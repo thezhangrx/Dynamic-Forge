@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bullet-sim"
+version = "0.1.0"
+description = "Reusable 2D dynamic-obstacle (bullet-hell) simulation platform for virtual training, CPU/FPGA deployment and real 2D cart validation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Bullet Platform Team" }]
+keywords = ["simulation", "bullet-hell", "reinforcement-learning", "fpga", "robotics", "dataset"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Simulation",
+]
+
+# NumPy is the ONLY hard dependency: the core simulator, dataset layer,
+# benchmark suites, CLI and test suite all work with it alone.
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+render = ["pygame>=2.1"]
+plots = ["matplotlib>=3.6"]
+test = ["pytest>=7"]
+dev = ["pytest>=7", "matplotlib>=3.6", "pygame>=2.1"]
+
+[project.scripts]
+bullet-sim = "bullet_sim.cli:main"
+
+[project.urls]
+Documentation = "bullet_sim/docs/ARCHITECTURE.md"
+
+[tool.setuptools.packages.find]
+include = ["bullet_sim*"]
+
+[tool.setuptools.package-data]
+bullet_sim = ["docs/*.md", "configs/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["bullet_sim/tests"]
+filterwarnings = ["error::DeprecationWarning:bullet_sim.*"]

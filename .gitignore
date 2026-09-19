@@ -1,0 +1,53 @@
+# ---------------------------------------------------------------------------
+# Bundled virtual environment (contains torch/pygame/... ~5.7 GB) - never commit
+# ---------------------------------------------------------------------------
+For_Test/
+.venv/
+venv/
+env/
+
+# ---------------------------------------------------------------------------
+# Third-party reference material (kept locally for reading only)
+#   Keiki-master  : no LICENSE file found -> [LICENSE_REVIEW_REQUIRED]
+#   TostEngine... : MIT upstream, but it is a separate repository (~594 MB)
+# Push these only if you have checked the licence question; see
+# bullet_sim/docs/OPEN_SOURCE_REFERENCES.md
+# ---------------------------------------------------------------------------
+Keiki-master/
+TostEngine-cinder-bullethell-main/
+*.zip
+
+# ---------------------------------------------------------------------------
+# Generated simulation artifacts
+# ---------------------------------------------------------------------------
+data/
+benchmarks_output/
+*.npz
+*.npy
+*.bin
+*.dat
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

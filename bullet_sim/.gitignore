@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test / tooling caches
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+# Generated artifacts (never commit datasets or benchmark dumps)
+data/
+benchmarks_output/
+*.npz
+*.npy
+*.bin
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
