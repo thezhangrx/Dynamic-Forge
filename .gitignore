@@ -8,17 +8,30 @@ env/
 
 # ---------------------------------------------------------------------------
 # Third-party reference material (kept locally for reading only)
-#   Outside/ : locally cloned reference projects (Algo / Bullet / Camera),
-#              ~1.4 GB, each with its own licence - never commit them
+#   Outside/<category>/<project>/ : locally cloned reference projects
+#   (Algo / Bullet / Camera), ~1.4 GB, each with its own licence.
+#
+#   The cloned CODE is never committed, but the hand-written analysis notes
+#   (Outside/<category>/<project>/tech.md) are the author's own work and ARE
+#   tracked - that is what the re-include lines below do.
 # ---------------------------------------------------------------------------
-Outside/
+Outside/*
+!Outside/Algo/
+!Outside/Bullet/
+!Outside/Camera/
+Outside/*/*
+!Outside/*/*/
+Outside/*/*/*
+!Outside/*/*/tech.md
 #   Keiki-master  : no LICENSE file found -> [LICENSE_REVIEW_REQUIRED]
 #   TostEngine... : MIT upstream, but it is a separate repository (~594 MB)
 # Push these only if you have checked the licence question; see
 # bullet_sim/docs/OPEN_SOURCE_REFERENCES.md
 # ---------------------------------------------------------------------------
-Keiki-master/
-TostEngine-cinder-bullethell-main/
+# (leading slash = repo root only, so these do not swallow the copies that
+#  now live under Outside/Bullet/)
+/Keiki-master/
+/TostEngine-cinder-bullethell-main/
 *.zip
 
 # ---------------------------------------------------------------------------
