@@ -34,8 +34,8 @@
 | 项 | 内容 |
 |---|---|
 | 项目定位 | "A 2D Bullet-Hell (Touhou-style) game engine built with Cinder framework" |
-| 许可证 | **MIT License**（README «## License»） |
-| 审查结论 | 允许复用，但本项目仍为独立设计，未移植其 C++ 代码 |
+| 许可证 | README 末尾只有一行 "MIT License"，**仓库内没有 LICENSE / COPYING 文件正文**（仅内嵌的 Cinder 框架带 BSD 风格 `cinder/COPYING`）→ 记为 `[LICENSE_REVIEW_REQUIRED]` |
+| 审查结论 | 本项目**未移植其 C++ 代码**，仅参考设计思路；若要直接复用源码，需先补齐许可证正文 |
 
 **本项目借鉴的设计思路**
 
@@ -62,8 +62,9 @@
 | 未引入参考项目的二进制/数据文件 | ✅ `Keiki-master/danmakus/*.npy`、`data/mat/*.npy` 均未被读取或打包 |
 | 未把原项目作为最终作品 | ✅ 两个参考目录保持原样，独立于 `bullet_sim/` |
 | 记录借鉴的具体功能点 | ✅ 见 §1 两张表 |
-| MIT 项目（TostEngine）来源标注 | ✅ 本文件 |
+| TostEngine 来源标注 | ✅ 本文件；README 自称 MIT 但**无许可证正文**，已标记 `[LICENSE_REVIEW_REQUIRED]` |
 | **Keiki 许可证不明 → 标记待审查** | `[LICENSE_REVIEW_REQUIRED]` |
+| **Red_Tracker 许可证不明（无 LICENSE、README 未声明）** | `[LICENSE_REVIEW_REQUIRED]` |
 
 ### `[LICENSE_REVIEW_REQUIRED]` 说明
 

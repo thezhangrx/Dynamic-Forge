@@ -845,13 +845,17 @@ BULLET_SIM_NO_PYTEST=1 python -m bullet_sim.tests.run_tests
 
 ## 21. 开源参考
 
-`Keiki-master/` 与 `TostEngine-cinder-bullethell-main/` 仅作为**技术思路**来源，
-未复制任何代码或数据：
+这些参考项目位于 `Outside/`（**不入库**，见 `.gitignore`），仅作为**技术思路**来源，
+未复制任何代码或数据；每个项目的详细技术拆解见 `docs/reference/`。
 
-* **TostEngine**（MIT）：`Velocity{linear, angular}` 的角速度概念、空间网格碰撞、
-  定长实体池、固定步长主循环、人工操作方式；
+* **TostEngine**（README 自称 MIT，但仓库内**没有 LICENSE 文件正文** →
+  `[LICENSE_REVIEW_REQUIRED]`；其内嵌的 Cinder 框架另有 BSD 风格 `cinder/COPYING`）：
+  `Velocity{linear, angular}` 的角速度概念、空间网格碰撞、定长实体池、固定步长主循环、人工操作方式；
 * **Keiki**（**未找到 LICENSE 文件** → `[LICENSE_REVIEW_REQUIRED]`）：builder 式弹幕组织、
-  极坐标弹幕表、延迟合并列表、未来帧预演。
+  极坐标弹幕表、延迟合并列表、未来帧预演；
+* **Red_Tracker**（**未找到 LICENSE 文件，README 也未声明** → `[LICENSE_REVIEW_REQUIRED]`）：
+  摄像头接口、SDRAM 双帧缓冲、阈值分割与质心跟踪。
 
 本项目为独立 Python 实现，并额外提供自己的 State / Action / Dataset / Hardware Interface。
-逐条对比与许可证审查见 `bullet_sim/docs/OPEN_SOURCE_REFERENCES.md`。
+逐条对比与许可证审查见 `bullet_sim/docs/OPEN_SOURCE_REFERENCES.md` 与
+`docs/reference/README.md`。
