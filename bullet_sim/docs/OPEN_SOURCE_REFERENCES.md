@@ -42,15 +42,15 @@
 | 参考点 | TostEngine 的做法 | 本项目的独立设计 |
 |---|---|---|
 | 实体结构 | `struct Bullet { Transform, Velocity{linear, angular}, Collider{radius, mask}, ... }`，`Entity` 定长数组 `MAX_ENTITIES = 8192` | `BulletPool` SoA：字段等价但**按列连续**存储（`id,x,y,vx,vy,ax,ay,angle,angular_velocity,radius,age,ttl,type_id,group_id` + `alive` 掩码） |
-| **角速度** | `Velocity.angular` 驱动旋转 | `angular_velocity` 字段 + **精确圆弧积分**（闭式弧长积分，见 `physics/motion.py`） |
-| 空间网格碰撞 | `GRID_COLS × GRID_ROWS` 静态网格 + `vector<int>` 桶 | `collision/grid.py`：CSR 计数排序桶 + 向量化批量查询；并**实测**单玩家时暴力法更快（见 ARCHITECTURE §7） |
-| 实体池 | 定长数组 + `active` 标志 + 自由 ID 回收 | SoA + LIFO 自由列表；额外保证**分配顺序是生成的纯函数**（复现性要求） |
-| 固定步长主循环 | fixed timestep game loop，`patternTimer` 驱动 pattern 切换 | `FixedClock`：`t = step_index * dt`，渲染与仿真完全解耦，支持 30/60/120/任意 dt |
-| 弹幕类型 | Rain / Spiral / Burst / Aimed / Wall / Mixed 六种 | `single / radial / spiral / aimed / burst / line / wall / random / mixed` 九种，全部参数化且可运行时 `spawn_pattern()` |
+| **角速度**（原文档此处有误，已更正） | **该引擎没有角速度积分**：`Velocity::angular`（`src/BulletHell.cpp:31`）与 `Transform::rotation`（`:30`）是**死字段**，全文仅出现在声明处，从未被读写；README 的 "Spiral" 实为生成时定好方向、之后直线飞行的径向弹（`:224-226`） | `angular_velocity` 字段 + **精确圆弧积分**（闭式弧长积分，见 `physics/motion.py`）——**本项目自研**，并非借鉴自 TostEngine |
+| 空间网格碰撞 | `GRID_COLS × GRID_ROWS` 静态网格 + `vector<int>` 桶；`gridQuery` 每次堆分配 `vector seen` 并做 O(k²) 去重（`:100-112`） | `collision/grid.py`：CSR 计数排序桶 + 向量化批量查询；并**实测**单玩家时暴力法更快（见 ARCHITECTURE §7） |
+| 实体池 | 定长 AoS 数组 + first-fit 线性扫描 + 无 free-list、无版本号（`:118-130`） | SoA + LIFO 自由列表；额外保证**分配顺序是生成的纯函数**（复现性要求） |
+| 主循环时间步（原文档此处有误，已更正） | **不是固定步长**：`update()` 用 `getElapsedSeconds()` 差值做**变步长**并钳到 0.25 s（`:324-330`），无累加器、无插值——对确定性仿真是反面教材 | `FixedClock`：`t = step_index * dt`，渲染与仿真完全解耦，支持 30/60/120/任意 dt；这是**主动纠正**而非借鉴 |
+| 弹幕类型 | Rain / Spiral / Burst / Aimed / Wall / Mixed 六种 | `small_obstacles / moving_block / wall_with_gap / corridor / cross_traffic` 五种现实障碍，可重复 `--obstacle-type` 组合 |
 | 人工操作 | 方向键/WASD 移动、Shift 聚焦 | `action/` 层：键名绑定 + `Action{direction,magnitude}` + 同时按键归一化；**Shift 表达为 magnitude 缩放而非新方向** |
-| HUD 调试 | 弹幕数/难度/命中框开关 | `render/overlays.py`：FPS、弹幕数、玩家/目标状态、碰撞模型；外加危险场与预测轨迹叠加 |
+| HUD 调试 | 弹幕数/难度/命中框开关 | `render/overlays.py`：FPS、实体数、玩家/目标状态、碰撞模型；外加危险场与预测轨迹叠加 |
 
-**未采用**：Cinder 框架、C++ 代码、ECS 风格 `Entity` 联合体、Lives/Score/Graze/Invincibility 等**游戏机制**（规格 §13 明确排除：本项目把弹幕抽象为"动态障碍物"）。
+**未采用**：Cinder 框架、C++ 代码、ECS 风格 `Entity` 联合体、Lives/Score/Graze/Invincibility 等**游戏机制**（规格 §13 明确排除：本项目把弹幕抽象为"动态障碍物"）。另注：该引擎**只有圆-圆碰撞、完全没有障碍物（矩形/墙）表达**，对"动态障碍模拟器"的参考价值主要体现在**反面教训**（变步长、AoS+first-fit 池、immediate-mode 渲染）。
 
 ---
 
