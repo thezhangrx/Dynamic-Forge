@@ -11,18 +11,15 @@ env/
 #   Outside/<category>/<project>/ : locally cloned reference projects
 #   (Algo / Bullet / Camera), ~1.4 GB, each with its own licence.
 #
-#   The cloned CODE is never committed, but the hand-written analysis notes
-#   (Outside/<category>/<project>/tech.md) are the author's own work and ARE
-#   tracked - that is what the re-include lines below do.
+#
+#   Why the whole tree is ignored rather than "everything except tech.md":
+#   these clones are git repositories themselves, so git refuses to track any
+#   single file inside them (a forced add is a silent no-op) and a re-include
+#   would instead add them as broken embedded repositories (gitlinks).
+#   The analysis notes are therefore committed as a tracked mirror under
+#   docs/reference/, with an in-place tech.md symlink next to each project.
 # ---------------------------------------------------------------------------
-Outside/*
-!Outside/Algo/
-!Outside/Bullet/
-!Outside/Camera/
-Outside/*/*
-!Outside/*/*/
-Outside/*/*/*
-!Outside/*/*/tech.md
+Outside/
 #   Keiki-master  : no LICENSE file found -> [LICENSE_REVIEW_REQUIRED]
 #   TostEngine... : MIT upstream, but it is a separate repository (~594 MB)
 # Push these only if you have checked the licence question; see
