@@ -38,11 +38,11 @@ Documentation = "core/bullet_sim/docs/ARCHITECTURE.md"
 # core/vision); the repository root only holds the driver scripts that call it.
 [tool.setuptools.packages.find]
 where = ["core"]
-include = ["bullet_sim*"]
+include = ["bullet_sim*", "cpu*"]
 
 [tool.setuptools.package-data]
 bullet_sim = ["docs/*.md", "configs/*.json"]
 
 [tool.pytest.ini_options]
-testpaths = ["core/bullet_sim/tests", "core/vision/tests"]
+testpaths = ["core/bullet_sim/tests", "core/vision/tests", "core/cpu/tests"]
 filterwarnings = ["error::DeprecationWarning:bullet_sim.*"]
