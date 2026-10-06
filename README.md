@@ -17,7 +17,7 @@
 | 可选依赖 | pygame（可视化）、pytest（测试）、matplotlib |
 | 状态协议 | **v3**（`readable_versions: [1, 2, 3]`） |
 | 数据集 schema | v1（`bin / csv / dat / json / npz`） |
-| 自动化测试 | **389 项**（`python -m pytest core/bullet_sim/tests -q`） |
+| 自动化测试 | **391 项**（`python -m pytest core/bullet_sim/tests -q`） |
 
 三句话概括现状：
 
@@ -298,7 +298,7 @@ from bullet_sim.ai import load_policy      # -> ModelNotAvailable
 |---|---|---|---|---|
 | `moving_block` | 迎面 / 横向接近的大型物体（移动机器、货架、车辆） | 从边界**一段区间内的随机位置**进入，速度强制指向场内；默认 2× 玩家直径 | 提前决定从哪一侧绕行 | `bypass` |
 | `wall_with_gap` | 围栏 / 隔断上的局部开口 | 两段矩形 + 一个 `gap_width` 缺口（位置随机抖动、可扫动）；缺口**不得小于玩家圆直径** | 定位缺口并判断"能否在墙到达前抵达" | `gap` |
-| `small_obstacles` | 树林枝叶 / 人群车流中的细小物体 | 尺寸远小于玩家的圆从各边界进入 | 保持长期连贯的可行通道 | `local_free` |
+| `small_obstacles` | 树林枝叶 / 人群车流中的细小物体 | 尺寸远小于玩家的圆从**单一侧边界**进入（`--region` 选边，默认 `top`），朝**对向边界**横穿场地；方向带随机扰动 | 保持长期连贯的可行通道 | `local_free` |
 | `corridor` | 通道 / 路面张开-收窄-偏转 | 角色在两堵墙**正中间**，墙心不动，只通过张开/收缩/旋转模拟道路变化（详见 8.3） | 判断变化后"现在能否通过 / 是否要等" | `corridor` |
 | `cross_traffic` | 十字路口 / 多方向来流 | 从多条边界同时进入、方向各异 | 多方向相对运动之间的间隙选择 | `generic` |
 
@@ -313,7 +313,7 @@ sc = scenario_from_types(
     [
         {"type": "moving_block", "size": 2.0, "speed": 90.0, "entry_span": 0.8},
         {"type": "wall_with_gap", "gap_width": 160.0, "gap_motion": "sweep"},
-        {"type": "small_obstacles", "count": 12, "size": 0.35},
+        {"type": "small_obstacles", "count": 12, "size": 0.35, "region": "left"},
         {"type": "corridor", "corridor_width": 120.0, "motion": "rotate_same", "change": 16.0},
     ],
     seed=7, duration=30.0, player_hitbox_radius=10.0,
@@ -563,6 +563,7 @@ python -m bullet_sim play --obstacle-type corridor --corridor-motion rotate_same
 | 蓝色折线（`--prediction`） | 障碍未来轨迹（解析外推，是**预测叠加**，不是障碍） |
 | 红色半透明栅格（`--danger`） | 未来危险场 |
 | 红色边框闪烁 | 刚发生碰撞（惩罚事件提示，不中断运行；默认不带文字） |
+| 青绿描边圆 / 矩形 | **目标区 target zone**（`world.state.target`，默认在场地正中）。它**不是障碍、不参与碰撞**，只有场景显式配了 `target_bonus` 才影响奖励。**默认不画**——在障碍场里这个绿圈容易被误当成障碍；需要时用 `PygameRenderer(show_target=True)` 打开 |
 
 **窗口默认不画任何文字**：HUD、坐标数字、启动控制帮助面板、模式切换横幅、碰撞提示文字
 全部不绘制，画面上只有场景本身。实现上是 `PygameRenderer(show_text=False)` 这个默认值
@@ -786,7 +787,7 @@ python3 bullet_sim_run_demo.py --help
 ### 18.1 自动化测试
 
 ```bash
-python -m pytest core/bullet_sim/tests -q                 # 389 项，约 90 秒
+python -m pytest core/bullet_sim/tests -q                 # 391 项，约 90 秒
 python -m bullet_sim.tests.run_tests                 # 无 pytest 时的内置 runner
 BULLET_SIM_NO_PYTEST=1 python -m bullet_sim.tests.run_tests
 ```
@@ -802,9 +803,12 @@ BULLET_SIM_NO_PYTEST=1 python -m bullet_sim.tests.run_tests
 | `core/bullet_sim/tests/test_protocol.py` | 协议 v1/v2/v3 编解码与 stride |
 | `core/bullet_sim/tests/test_determinism.py` | 同 seed 跨进程哈希一致 |
 | `core/vision/tests/test_wall_with_gap.py` | **图像识别**（vision 模块）：合成图上的两段墙 + 缺口、角色圆、目标环；不依赖摄像头 |
+| `core/vision/tests/test_live_view.py` | **实时视频**：采集主循环、`--seconds` 墙钟判定、读帧失败退出码、帧率计；用假 source，不需要摄像头/显示器 |
+| `core/standard/tests/test_standard.py` | **三个规范**（角色/障碍/视觉输出）：JSON 样例往返、BHL1 互转、以及必须拦住的错误用法 |
 
-`core/vision/tests` 不属于平台包，跑法：`python -m pytest core/vision/tests -q`；
-直接 `python -m pytest` 会把两者一起收集（见 `pyproject.toml` 的 `testpaths`）。
+`core/vision/tests` 与 `core/standard/tests` 不属于平台包，跑法：
+`python -m pytest core/vision/tests core/standard/tests -q`；
+直接 `python -m pytest` 会把三者一起收集（见 `pyproject.toml` 的 `testpaths`）。
 
 ### 18.2 手工验收清单
 

@@ -87,6 +87,7 @@ class PygameRenderer:
         show_text: bool = False,
         show_prediction: bool = False,
         show_danger: bool = False,
+        show_target: bool = False,
         predictor: Any = None,
         prediction_horizon: int = 90,
         danger: Any = None,
@@ -110,6 +111,11 @@ class PygameRenderer:
         self.show_text = bool(show_text)
         self.show_prediction = bool(show_prediction)
         self.show_danger = bool(show_danger)
+        #: Draw the target zone marker.  Off by default: in an obstacle field the
+        #: green ring reads as "something to reach / protect" and is mistaken for
+        #: an obstacle, while it neither collides nor affects the reward unless a
+        #: scenario explicitly configures ``target_bonus``.
+        self.show_target = bool(show_target)
         self.predictor = predictor
         self.prediction_horizon = int(prediction_horizon)
         self.danger = danger
@@ -211,16 +217,17 @@ class PygameRenderer:
                                           True, (255, 220, 220))
                 screen.blit(label, (8, self._size[1] - label.get_height() - 8))
 
-        # --- target zone ------------------------------------------------
-        t = world.state.target
-        if t.shape == "rect":
-            pts = vp.rect_to_screen(t.x, t.y, t.half_w, t.half_h)
-            pygame.draw.polygon(screen, (90, 200, 140), pts, 2)
-        else:
-            pygame.draw.circle(
-                screen, (90, 200, 140), vp.world_to_screen(t.x, t.y),
-                max(2, int(vp.len_to_screen(t.radius))), 2,
-            )
+        # --- target zone (off by default, see show_target) --------------
+        if self.show_target:
+            t = world.state.target
+            if t.shape == "rect":
+                pts = vp.rect_to_screen(t.x, t.y, t.half_w, t.half_h)
+                pygame.draw.polygon(screen, (90, 200, 140), pts, 2)
+            else:
+                pygame.draw.circle(
+                    screen, (90, 200, 140), vp.world_to_screen(t.x, t.y),
+                    max(2, int(vp.len_to_screen(t.radius))), 2,
+                )
 
         if self.show_danger and self.danger is not None:
             self._draw_danger(screen, world)

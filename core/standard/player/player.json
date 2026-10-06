@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/bullet-platform/standard/player/player.json",
+  "title": "Player（角色）",
+  "description": "角色就是一个圆：半径既是碰撞体也是画面大小。位置与速度都在 frame_id 指定的坐标系（默认场地世界系 field）里。规范版本见 x-standard-version。派生量 heading = atan2(vy,vx)、speed_measured = hypot(vx,vy)、diameter = 2*radius 不入结构。",
+  "x-standard-version": 1,
+  "type": "object",
+  "required": ["x", "y", "radius"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "default": "player",
+      "description": "身份标识；多角色场景下用于区分。"
+    },
+    "frame_id": {
+      "type": "string",
+      "default": "field",
+      "description": "位置与速度所在的坐标系。默认场地世界系：原点在场地左下，+x 向右，+y 向上（与图像系的 y 向下相反）。"
+    },
+    "stamp": {
+      "type": ["number", "null"],
+      "default": null,
+      "description": "采集/仿真时刻，单位秒。测速的唯一合法时间基准：v = Δx / Δstamp。"
+    },
+    "seq": {
+      "type": ["integer", "null"],
+      "default": null,
+      "minimum": 0,
+      "description": "单调帧序号。只用于去重与丢帧检测，不用于算 dt（帧率不恒定）。"
+    },
+    "x": {
+      "type": "number",
+      "description": "位置 x，场地世界单位。"
+    },
+    "y": {
+      "type": "number",
+      "description": "位置 y，场地世界单位，向上为正。"
+    },
+    "radius": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "唯一的半径：可视 = 碰撞。不得存在 body_radius / hitbox_radius 两套尺寸。平台所有间距（缺口宽度、走廊宽度）都以 diameter = 2*radius 为单位。"
+    },
+    "vx": {
+      "type": "number",
+      "default": 0,
+      "description": "速度 x，世界单位/秒。"
+    },
+    "vy": {
+      "type": "number",
+      "default": 0,
+      "description": "速度 y，世界单位/秒。"
+    },
+    "speed": {
+      "type": "number",
+      "minimum": 0,
+      "description": "运动学速度上限（不是瞬时速度）。瞬时速率请用派生量 speed_measured = hypot(vx,vy)。二者混用会让控制回路误以为角色一直满速。"
+    },
+    "alive": {
+      "type": "boolean",
+      "default": true,
+      "description": "存活标志。"
+    },
+    "valid": {
+      "type": "boolean",
+      "default": true,
+      "description": "本条观测是否可信（分割失败/跟踪丢失时为 false）。"
+    },
+    "occluded": {
+      "type": "boolean",
+      "default": false,
+      "description": "是否被遮挡或高光饱和。灯在屏幕上的反光会把颜色洗白（实测 R-B 由 82 掉到 13，与纯眩光无法区分），此时必须标记而不是硬报错值。"
+    },
+    "score": {
+      "type": ["number", "null"],
+      "default": null,
+      "minimum": 0,
+      "maximum": 1,
+      "description": "检测置信度，约定与 vision_msgs/ObjectHypothesis.score 一致。"
+    },
+    "pose_cov": {
+      "type": ["array", "null"],
+      "default": null,
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "[σxx, σxy, σyy]，位置协方差。对应 ROS geometry_msgs/PoseWithCovariance 的 6x6=36 个 float64 里的 2D 独立分量（下标 0,1,6,7）。"
+    },
+    "vel_cov": {
+      "type": ["array", "null"],
+      "default": null,
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "[σxx, σxy, σyy]，速度协方差。对应 geometry_msgs/TwistWithCovariance。"
+    },
+    "is_stationary": {
+      "type": ["boolean", "null"],
+      "default": null,
+      "description": "明确静止（速度估计落在噪声内）。约定取自 autoware_perception_msgs/TrackedObjectKinematics.is_stationary。"
+    }
+  },
+  "examples": [
+    {
+      "id": "player",
+      "frame_id": "field",
+      "stamp": 12.345,
+      "seq": 741,
+      "x": 221.3,
+      "y": 333.4,
+      "radius": 9.0,
+      "vx": 12.5,
+      "vy": -30.0,
+      "speed": 120.0,
+      "alive": true,
+      "valid": true,
+      "occluded": false,
+      "score": 0.92,
+      "pose_cov": [1.2, 0.0, 1.1],
+      "vel_cov": null,
+      "is_stationary": false
+    }
+  ]
+}

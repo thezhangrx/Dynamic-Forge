@@ -423,16 +423,20 @@ def _layout_wall_gap(spec, ctx, elapsed, step):
 
 
 def _layout_small(spec, ctx, elapsed, step):
-    """Small circles entering from the edges, each with its own entry angle."""
+    """Small circles entering from ONE boundary and crossing to the opposite one.
+
+    Real debris (leaves, twigs, litter) drifts across in a single direction
+    instead of converging from every side, so every small obstacle enters on
+    the same edge (``params['spawn']``, default ``top``) and travels broadly
+    across the field.  Keeping the flow unidirectional also makes the
+    avoidance problem directional instead of omnidirectional.
+    """
     n = max(1, _count(spec))
-    regions = spec.params.get("regions", ["left", "right", "top", "bottom"])
-    m = len(regions)
-    idx = ctx.rng.integers(0, m, n)
+    region = str(spec.params.get("spawn", "top"))
     offsets = np.empty((n, 2), dtype=np.float64)
     angles = np.empty(n, dtype=np.float64)
     jitter = float(spec.params.get("angle_jitter", 25.0)) * _DEG
     for i in range(n):
-        region = str(regions[int(idx[i])])
         t = ctx.rng.uniform(0.05, 0.95)
         px, py, nx, ny = _edge_point(region, ctx, t, outward=1.0)
         offsets[i] = (px, py)

@@ -251,6 +251,11 @@ def _add_obstacle_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--entry-angle", type=float, default=None,
                    help="entry direction in degrees (overrides the region default; "
                         "obstacles are always forced to travel into the field)")
+    p.add_argument("--region", default=None,
+                   choices=["left", "right", "top", "bottom"],
+                   help="which boundary boundary-spawned obstacles enter from "
+                        "(small_obstacles / moving_block); they travel toward the "
+                        "opposite boundary. Default comes from the obstacle type.")
 
 
 def _add_safety_args(p: argparse.ArgumentParser) -> None:
@@ -337,6 +342,7 @@ def _obstacle_scenario_from_args(args: argparse.Namespace):
             ("tilt_deg", "tilt_deg"),
             ("entry_span", "entry_span"),
             ("entry_angle", "entry_angle"),
+            ("region", "region"),
         ):
             value = getattr(args, flag, None)
             if value is not None:
