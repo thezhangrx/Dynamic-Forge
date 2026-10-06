@@ -24,6 +24,21 @@ env/
 /docs/
 
 # ---------------------------------------------------------------------------
+# refs/ - the flat third-party reference library: one directory per upstream
+# repository, each with its own LICENSE plus a _REFERENCE.md / _SOURCE.txt pair
+# written by us.  See refs/README.md for what is in it and how to add a repo.
+#
+#   LOCAL ONLY, NEVER PUSHED.  Two hard reasons:
+#     1. pred-occ-planner/ is GPL-3.0, which is incompatible with this
+#        project's MIT licence;
+#     2. the directory is ~1.7 GB (LatticeSIPP alone ships ~776 MB of
+#        generated demo GIFs/MP4s).
+# ---------------------------------------------------------------------------
+# NOTE: also root-anchored - a bare `refs/` would swallow a future
+# core/<module>/refs/ directory.
+/refs/
+
+# ---------------------------------------------------------------------------
 # Module outputs - one folder per module under data/, plus generated artifacts
 #
 #   data/bullet_sim/   platform results (datasets, benchmark JSON reports)
