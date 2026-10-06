@@ -32,14 +32,17 @@ dev = ["pytest>=7", "matplotlib>=3.6", "pygame>=2.1"]
 bullet-sim = "bullet_sim.cli:main"
 
 [project.urls]
-Documentation = "bullet_sim/docs/ARCHITECTURE.md"
+Documentation = "core/bullet_sim/docs/ARCHITECTURE.md"
 
+# All module source lives under core/ (core/bullet_sim, core/cpu, core/fpga,
+# core/vision); the repository root only holds the driver scripts that call it.
 [tool.setuptools.packages.find]
+where = ["core"]
 include = ["bullet_sim*"]
 
 [tool.setuptools.package-data]
 bullet_sim = ["docs/*.md", "configs/*.json"]
 
 [tool.pytest.ini_options]
-testpaths = ["bullet_sim/tests"]
+testpaths = ["core/bullet_sim/tests", "core/vision/tests"]
 filterwarnings = ["error::DeprecationWarning:bullet_sim.*"]

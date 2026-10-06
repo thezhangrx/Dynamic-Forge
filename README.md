@@ -17,7 +17,7 @@
 | 可选依赖 | pygame（可视化）、pytest（测试）、matplotlib |
 | 状态协议 | **v3**（`readable_versions: [1, 2, 3]`） |
 | 数据集 schema | v1（`bin / csv / dat / json / npz`） |
-| 自动化测试 | **383 项**（`python -m pytest bullet_sim/tests -q`） |
+| 自动化测试 | **389 项**（`python -m pytest core/bullet_sim/tests -q`） |
 
 三句话概括现状：
 
@@ -37,7 +37,7 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ L6 应用层      cli  /  examples  /  run_demo.py                       │
+│ L6 应用层      cli  /  examples  /  bullet_sim_run_demo.py                       │
 ├──────────────────────────────────────────────────────────────────────┤
 │ L5 工具层      render/     dataset/    benchmark/    prediction/     │
 │                (可视化)     (数据集)     (性能)        (预测/危险场)   │
@@ -74,32 +74,32 @@
 
 | 目录 | 职责 | 关键文件 |
 |---|---|---|
-| `bullet_sim/core/` | SoA 状态容器、种子管理、固定时钟、动作编解码、数值策略 | `state.py`, `rng.py`, `clock.py`, `actions.py`, `numerics.py` |
-| `bullet_sim/entities/` | Player / BulletPool / Target 的 SoA 读写视图 | `player.py`, `bullet.py`, `target.py` |
-| `bullet_sim/physics/` | 精确运动积分（直线 / 圆弧 / **矩形自转**）、玩家运动学、边界剔除、相对运动 | `motion.py`, `kinematics.py`, `bounds.py`, `relative.py` |
-| `bullet_sim/collision/` | 可替换碰撞后端 + 接触状态机 | `circle.py`, `grid.py`, `shapes.py`, `obstacles.py`, `events.py` |
-| `bullet_sim/generators/` | 构建期实体生成（动态障碍 layout）、`SpawnEvent` / `SpawnTimeline` | `patterns.py`, `burst.py`, `composite.py`, `registry.py` |
-| `bullet_sim/obstacles/` | **现实障碍类型目录**与场景组合 | `catalog.py`, `spec.py`, `scenario.py` |
-| `bullet_sim/safety/` | 配置空间自由空间、时间窗路径搜索、场景可行性闭环 | `free_space.py`, `path_search.py`, `validate.py` |
-| `bullet_sim/scenarios/` | `ScenarioSpec`、参数化难度、level 预设、构建与标定 | `spec.py`, `complexity.py`, `params.py`, `presets.py`, `builder.py` |
-| `bullet_sim/simulator/` | 确定性内核、Env、Replay、Reward | `world.py`, `env.py`, `replay.py`, `rewards.py` |
-| `bullet_sim/action/` | 统一 `Action`、`ActionSource`、人工输入、运行时切换 | `types.py`, `base.py`, `manual.py`, `switch.py` |
-| `bullet_sim/ai/` | 自主基线控制器、模型接入契约 | `baseline.py`, `policy.py`, `factory.py` |
-| `bullet_sim/cpu/`, `bullet_sim/fpga/` | CPU 决策层、CPU↔FPGA 回路、预测帧参考实现 | `decision.py`, `prediction_block.py` |
-| `bullet_sim/hardware_interface/` | 开发板输入占位（全量 TBD，故障即报错） | `tbd.py` |
-| `bullet_sim/interface/` | Obs/Action 空间、扁平协议、控制器契约、HardwareLink | `space.py`, `protocol.py`, `controller.py`, `hardware.py` |
-| `bullet_sim/prediction/` | 闭式弹道、rollout、危险场 | `ballistic.py`, `rollout.py`, `danger_field.py` |
-| `bullet_sim/dataset/` | 数据集 schema、录制、多格式读写、回放校验 | `schema.py`, `recorder.py`, `writers.py`, `readers.py` |
-| `bullet_sim/benchmark/` | 性能与压力套件 | `metrics.py`, `runner.py`, `suites.py` |
-| `bullet_sim/render/` | pygame / ASCII 视图、**Viewport 窗口缩放**、HUD、调试叠加 | `viewport.py`, `pygame_view.py`, `ascii_view.py`, `overlays.py` |
-| `bullet_sim/tests/` | 自动化测试（含 README 一致性检查） | `test_obstacle_environment.py` 等 |
+| `core/bullet_sim/core/` | SoA 状态容器、种子管理、固定时钟、动作编解码、数值策略 | `state.py`, `rng.py`, `clock.py`, `actions.py`, `numerics.py` |
+| `core/bullet_sim/entities/` | Player / BulletPool / Target 的 SoA 读写视图 | `player.py`, `bullet.py`, `target.py` |
+| `core/bullet_sim/physics/` | 精确运动积分（直线 / 圆弧 / **矩形自转**）、玩家运动学、边界剔除、相对运动 | `motion.py`, `kinematics.py`, `bounds.py`, `relative.py` |
+| `core/bullet_sim/collision/` | 可替换碰撞后端 + 接触状态机 | `circle.py`, `grid.py`, `shapes.py`, `obstacles.py`, `events.py` |
+| `core/bullet_sim/generators/` | 构建期实体生成（动态障碍 layout）、`SpawnEvent` / `SpawnTimeline` | `patterns.py`, `burst.py`, `composite.py`, `registry.py` |
+| `core/bullet_sim/obstacles/` | **现实障碍类型目录**与场景组合 | `catalog.py`, `spec.py`, `scenario.py` |
+| `core/bullet_sim/safety/` | 配置空间自由空间、时间窗路径搜索、场景可行性闭环 | `free_space.py`, `path_search.py`, `validate.py` |
+| `core/bullet_sim/scenarios/` | `ScenarioSpec`、参数化难度、level 预设、构建与标定 | `spec.py`, `complexity.py`, `params.py`, `presets.py`, `builder.py` |
+| `core/bullet_sim/simulator/` | 确定性内核、Env、Replay、Reward | `world.py`, `env.py`, `replay.py`, `rewards.py` |
+| `core/bullet_sim/action/` | 统一 `Action`、`ActionSource`、人工输入、运行时切换 | `types.py`, `base.py`, `manual.py`, `switch.py` |
+| `core/bullet_sim/ai/` | 自主基线控制器、模型接入契约 | `baseline.py`, `policy.py`, `factory.py` |
+| `core/bullet_sim/cpu/`, `core/bullet_sim/fpga/` | CPU 决策层、CPU↔FPGA 回路、预测帧参考实现 | `decision.py`, `prediction_block.py` |
+| `core/bullet_sim/hardware_interface/` | 开发板输入占位（全量 TBD，故障即报错） | `tbd.py` |
+| `core/bullet_sim/interface/` | Obs/Action 空间、扁平协议、控制器契约、HardwareLink | `space.py`, `protocol.py`, `controller.py`, `hardware.py` |
+| `core/bullet_sim/prediction/` | 闭式弹道、rollout、危险场 | `ballistic.py`, `rollout.py`, `danger_field.py` |
+| `core/bullet_sim/dataset/` | 数据集 schema、录制、多格式读写、回放校验 | `schema.py`, `recorder.py`, `writers.py`, `readers.py` |
+| `core/bullet_sim/benchmark/` | 性能与压力套件 | `metrics.py`, `runner.py`, `suites.py` |
+| `core/bullet_sim/render/` | pygame / ASCII 视图、**Viewport 窗口缩放**、HUD、调试叠加 | `viewport.py`, `pygame_view.py`, `ascii_view.py`, `overlays.py` |
+| `core/bullet_sim/tests/` | 自动化测试（含 README 一致性检查） | `test_obstacle_environment.py` 等 |
 
 ---
 
 ## 4. 数据结构
 
-**以下字段名与代码一致**：`bullet_sim/entities/bullet.py`、`bullet_sim/entities/player.py`、
-`bullet_sim/core/state.py`、`bullet_sim/action/types.py` 是唯一权威。
+**以下字段名与代码一致**：`core/bullet_sim/entities/bullet.py`、`core/bullet_sim/entities/player.py`、
+`core/bullet_sim/core/state.py`、`core/bullet_sim/action/types.py` 是唯一权威。
 
 整个状态：`S_t = { player, bullets, target, environment, timestamp }`。
 
@@ -190,8 +190,8 @@ Action.zero()                      # 不移动
 
 | 侧 | 负责 |
 |---|---|
-| CPU | 观测编码、决策（`bullet_sim/cpu/decision.py`）、回合管理、数据集、渲染 |
-| FPGA | 大规模障碍的**并行预测**（`bullet_sim/fpga/prediction_block.py`：`BHP1` 帧协议 + Python golden model） |
+| CPU | 观测编码、决策（`core/bullet_sim/cpu/decision.py`）、回合管理、数据集、渲染 |
+| FPGA | 大规模障碍的**并行预测**（`core/bullet_sim/fpga/prediction_block.py`：`BHP1` 帧协议 + Python golden model） |
 | Simulator | 环境本体，对两侧都只暴露字节协议与 `Action` |
 
 ### 5.2 State 帧（v3）
@@ -211,7 +211,7 @@ Total := 88 + 68 * n_bullets 字节   (v1 = 88+40n, v2 = 88+52n)
 
 `decode_state()` 同时接受 v1 / v2 / v3；`encode_state()` 只产出 v3。
 `describe_protocol()` 上报 `readable_versions: [1, 2, 3]`。详细说明见
-`bullet_sim/docs/PROTOCOL.md`。
+`core/bullet_sim/docs/PROTOCOL.md`。
 
 ### 5.3 现在**可以**使用什么
 
@@ -233,7 +233,7 @@ from bullet_sim.fpga import FpgaPredictionReference
 * FPGA RTL——目前只有 Python golden model 与帧格式（`[HARDWARE_INTERFACE_TBD]`）；
 * 量化与上板工具链（`[MODEL_DEPLOYMENT_TBD]`）。
 
-`bullet_sim/hardware_interface/tbd.py` 是唯一记录这些未知量的地方。
+`core/bullet_sim/hardware_interface/tbd.py` 是唯一记录这些未知量的地方。
 
 ---
 
@@ -251,14 +251,14 @@ python -m bullet_sim play --level easy --seed 3            # play 默认就是 m
 | `SHIFT` | 聚焦（0.4× 速度） |
 | `CTRL` | 慢速（0.25× 速度） |
 | `TAB` | 运行时 MANUAL ↔ AUTO 切换 |
-| `H` | 切换 HUD |
+| `H` | 切换 HUD（仅在 `show_text=True` 时可见，见第 12 节） |
 | `+` / `-` / `0` | 缩放 / 复位视图 |
 | 鼠标滚轮 | 缩放 |
 | `B` | 切换碰撞轮廓显示 |
 | `ESC` | 退出 |
 
 **键盘不会直接改玩家状态**：按键 → `ManualInputSource` → `Action` → `World.step()`。
-细节见 `bullet_sim/docs/INPUT_MODES.md`。
+细节见 `core/bullet_sim/docs/INPUT_MODES.md`。
 
 ---
 
@@ -286,7 +286,7 @@ python -m bullet_sim autoplay --level medium --seed 21 --steps 1200
 from bullet_sim.ai import load_policy      # -> ModelNotAvailable
 ```
 
-接入契约已就绪（`bullet_sim/ai/policy.py`）；模型需要你们自己训练。
+接入契约已就绪（`core/bullet_sim/ai/policy.py`）；模型需要你们自己训练。
 
 ---
 
@@ -507,7 +507,7 @@ Scenario Generator → Obstacle Generation → Free Space Analysis
                    → Path Feasibility Check → Valid Scenario
 ```
 
-| 公开 API（`bullet_sim/safety/`） | 作用 |
+| 公开 API（`core/bullet_sim/safety/`） | 作用 |
 |---|---|
 | `is_scenario_valid(...)` | 布尔判定：是否存在可行安全路径 |
 | `find_safe_path(...)` | 找一条具体可行的无碰撞轨迹（`SafePath`） |
@@ -548,7 +548,7 @@ python -m bullet_sim play --level easy --seed 3 --input auto --prediction
 python -m bullet_sim play --obstacle-type corridor --corridor-motion rotate_same --seed 3
 ```
 
-**窗口缩放**：`bullet_sim/render/viewport.py` 的单个 `Viewport` 负责世界↔屏幕映射
+**窗口缩放**：`core/bullet_sim/render/viewport.py` 的单个 `Viewport` 负责世界↔屏幕映射
 （等比 letterbox，`scale = fit_scale × zoom`）。放大窗口只改变"看到多大"，
 `dt`、物理、碰撞判定与渲染帧率完全解耦。`VIDEORESIZE` 实时 `resize`，`+/-/0` 与滚轮缩放。
 
@@ -559,12 +559,18 @@ python -m bullet_sim play --obstacle-type corridor --corridor-motion rotate_same
 | 白色圆 + 短线 | 玩家：半径既是碰撞体也是画面大小（短线只是方向提示） |
 | 红色圆环（`B` 切换） | 同一个圆的碰撞轮廓——可视 = 碰撞，正好贴在一起 |
 | 彩色小圆 / 矩形（可旋转） | 动态障碍，形状与 `shape/half_w/half_h/rotation` 一致 |
-| 浅色网格 + 坐标标注 | 世界坐标轴（100 px 网格），把屏幕像素对应回世界量 |
+| 浅色网格 | 世界坐标网格（100 px）；**数字刻度默认不画** |
 | 蓝色折线（`--prediction`） | 障碍未来轨迹（解析外推，是**预测叠加**，不是障碍） |
 | 红色半透明栅格（`--danger`） | 未来危险场 |
-| 红色边框闪烁 | 刚发生碰撞（惩罚事件提示，不中断运行） |
-| HUD | 控制模式 / 控制器 / 场景与障碍类型 / FPS / 碰撞与 reward / 实体计数 / 玩家圆半径 / 世界坐标 |
-| 黄色横幅 | 切换模式时的即时提示 |
+| 红色边框闪烁 | 刚发生碰撞（惩罚事件提示，不中断运行；默认不带文字） |
+
+**窗口默认不画任何文字**：HUD、坐标数字、启动控制帮助面板、模式切换横幅、碰撞提示文字
+全部不绘制，画面上只有场景本身。实现上是 `PygameRenderer(show_text=False)` 这个默认值
+（见 `core/bullet_sim/render/pygame_view.py`）；需要这些文字时传 `show_text=True`，
+`H` 也只在 `show_text=True` 时有可见效果。
+
+文字内容本身仍由 `core/bullet_sim/render/overlays.py` 生成（`hud_lines()` / `scene_lines()` /
+`geometry_lines()`），所以"画面上不显示"不影响任何取数逻辑，HUD 数据随时可用。
 
 ---
 
@@ -599,60 +605,76 @@ python -m bullet_sim replay --dataset data/ep_00000.npz
 * `replay` 会逐步重放并比对 `state_hash`，输出 `reproduced / reason`；
 * 支持 `bin / csv / dat / json / npz`，`--bullet-stride` 可对实体采样以降体积。
 
-细节见 `bullet_sim/docs/DATASET.md`。
+细节见 `core/bullet_sim/docs/DATASET.md`。
 
 ---
 
 ## 15. 项目目录
 
 ```
-Bullet_Platform/
-├── run_demo.py                      # 单文件可运行入口（不需要安装）
-├── pyproject.toml                   # 打包；NumPy 是唯一硬依赖
-├── README.md                        # 本文件
-├── benchmarks_output/               # 基准报告产物（本地生成，不入库）
-└── bullet_sim/
-    ├── core/                        状态容器 / RNG / 时钟 / 动作编解码 / 数值策略
-    ├── entities/                    Player / BulletPool / Target
-    ├── physics/                     运动积分（含圆弧与矩形自转）、玩家运动学、边界、相对运动
-    ├── collision/                   圆-圆、hitbox 形状、均匀网格、障碍 SDF、接触状态机
-    ├── generators/                  动态障碍 layout、SpawnEvent / SpawnTimeline
-    ├── obstacles/                   5 种现实障碍目录、ObstacleScenario 组合
-    ├── safety/                      自由空间（配置空间膨胀）、到达时间波前、场景可行性
-    ├── scenarios/                   ScenarioSpec、level 总控、实测难度参数、构建与标定
-    ├── simulator/                   World 确定性内核、Env、Replay、Reward
-    ├── action/                      Action 类型、ActionSource、人工输入、运行时切换
-    ├── ai/                          自主基线控制器、模型接入契约
-    ├── cpu/                         CPU 决策层与 CPU↔FPGA 回路
-    ├── fpga/                        预测帧协议与 Python 参考实现
-    ├── hardware_interface/          开发板输入占位（TBD）+ 状态链路
-    ├── interface/                   Obs/Action 空间、扁平协议、控制器、HardwareLink
-    ├── prediction/                  闭式弹道、rollout、危险场
-    ├── dataset/                     schema、recorder、json/npz/csv/bin 读写
-    ├── benchmark/                   指标、runner、压力测试套件
-    ├── render/                      pygame / ASCII 视图、viewport、HUD、调试叠加
-    ├── tests/                       自动化测试（含 README 一致性检查）
-    ├── examples/                    可运行示例
-    ├── configs/                     场景配置样例（可直接 --scenario 加载）
-    ├── docs/                        架构、设计、输入模式、数据集、协议、重构分析、开源参考
-    └── cli.py                       命令行入口
+FPGA/                              ← git 根；根目录只放"调用代码"
+├── core/                          # 所有模块源码都在这下面
+│   ├── bullet_sim/                # 弹幕 / 动态障碍平台（本手册描述的对象）
+│   │   ├── core/                  状态容器 / RNG / 时钟 / 动作编解码 / 数值策略
+│   │   ├── entities/              Player / BulletPool / Target
+│   │   ├── physics/               运动积分（含圆弧与矩形自转）、玩家运动学、边界、相对运动
+│   │   ├── collision/             圆-圆、hitbox 形状、均匀网格、障碍 SDF、接触状态机
+│   │   ├── generators/            动态障碍 layout、SpawnEvent / SpawnTimeline
+│   │   ├── obstacles/             5 种现实障碍目录、ObstacleScenario 组合
+│   │   ├── safety/                自由空间（配置空间膨胀）、到达时间波前、场景可行性
+│   │   ├── scenarios/             ScenarioSpec、level 总控、实测难度参数、构建与标定
+│   │   ├── simulator/             World 确定性内核、Env、Replay、Reward
+│   │   ├── action/                Action 类型、ActionSource、人工输入、运行时切换
+│   │   ├── ai/                    自主基线控制器、模型接入契约
+│   │   ├── cpu/                   CPU 决策层与 CPU↔FPGA 回路
+│   │   ├── fpga/                  预测帧协议与 Python 参考实现
+│   │   ├── hardware_interface/    开发板输入占位（TBD）+ 状态链路
+│   │   ├── interface/             Obs/Action 空间、扁平协议、控制器、HardwareLink
+│   │   ├── prediction/            闭式弹道、rollout、危险场
+│   │   ├── dataset/               schema、recorder、json/npz/csv/bin 读写
+│   │   ├── benchmark/             指标、runner、压力测试套件
+│   │   ├── render/                pygame / ASCII 视图、viewport、HUD、调试叠加
+│   │   ├── tests/                 自动化测试（含 README 一致性检查）
+│   │   ├── examples/              可运行示例
+│   │   ├── configs/               场景配置样例（可直接 --scenario 加载）
+│   │   ├── docs/                  架构、设计、输入模式、数据集、协议、重构分析、开源参考
+│   │   └── cli.py                 命令行入口
+│   ├── cpu/                       CPU 决策代码
+│   ├── fpga/                      FPGA 程序
+│   └── vision/                    图像处理：primitives.py / wall_with_gap.py / capture_one_frame.py
+├── data/                          # 各模块的产物（本地生成，不入库）
+│   ├── bullet_sim/                平台产物：数据集、基准报告、模型权重、启动调试日志
+│   ├── cpu/                       CPU 决策产物
+│   ├── fpga/                      FPGA 产物
+│   └── vision/                    图像处理产物
+├── docs/                          # 文档与外部参考仓库（本地，不入库）
+│   ├── 分配.md / 算法开源项目.md
+│   ├── reference/                 第三方参考项目的逐文件技术拆解
+│   └── repo/                      克隆的第三方项目（Algo / Bullet / Camera / image_process）
+├── bullet_sim_run_demo.py         弹幕平台调用入口（前缀 = core/ 下的模块名）
+├── pyproject.toml                 打包；NumPy 是唯一硬依赖
+└── README.md                      本文件
 ```
 
-`bullet_sim/docs/` 另有：`bullet_sim/docs/ARCHITECTURE.md`（架构与实测性能）、
-`bullet_sim/docs/DESIGN.md`（设计与接口变更记录）、
-`bullet_sim/docs/INPUT_MODES.md`（人工 / 自主 / 开发板输入）、
-`bullet_sim/docs/PROTOCOL.md`（CPU/FPGA 协议）、
-`bullet_sim/docs/DATASET.md`（数据集）、
-`bullet_sim/docs/USAGE.md`（API 快速上手）、
-`bullet_sim/docs/REFACTOR_ANALYSIS.md`（动态障碍改造的结构分析）、
-`bullet_sim/docs/OPEN_SOURCE_REFERENCES.md`（开源参考与许可审查）。
+**约定**：`core/<模块>/` 放源码，`data/<模块>/` 放该模块的产物，根目录只放
+`<模块>_*.py` 形式的调用代码（前缀就是 `core/` 下的目录名）。`docs/`、`data/`
+与 `.pytest_cache/` 都不进 git。
+
+`core/bullet_sim/docs/` 另有：`core/bullet_sim/docs/ARCHITECTURE.md`（架构与实测性能）、
+`core/bullet_sim/docs/DESIGN.md`（设计与接口变更记录）、
+`core/bullet_sim/docs/INPUT_MODES.md`（人工 / 自主 / 开发板输入）、
+`core/bullet_sim/docs/PROTOCOL.md`（CPU/FPGA 协议）、
+`core/bullet_sim/docs/DATASET.md`（数据集）、
+`core/bullet_sim/docs/USAGE.md`（API 快速上手）、
+`core/bullet_sim/docs/REFACTOR_ANALYSIS.md`（动态障碍改造的结构分析）、
+`core/bullet_sim/docs/OPEN_SOURCE_REFERENCES.md`（开源参考与许可审查）。
 
 ---
 
 ## 16. Installation
 
 ```bash
-cd /home/zhang/Bullet_Platform
+cd /home/zhang/FPGA
 
 # 只要 NumPy（仿真 + 数据集 + 基准 + 测试全部可用）
 pip install -e .
@@ -661,15 +683,45 @@ pip install -e .
 pip install -e ".[dev]"
 ```
 
-`For_Test/` 是一份**本机便利虚拟环境**（内含 torch/pygame 等，约 5.7 GB），
-**刻意不入库**（见 `.gitignore`）。克隆仓库后请用上面两条 `pip install` 之一自建环境：
+`Env/` 是本机便利虚拟环境（Python 3.12 + numpy / opencv / pygame），**刻意不入库**
+（见 `.gitignore`）。克隆仓库后请用上面两条 `pip install` 之一自建环境：
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-零安装也可直接跑：`python3 run_demo.py`（自动把仓库根加入 `sys.path`，只需要 NumPy）。
+`pyproject.toml` 里配了 `[tool.setuptools.packages.find] where = ["core"]`，所以
+`pip install -e .` 装上的是 `core/bullet_sim/`，仓库根目录本身不需要放进 `sys.path`。
+
+零安装也可直接跑：`python3 bullet_sim_run_demo.py`（自动把 `core/` 加入 `sys.path`，只需要 NumPy）。
+
+### 16.1 每次启动的调试日志
+
+**每一次通过 CLI 启动平台，都会在模块的数据目录里留一份调试日志**，文件名带日期戳：
+
+```
+data/bullet_sim/debug_YYYYmmdd_HHMMSS.log
+```
+
+内容分三段：
+
+| 段 | 内容 |
+|---|---|
+| 头部 | 启动时间、子命令、完整 argv、cwd、仓库根、数据目录、Python/平台、numpy/pygame 版本、`bullet_sim` 版本与协议版本 |
+| 正文 | 该次运行**打印到 stdout/stderr 的全部内容**（原样镜像，stdout 本身不受影响，机器可读输出仍是机器可读） |
+| 尾部 | 结束时间、耗时、退出码；若异常退出则附完整 traceback |
+
+同一秒内二次启动不会覆盖前一份，会写成 `debug_YYYYmmdd_HHMMSS_1.log`。
+
+```bash
+BULLET_SIM_DEBUG_LOG=0 python -m bullet_sim play --level medium   # 关闭本次日志
+BULLET_SIM_DATA_DIR=/tmp/bs python -m bullet_sim info             # 改输出目录
+```
+
+pytest 下会**自动跳过**（一次测试运行不算"启动平台"），除非显式 `BULLET_SIM_DEBUG_LOG=1`。
+实现见 `core/bullet_sim/debug_log.py`，入口挂在 `cli.main()` 上，所以 `play` / `run` /
+`record` / `benchmark` / `replay` / `info` 等所有子命令都覆盖。
 
 ---
 
@@ -721,10 +773,10 @@ python -m bullet_sim run --obstacle-type corridor --corridor-motion close \
 引导式演示（约 30 秒）：
 
 ```bash
-python3 run_demo.py            # 默认导览
-python3 run_demo.py patterns   # 障碍场景与 level 总控
-python3 run_demo.py inputs     # 人工 / 自主 / 开发板三种模式对比
-python3 run_demo.py --help
+python3 bullet_sim_run_demo.py            # 默认导览
+python3 bullet_sim_run_demo.py patterns   # 障碍场景与 level 总控
+python3 bullet_sim_run_demo.py inputs     # 人工 / 自主 / 开发板三种模式对比
+python3 bullet_sim_run_demo.py --help
 ```
 
 ---
@@ -734,7 +786,7 @@ python3 run_demo.py --help
 ### 18.1 自动化测试
 
 ```bash
-python -m pytest bullet_sim/tests -q                 # 383 项，约 90 秒
+python -m pytest core/bullet_sim/tests -q                 # 389 项，约 90 秒
 python -m bullet_sim.tests.run_tests                 # 无 pytest 时的内置 runner
 BULLET_SIM_NO_PYTEST=1 python -m bullet_sim.tests.run_tests
 ```
@@ -743,12 +795,16 @@ BULLET_SIM_NO_PYTEST=1 python -m bullet_sim.tests.run_tests
 
 | 文件 | 覆盖 |
 |---|---|
-| `bullet_sim/tests/test_obstacle_environment.py` | 圆形角色（可视 = 碰撞）、5 种类型、边界生成、走廊各运动模式与墙心不动、level 总控与 extreme 安全区、安全 API、HUD、CLI |
-| `bullet_sim/tests/test_patterns.py` | 5 个 obstacle layout 的几何性质（区间随机、缺口下限、走廊对称/旋转限角、只保留现实形状） |
-| `bullet_sim/tests/test_collision_events.py` | 碰撞 = 惩罚事件的 10 项约定 |
-| `bullet_sim/tests/test_readme_consistency.py` | **本 README 与代码一致**（路径 / 命令 / 参数 / 字段） |
-| `bullet_sim/tests/test_protocol.py` | 协议 v1/v2/v3 编解码与 stride |
-| `bullet_sim/tests/test_determinism.py` | 同 seed 跨进程哈希一致 |
+| `core/bullet_sim/tests/test_obstacle_environment.py` | 圆形角色（可视 = 碰撞）、5 种类型、边界生成、走廊各运动模式与墙心不动、level 总控与 extreme 安全区、安全 API、HUD、CLI |
+| `core/bullet_sim/tests/test_patterns.py` | 5 个 obstacle layout 的几何性质（区间随机、缺口下限、走廊对称/旋转限角、只保留现实形状） |
+| `core/bullet_sim/tests/test_collision_events.py` | 碰撞 = 惩罚事件的 10 项约定 |
+| `core/bullet_sim/tests/test_readme_consistency.py` | **本 README 与代码一致**（路径 / 命令 / 参数 / 字段） |
+| `core/bullet_sim/tests/test_protocol.py` | 协议 v1/v2/v3 编解码与 stride |
+| `core/bullet_sim/tests/test_determinism.py` | 同 seed 跨进程哈希一致 |
+| `core/vision/tests/test_wall_with_gap.py` | **图像识别**（vision 模块）：合成图上的两段墙 + 缺口、角色圆、目标环；不依赖摄像头 |
+
+`core/vision/tests` 不属于平台包，跑法：`python -m pytest core/vision/tests -q`；
+直接 `python -m pytest` 会把两者一起收集（见 `pyproject.toml` 的 `testpaths`）。
 
 ### 18.2 手工验收清单
 
@@ -828,7 +884,7 @@ BULLET_SIM_NO_PYTEST=1 python -m bullet_sim.tests.run_tests
 
 拿到真板卡后的推荐顺序：
 
-1. **确定链路**（见第 5 节），把 `bullet_sim/hardware_interface/tbd.py` 填成真实值；
+1. **确定链路**（见第 5 节），把 `core/bullet_sim/hardware_interface/tbd.py` 填成真实值；
 2. 实现 `HardwareInputAdapter` 子类，先用 `LoopbackHardwareInputAdapter` 对照验证 `Action` 语义；
 3. 用 `FpgaPredictionReference` 当 golden model 写 HDL 测试向量：同一 state frame 必须得到
    逐位相同的 prediction frame；
@@ -845,7 +901,7 @@ BULLET_SIM_NO_PYTEST=1 python -m bullet_sim.tests.run_tests
 
 ## 21. 开源参考
 
-这些参考项目位于 `Outside/`（**不入库**，见 `.gitignore`），仅作为**技术思路**来源，
+这些参考项目位于 `docs/repo/`（**不入库**，见 `.gitignore`），仅作为**技术思路**来源，
 未复制任何代码或数据；每个项目的详细技术拆解见 `docs/reference/`。
 
 * **TostEngine**（README 自称 MIT，但仓库内**没有 LICENSE 文件正文** →
@@ -857,5 +913,5 @@ BULLET_SIM_NO_PYTEST=1 python -m bullet_sim.tests.run_tests
   摄像头接口、SDRAM 双帧缓冲、阈值分割与质心跟踪。
 
 本项目为独立 Python 实现，并额外提供自己的 State / Action / Dataset / Hardware Interface。
-逐条对比与许可证审查见 `bullet_sim/docs/OPEN_SOURCE_REFERENCES.md` 与
+逐条对比与许可证审查见 `core/bullet_sim/docs/OPEN_SOURCE_REFERENCES.md` 与
 `docs/reference/README.md`。

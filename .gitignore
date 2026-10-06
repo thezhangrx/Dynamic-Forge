@@ -1,41 +1,38 @@
 # ---------------------------------------------------------------------------
-# Bundled virtual environment (contains torch/pygame/... ~5.7 GB) - never commit
+# Local virtual environments - never commit
 # ---------------------------------------------------------------------------
+Env/
 For_Test/
 .venv/
 venv/
 env/
 
 # ---------------------------------------------------------------------------
-# Third-party reference material (kept locally for reading only)
-#   Outside/<category>/<project>/ : locally cloned reference projects
-#   (Algo / Bullet / Camera), ~1.4 GB, each with its own licence.
+# Documentation and third-party reference repositories (local only, not pushed)
 #
+#   docs/            this project's own notes (分配.md, 算法开源项目.md,
+#                    reference/*.md = third-party project teardowns)
+#   docs/repo/       cloned third-party projects (image_process / Algo /
+#                    Bullet / Camera), ~1.4 GB, each with its own licence
 #
-#   Why the whole tree is ignored rather than "everything except tech.md":
-#   these clones are git repositories themselves, so git refuses to track any
-#   single file inside them (a forced add is a silent no-op) and a re-include
-#   would instead add them as broken embedded repositories (gitlinks).
-#   The analysis notes are therefore committed as a tracked mirror under
-#   docs/reference/, with an in-place tech.md symlink next to each project.
+#   These are working material and are deliberately kept out of the pushed
+#   tree.  Licence status of every reference project:
+#   core/bullet_sim/docs/OPEN_SOURCE_REFERENCES.md
 # ---------------------------------------------------------------------------
-Outside/
-#   Keiki-master  : no LICENSE file found -> [LICENSE_REVIEW_REQUIRED]
-#   TostEngine... : MIT upstream, but it is a separate repository (~594 MB)
-# Push these only if you have checked the licence question; see
-# bullet_sim/docs/OPEN_SOURCE_REFERENCES.md
-# ---------------------------------------------------------------------------
-# (leading slash = repo root only, so these do not swallow the copies that
-#  now live under Outside/Bullet/)
-/Keiki-master/
-/TostEngine-cinder-bullethell-main/
-*.zip
+# NOTE: keep this root-anchored - a bare `docs/` also swallows the package's
+# own core/bullet_sim/docs/ directory.
+/docs/
 
 # ---------------------------------------------------------------------------
-# Generated simulation artifacts
+# Module outputs - one folder per module under data/, plus generated artifacts
+#
+#   data/bullet_sim/   platform results (datasets, benchmark JSON reports)
+#   data/cpu/          CPU decision results
+#   data/fpga/         FPGA results
+#   data/vision/       image-processing results
 # ---------------------------------------------------------------------------
-data/
-benchmarks_output/
+/data/
+/benchmarks_output/
 *.npz
 *.npy
 *.bin
@@ -58,8 +55,9 @@ dist/
 htmlcov/
 
 # ---------------------------------------------------------------------------
-# Editors / OS
+# Archives / Editors / OS
 # ---------------------------------------------------------------------------
+*.zip
 .idea/
 .vscode/
 *.swp
