@@ -5,6 +5,8 @@ The environment has exactly one generator (``obstacle``) and five layouts
 pin the properties the redesign exists for:
 
 * an object is born on a boundary and travels *into* the field;
+* small obstacles enter from **one** boundary and cross toward the opposite one
+  (debris drifts in a single direction; it does not converge from all sides);
 * a moving block enters from a band, never from a single point, and never runs
   outward;
 * a wall's opening is never narrower than the player circle;
@@ -200,6 +202,36 @@ def test_small_obstacles_are_circles_born_on_the_boundary():
         | (np.abs(offsets[:, 1] - FIELD_H) < 3.0)
     )
     assert on_edge.all(), f"some small obstacles were born in the middle: {offsets}"
+
+
+def test_small_obstacles_enter_from_a_single_boundary():
+    """Leaves/twigs drift in one direction - they do not come from four sides."""
+    spec = obstacle_spec("small", count=12, size=0.35)
+    event = emit(spec)[0]
+    offsets = np.asarray(event.offsets)
+
+    on_top = np.abs(offsets[:, 1] - FIELD_H) < 3.0
+    on_bottom = np.abs(offsets[:, 1]) < 3.0
+    on_left = np.abs(offsets[:, 0]) < 3.0
+    on_right = np.abs(offsets[:, 0] - FIELD_W) < 3.0
+    edges = [on_top, on_bottom, on_left, on_right]
+    assert sum(int(mask.any()) for mask in edges) == 1, (
+        f"small obstacles must use exactly one boundary, got {offsets}"
+    )
+    assert on_top.all(), "the default entry boundary for small_obstacles is the top edge"
+
+    # ...and they all travel the same way (downwards), inside the jitter cone
+    jitter = math.radians(30.0)          # small_obstacles default angle_jitter (deg)
+    inward = -math.pi / 2.0              # top edge -> toward the bottom
+    assert np.all(np.abs(np.asarray(event.angles) - inward) <= jitter + 1e-9)
+
+
+def test_small_obstacles_follow_the_configured_boundary():
+    event = emit(obstacle_spec("small", count=6, region="left"))[0]
+    offsets = np.asarray(event.offsets)
+    assert np.all(np.abs(offsets[:, 0]) < 3.0), f"expected the left edge: {offsets}"
+    jitter = math.radians(30.0)
+    assert np.all(np.abs(np.asarray(event.angles)) <= jitter + 1e-9), "must travel +x"
 
 
 def test_cross_traffic_uses_several_edges():

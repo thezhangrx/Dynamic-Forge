@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/bullet-platform/standard/obstacle/obstacle.json",
+  "title": "Obstacle（障碍）",
+  "description": "一个障碍 = 一个圆 或 一个旋转矩形，没有第三种原语。5 种现实类型（moving_block / wall_with_gap / small_obstacles / corridor / cross_traffic）共用同一套字段，靠 type 区分。矩形不变量：half_w >= half_h（长边恒为 half_w 轴）。注意 angle 是速度方向、rotation 是形状朝向，两者相差 90°。",
+  "x-standard-version": 1,
+  "type": "object",
+  "required": ["id", "shape", "x", "y"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "跨帧稳定的标识（单调递增，跨池 compact() 不变）。碰撞报告与数据集一律引用它，不要用槽位号。"
+    },
+    "frame_id": {
+      "type": "string",
+      "default": "field",
+      "description": "位置/速度/加速度所在的坐标系。默认场地世界系（原点左下，+x 右，+y 上）。"
+    },
+    "type": {
+      "type": ["string", "null"],
+      "enum": ["moving_block", "wall_with_gap", "small_obstacles", "corridor", "cross_traffic", null],
+      "default": null,
+      "description": "现实障碍类型。null 表示未分类。"
+    },
+    "type_id": {
+      "type": ["integer", "null"],
+      "enum": [0, 1, 2, 3, 4, 5, null],
+      "default": null,
+      "description": "线协议用的数值编码，与 type 一一对应：0=未分类, 1=moving_block, 2=wall_with_gap, 3=small_obstacles, 4=corridor, 5=cross_traffic。注意平台当前实现把 PatternSpec.type_id 默认写成 0，落地时需显式设置。"
+    },
+    "shape": {
+      "type": "string",
+      "enum": ["circle", "rect"],
+      "description": "原语种类。线协议编码 circle=0, rect=1。"
+    },
+    "x": { "type": "number", "description": "中心 x，世界单位。" },
+    "y": { "type": "number", "description": "中心 y，世界单位（向上为正）。" },
+    "vx": { "type": "number", "default": 0, "description": "速度 x，世界单位/秒。" },
+    "vy": { "type": "number", "default": 0, "description": "速度 y，世界单位/秒。" },
+    "ax": { "type": "number", "default": 0, "description": "加速度 x，世界单位/秒²。" },
+    "ay": { "type": "number", "default": 0, "description": "加速度 y，世界单位/秒²。" },
+    "radius": {
+      "type": ["number", "null"],
+      "exclusiveMinimum": 0,
+      "default": null,
+      "description": "圆的碰撞半径。shape=circle 时必填。"
+    },
+    "half_w": {
+      "type": ["number", "null"],
+      "exclusiveMinimum": 0,
+      "default": null,
+      "description": "矩形长边半长。shape=rect 时必填，且必须 >= half_h。圆形时约定 half_w = radius（同一套 clearance 代码通用）。"
+    },
+    "half_h": {
+      "type": ["number", "null"],
+      "exclusiveMinimum": 0,
+      "default": null,
+      "description": "矩形短边半长。shape=rect 时必填，且必须 <= half_w。"
+    },
+    "rotation": {
+      "type": "number",
+      "default": 0,
+      "description": "形状朝向（长边方向），弧度，世界系。平台的横墙为 0、竖墙为 π/2。"
+    },
+    "angle": {
+      "type": ["number", "null"],
+      "default": null,
+      "description": "速度方向，弧度。与 rotation 相差 90°，不是同一个量。线协议里为省 FPGA 的 atan2 而冗余存储，必须与 (vx,vy) 保持同步、不得独立修改。"
+    },
+    "angular_velocity": {
+      "type": "number",
+      "default": 0,
+      "description": "按形状解释：矩形 = 自转（绕自身中心，位置不变）；圆 = 速度方向的旋转率（曲线运动）。单位 弧度/秒。"
+    },
+    "ttl": {
+      "type": ["number", "null"],
+      "default": null,
+      "description": "生命周期（秒）；可为正无穷表示不消失（走廊的墙）。"
+    },
+    "age": { "type": ["number", "null"], "default": null, "minimum": 0, "description": "已存活时间（秒）。" },
+    "group_id": {
+      "type": ["integer", "null"],
+      "default": null,
+      "minimum": 0,
+      "description": "发射组。同一面 wall_with_gap 的两段共享同一个 group_id。"
+    },
+    "alive": { "type": "boolean", "default": true, "description": "存活标志。" },
+    "valid": { "type": "boolean", "default": true, "description": "本条观测是否可信。" },
+    "occluded": { "type": "boolean", "default": false, "description": "是否被遮挡或高光饱和（灯反光场景必用）。" },
+    "score": {
+      "type": ["number", "null"],
+      "default": null,
+      "minimum": 0,
+      "maximum": 1,
+      "description": "检测置信度，约定同 vision_msgs/ObjectHypothesis.score。"
+    },
+    "cov": {
+      "type": ["array", "null"],
+      "default": null,
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3,
+      "description": "[σxx, σxy, σyy]，位置协方差（2D 独立分量）。"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "shape": { "const": "circle" } }, "required": ["shape"] },
+      "then": { "required": ["radius"] }
+    },
+    {
+      "if": { "properties": { "shape": { "const": "rect" } }, "required": ["shape"] },
+      "then": { "required": ["half_w", "half_h"] }
+    },
+    {
+      "comment": "half_w >= half_h 的不变量（长边恒为 half_w 轴）",
+      "if": {
+        "properties": { "shape": { "const": "rect" } },
+        "required": ["half_w", "half_h"]
+      },
+      "then": {
+        "properties": {
+          "half_w": { "type": "number" },
+          "half_h": { "type": "number" }
+        }
+      }
+    }
+  ],
+  "examples": [
+    {
+      "id": 1042,
+      "type": "small_obstacles",
+      "type_id": 3,
+      "shape": "circle",
+      "frame_id": "field",
+      "x": 88.0,
+      "y": 470.0,
+      "vx": 0.0,
+      "vy": -95.0,
+      "ax": 0.0,
+      "ay": 0.0,
+      "radius": 3.5,
+      "angle": -1.5708,
+      "angular_velocity": 0.0,
+      "ttl": 12.0,
+      "age": 1.4,
+      "group_id": 7,
+      "alive": true,
+      "score": 0.81,
+      "valid": true,
+      "occluded": false
+    },
+    {
+      "id": 2001,
+      "type": "wall_with_gap",
+      "type_id": 2,
+      "shape": "rect",
+      "frame_id": "field",
+      "x": 73.5,
+      "y": 270.0,
+      "vx": 0.0,
+      "vy": -40.0,
+      "half_w": 73.5,
+      "half_h": 9.5,
+      "rotation": 0.0,
+      "angle": -1.5708,
+      "ttl": 20.0,
+      "group_id": 11,
+      "alive": true,
+      "score": 0.95
+    }
+  ]
+}

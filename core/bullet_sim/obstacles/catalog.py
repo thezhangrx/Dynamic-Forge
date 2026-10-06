@@ -93,11 +93,13 @@ SMALL_OBSTACLES = ObstacleType(
     label="Small Obstacles",
     label_zh="小型动态障碍",
     simulates=(
-        "树林/复杂自然环境中的枝叶、漂浮物，或人群/车流中的细小动态物体。"
+        "树林/复杂自然环境中的枝叶、漂浮物（沿一个方向飘来），"
+        "或人群/车流中的细小动态物体。"
         "稀疏与密集只是同一个障碍的两个参数，因此合并为一个类型。"
     ),
     motion=(
-        "尺寸远小于玩家的圆形障碍从各个边界进入，方向在进入方向附近随机扰动，"
+        "尺寸远小于玩家的圆形障碍从**同一个侧边界**进入（`spawn` 选边，默认 `top`），"
+        "朝该边界的**对向**横穿场地，方向在进入方向附近随机扰动，"
         "彼此分散或密集（由 count / interval / size 决定），相对运动以"
         "'擦身而过'为主，而非正面对撞。"
     ),
@@ -108,7 +110,7 @@ SMALL_OBSTACLES = ObstacleType(
     layout="small",
     shape="circle",
     safety_strategy="local_free",
-    defaults={"size": 0.35, "angle_jitter": 30.0, "count": 12},
+    defaults={"size": 0.35, "angle_jitter": 30.0, "count": 12, "spawn": "top"},
 )
 
 # --------------------------------------------------------------------------

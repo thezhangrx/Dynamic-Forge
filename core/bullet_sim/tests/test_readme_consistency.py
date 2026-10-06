@@ -132,8 +132,19 @@ def test_every_flag_named_anywhere_in_the_readme_exists(readme_text: str, parser
     mentioned = set(
         re.findall(r"(?<![\w-])(--[a-z][a-z0-9\-]*)(?![\w])", readme_text)
     )
-    # flags that belong to tools other than this CLI (pip, pytest, git, ...)
-    external = {"--version", "--upgrade", "--user", "--prefix"}
+    # Flags that belong to tools other than this CLI.  The root README is the
+    # whole-repo manual, so it also documents the sibling entry points under
+    # core/vision/ - those flags are legitimate and must not be reported here.
+    external = {
+        # pip / pytest / git
+        "--version", "--upgrade", "--user", "--prefix",
+        # vision_live.py   (实时视频)
+        "--device", "--width", "--height", "--fps", "--fourcc", "--window",
+        "--headless", "--no-overlay", "--seconds",
+        # vision_detect.py (图像识别)
+        "--image", "--out-dir", "--no-save", "--wall-diff", "--edge-min",
+        "--min-gap-px",
+    }
     unknown = sorted(f for f in mentioned if f not in known and f not in external)
     assert not unknown, f"README mentions flags the CLI does not accept: {unknown}"
 
@@ -254,16 +265,26 @@ def test_readme_does_not_claim_a_trained_model_exists(readme_text: str):
 
 
 def test_readme_states_the_real_test_count(readme_text: str):
-    """If the README quotes a test count, it must match reality."""
+    """If the README quotes a test count, it must not be absurdly stale.
+
+    The bound is derived from the number of test *modules* rather than being a
+    frozen window: the suite keeps growing, and a hard-coded range silently
+    turns into "any accurate number above the old maximum fails" (the previous
+    ``abs(q - 270) < 120`` rejected a correct 391).
+    """
     from bullet_sim.tests.run_tests import discover
 
     module_count = len(discover())
     assert module_count >= 10
-    # the README may quote a number; if it does, it must not be absurdly stale
+    # Each test module holds at least a handful of cases; parametrisation pushes
+    # the collected count above the number of ``def test_`` functions, so the
+    # upper bound is deliberately loose.
+    lo, hi = module_count * 5, module_count * 60
     quoted = re.findall(r"(\d{2,4})\s*(?:项|automated tests|tests)\b", readme_text)
     if quoted:
-        assert any(abs(int(q) - 270) < 120 for q in quoted), (
-            f"README quotes a test count {quoted} that is far from reality"
+        assert any(lo <= int(q) <= hi for q in quoted), (
+            f"README quotes a test count {quoted} that is far from reality: "
+            f"expected something in [{lo}, {hi}] for {module_count} test modules"
         )
 
 

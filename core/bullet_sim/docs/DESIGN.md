@@ -341,7 +341,7 @@ ObstacleScenario(name, seed, duration, dt, field_w, field_h,
 
 * `block` - 从边界一段区间**随机位置**进入，速度强制指向场内（给向外的角度也会被纠正）；
 * `wall_gap` - 缺口 ≥ 玩家圆直径，缺口位置随机抖动 / 可扫动；
-* `small` - 边界进入的圆形小障碍；
+* `small` - 从**同一个侧边界**进入（`spawn` 选边，默认 `top`）、朝对向边界横穿的圆形小障碍；
 * `cross` - 多方向同时进入；
 * `corridor` - 角色生成在两堵墙**正中间**，两墙以角色为中心对称、**墙心不动**，
   只通过 `open`/`close`（对称平移改变宽度）、`rotate_same`（同向自转 → 通道整体倾斜，
