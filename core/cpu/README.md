@@ -15,24 +15,27 @@ CPU 侧的两件事：**从"看见障碍"到"给出速度指令"的避障算法*
 # 0) 依赖：NumPy 是唯一硬依赖；pygame 只有可视化需要
 python -m pip install -e ".[dev]"
 
-# 1) 算法自检（不需要 pygame、不需要仿真器）
-python core/cpu/gap_avoid.py
+# 1) 根入口（README 承诺的那个，已就位）
+python cpu_run_demo.py selftest            # gap_avoid 零依赖自检，不需要 pygame
+python cpu_run_demo.py gap                 # 缺口墙避障演示（incoming 场景）
+python cpu_run_demo.py gap --scene drive --episodes 5   # 连过三堵墙
+python cpu_run_demo.py gap --headless -e 5 # 不开窗口，只打印统计
+python cpu_run_demo.py paths               # 排查环境：打印解析到的模块路径
 
-# 2) 缺口墙避障演示：车朝墙开过去，缺口会动
+# 2) 也可以直接跑模块内脚本（根入口只是转发）
+python core/cpu/gap_avoid.py
 python core/cpu/gap_wall_demo.py --scene incoming --episodes 5
-python core/cpu/gap_wall_demo.py --scene drive --walls 3      # 连过三堵墙
 
 # 3) 本模块的测试
 python -m pytest core/cpu/tests -q
 
-# 4) 整条闭环（渲染 → 真实视觉 → 决策 → 动作），在仓库根：
+# 4) 整条闭环（渲染 → 真实视觉 → 决策 → 动作）
 python cpu_vision_loop.py --synthetic --episodes 5 --seconds 16
 ```
 
-> ⚠ **根入口 `cpu_run_demo.py` 还不存在。** 仓库约定是"根目录放
-> `<模块>_*.py` 调用代码"，本模块按约定该有一个 `cpu_run_demo.py`，
-> 上面第 1/2 条最终应该由它转发。目前请直接跑 `core/cpu/` 下的脚本。
-> 这是已知缺口，不是笔误。
+> 根入口 `cpu_run_demo.py` 的 `version` / `bench` 两个子命令**已删除**：
+> 它们依赖已移除的 `cpu.decision.build`（BUILD_ID）与
+> `cpu.benchmark_decision`，见 §4。
 
 ---
 
