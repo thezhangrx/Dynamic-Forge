@@ -95,8 +95,19 @@ class Tracker:
 
     alpha: float = DEFAULT_ALPHA
     beta: float = DEFAULT_BETA
-    #: 关联门限（世界单位）。超过就不认为是同一个目标 —— 太大串目标、太小总丢。
-    gate: float = 0.6
+    #: 关联门限的**基础**值（世界单位）。超出就不认为是同一个目标。
+    #:
+    #: 默认 24 ≈ 1.2 个玩家直径（平台把间距都以 ``player_diameter = 2r`` 计价，
+    #: 障碍场景里 r=10）。**这个数不能拍脑袋选小**：实测在 640x480 的场地里，
+    #: 角色一帧能走 1.67 个单位，而门限如果按"米"的习惯写成 0.6，
+    #: 结果每一帧都判成新目标 —— 每条轨迹只活一帧，速度恒为 0，
+    #: 而位置看起来还是对的，所以这个 bug 特别难发现。
+    gate: float = 24.0
+    #: 门限随目标**自身速度**放宽的比例：``gate + frac * |v| * dt``。
+    #:
+    #: 快速目标本来就该有更大的搜索窗，否则它总会"跑出门限"。
+    #: 取 0.5 表示"允许比按惯性预测的落点再多偏半个身位"。
+    gate_speed_frac: float = 0.5
     #: 连续丢失多少帧后删除轨迹。
     max_misses: int = 5
     #: 两帧间隔超过它就**不做预测**（速度置零重来），避免跨大间隔乱推。
@@ -129,7 +140,10 @@ class Tracker:
         used = [False] * len(detections)
         matched: dict[int, int] = {}                  # 轨迹下标 -> 检测下标
         for ti, (px, py) in enumerate(predicted):
-            best_j, best_d = -1, self.gate
+            t = self._tracks[ti]
+            # 自适应门限：跑得快的目标给更大的搜索窗（一次乘加，仍然可流水）
+            gate = self.gate + self.gate_speed_frac * t.speed * (dt if dt > 0.0 else 0.0)
+            best_j, best_d = -1, gate
             for j, (zx, zy) in enumerate(detections):
                 if used[j]:
                     continue

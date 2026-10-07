@@ -36,13 +36,19 @@ Documentation = "core/bullet_sim/docs/ARCHITECTURE.md"
 
 # All module source lives under core/ (core/bullet_sim, core/cpu, core/fpga,
 # core/vision); the repository root only holds the driver scripts that call it.
+# `cpu` 与 `vision` **必须列上**：漏了它们，干净 `pip install .` 装出来的包
+# 缺两个模块，而仓库内开发（conftest 往 sys.path 塞 core/）看不出问题 ——
+# 交付要求是"可复现工程"，这一步不能只在开发者机器上成立。
 [tool.setuptools.packages.find]
 where = ["core"]
-include = ["bullet_sim*", "standard*"]
+include = ["bullet_sim*", "cpu*", "harness*", "vision*", "standard*"]
 
 [tool.setuptools.package-data]
 bullet_sim = ["docs/*.md", "configs/*.json"]
 
 [tool.pytest.ini_options]
-testpaths = ["core/bullet_sim/tests", "core/vision/tests", "core/standard/tests"]
+# `core/cpu/tests` 与 `core/harness/tests` 也在里面：漏掉时裸 `pytest` 会
+# **静默跳过**这两个模块（含闭环端到端），"本地全绿"就是个假象。
+testpaths = ["core/bullet_sim/tests", "core/cpu/tests", "core/harness/tests",
+             "core/vision/tests", "core/standard/tests"]
 filterwarnings = ["error::DeprecationWarning:bullet_sim.*"]

@@ -36,28 +36,72 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
+def frame_is_usable(bgr, *, min_mean: float = 8.0, max_mean: float = 250.0) -> bool:
+    """这一帧是不是"能用的画面"。
+
+    判据来自实测的两个真实故障：
+
+    * **全白**：相机的自动曝光被拉满（或链路出问题）时，整帧饱和成纯白，
+      均值 ~254。此时任何阈值检测都会把整幅图当成目标。
+    * **全黑**：镜头被挡住 / 隐私快门关闭（笔记本内置摄像头实测如此）。
+
+    这只挡"整帧废掉"的情况，不做内容判断 —— 内容判断属于具体算法。
+    """
+    import numpy as np
+    a = np.asarray(bgr)
+    if a.size == 0:
+        return False
+    mean = float(a.mean())
+    return min_mean <= mean <= max_mean
+
+
+def capture_bgr(device: int = 0, width: int = 640, height: int = 480,
+                warmup: int = 25, *, tries: int = 5):
+    """抓一帧 BGR 图像（``numpy`` 数组）；失败返回 ``None``。
+
+    单独抽出来是为了让 `vision_calibrate.py --capture` 复用同一条采集路径 ——
+    采集参数（MJPG 必须在宽高之前设、warmup 帧数）只在这里定义一次。
+
+    ``tries`` 次里挑第一帧"画面正常、且和上一帧不同"的：只读一帧的话，
+    可能拿到自动曝光还没收敛的画面，或者链路卡住重复吐出的同一帧
+    （实测出现过整帧纯白、连续 12 帧逐字节相同的情况）。
+    """
+    cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+    # MJPG 下多数 USB 摄像头才能跑到 60fps；顺序必须在设置宽高之前。
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    if not cap.isOpened():
+        cap.release()
+        return None
+
+    for _ in range(max(0, warmup)):
+        cap.grab()
+    prev = None
+    good = None
+    for _ in range(max(1, tries)):
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            continue
+        if frame_is_usable(frame):
+            good = frame
+            # 再确认画面在变：卡住的链路会重复吐同一帧。
+            if prev is not None and not (frame == prev).all():
+                break
+        prev = frame
+    cap.release()
+    return good
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     out = args.out or _DEFAULT_DIR / f"frame_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
-    # MJPG 下多数 USB 摄像头才能跑到 60fps；顺序必须在设置宽高之前。
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    if not cap.isOpened():
-        print(f"[FAIL] 打不开 /dev/video{args.device}")
+    frame = capture_bgr(args.device, args.width, args.height, args.warmup)
+    if frame is None:
+        print(f"[FAIL] 打不开 /dev/video{args.device} 或读不到帧")
         return 2
-
-    for _ in range(max(0, args.warmup)):
-        cap.grab()
-    ok, frame = cap.read()
-    cap.release()
-
-    if not ok or frame is None:
-        print("[FAIL] 打开成功但读不到帧")
-        return 3
     if not cv2.imwrite(str(out), frame):
         print(f"[FAIL] 写文件失败: {out}")
         return 4

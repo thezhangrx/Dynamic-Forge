@@ -144,6 +144,16 @@ def test_every_flag_named_anywhere_in_the_readme_exists(readme_text: str, parser
         # vision_detect.py (图像识别)
         "--image", "--out-dir", "--no-save", "--wall-diff", "--edge-min",
         "--min-gap-px",
+        # vision_calibrate.py (参考物标定)
+        "--auto", "--corners", "--marker", "--marker-color", "--name",
+        "--out", "--warp", "--relative", "--capture", "--field",
+        "--warmup",
+        # vision_track.py (视频 → 坐标/速度)
+        "--video", "--frames", "--calibration", "--max-frames", "--gate",
+        "--track", "--summary", "--decide",
+        # cpu_vision_loop.py (摄像头闭环)
+        "--synthetic", "--camera", "--control-hz", "--episodes", "--seconds",
+        "--gap-width", "--obstacle-speed", "--margin", "--forward",
     }
     unknown = sorted(f for f in mentioned if f not in known and f not in external)
     assert not unknown, f"README mentions flags the CLI does not accept: {unknown}"

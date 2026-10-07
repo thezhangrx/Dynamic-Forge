@@ -138,6 +138,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--danger-every", type=int, default=4,
                    help="recompute the danger field every N rendered frames")
     p.add_argument("--horizon", type=int, default=90)
+    p.add_argument("--fullscreen", action="store_true",
+                   help="全屏显示场地（调试视觉时建议开：场地就是整个屏幕，"
+                        "窗口外的桌面内容不会再被当成目标）")
+    p.add_argument("--gap-position", type=float, default=None,
+                   help="wall_with_gap 缺口在场地宽度上的位置 0~1（默认 0.5 = 正中）")
+    p.add_argument("--gap-motion", default=None, choices=("static", "sweep"),
+                   help="缺口动不动（默认 sweep；录调试视频时建议 static，"
+                        "否则缺口会自己游走到角色身上，测不出控制有没有生效）")
+    p.add_argument("--calib-marker", action="store_true",
+                   help="draw the calibration reference at the field origin "
+                        "(for a camera filming the screen)")
+    p.add_argument("--calib-marker-w", type=float, default=0.90,
+                   help="reference width as a fraction of field_w (default 0.90)")
+    p.add_argument("--calib-marker-h", type=float, default=0.90,
+                   help="reference height as a fraction of field_h (default 0.90)")
+    p.add_argument("--calib-marker-color", default="800080",
+                   help="reference colour as RRGGBB hex (default 800080 half-intensity magenta; "
+                        "magenta is immune to the room's white glare)")
     p.add_argument("--scale", type=float, default=1.0)
     p.add_argument("--no-switch", action="store_true",
                    help="disable runtime MANUAL<->AUTO switching (no TAB binding)")
@@ -288,6 +306,22 @@ def _level_value(level: str) -> Any:
         return level
 
 
+def parse_hex_color(text: str) -> tuple[int, int, int]:
+    """``"FF00FF"`` / ``"#ff00ff"`` → ``(255, 0, 255)``。
+
+    只接受 6 位十六进制；解析不出来时抛 ``ValueError``（由命令行报错），
+    不做静默回退 —— 颜色写错时画出个别的颜色比直接报错更难查。
+    """
+    s = str(text).strip().lstrip("#")
+    if len(s) != 6:
+        raise ValueError(f"colour must be 6 hex digits (RRGGBB), got {text!r}")
+    try:
+        v = int(s, 16)
+    except ValueError:
+        raise ValueError(f"colour must be 6 hex digits (RRGGBB), got {text!r}") from None
+    return ((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF)
+
+
 def _spec_from_args(args: argparse.Namespace):
     from bullet_sim.scenarios.builder import build_scenario
     from bullet_sim.scenarios.presets import stress
@@ -333,6 +367,8 @@ def _obstacle_scenario_from_args(args: argparse.Namespace):
             ("obstacle_size", "size"),
             ("obstacle_interval", "interval"),
             ("gap_width", "gap_width"),
+            ("gap_position", "gap_position"),
+            ("gap_motion", "gap_motion"),
             ("corridor_width", "corridor_width"),
             ("corridor_min_width", "corridor_min_width"),
             ("corridor_walls", "walls"),
@@ -787,6 +823,10 @@ def _print_play_banner(args, spec, play, env) -> None:
     print("=" * 74)
 
 
+#: `play` 不给 `--duration` 时的默认场景时长（秒）。见 `cmd_play` 里的说明。
+PLAY_DEFAULT_SECONDS = 1800.0
+
+
 def cmd_play(args: argparse.Namespace) -> int:
     import time
 
@@ -796,6 +836,12 @@ def cmd_play(args: argparse.Namespace) -> int:
     from bullet_sim.render.base import make_renderer
     from bullet_sim.simulator.env import BulletHellEnv
 
+    # 交互窗口默认只跑 30 秒（场景默认 duration）就自己关了 —— 对看窗口的人太短，
+    # 而且 `--max-steps` **单独加长不了**：env 会在 spec.total_steps 处截断
+    # （实测 `--max-steps 300000` 仍然只跑 3600 步）。所以给 play 一个更长的默认，
+    # 按 ESC/Q 随时退。
+    if args.duration is None and args.max_seconds is None:
+        args.duration = PLAY_DEFAULT_SECONDS
     spec = _spec_from_args(args)
     _report, ok = _run_safety_check(args, spec)
     if not ok:
@@ -844,6 +890,11 @@ def cmd_play(args: argparse.Namespace) -> int:
             interactive=False,
             input_source=play.source,
             controller=play.controller,
+            # 标定参考物：相机拍屏幕时用它建场地坐标系
+            fullscreen=args.fullscreen,
+            show_calibration_marker=args.calib_marker,
+            calibration_marker=(args.calib_marker_w, args.calib_marker_h),
+            calibration_marker_color=parse_hex_color(args.calib_marker_color),
         )
     except Exception as exc:
         print(f"cannot open a window ({exc}).", file=sys.stderr)

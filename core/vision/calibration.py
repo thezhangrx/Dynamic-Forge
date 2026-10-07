@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from . import primitives as P
+from . import subpixel as S
 
 #: 本规范版本（与 core/standard 的字段命名保持一致）。
 CALIBRATION_VERSION = 1
@@ -209,39 +210,83 @@ class Marker:
                 (self.width_m, self.height_m), (0.0, self.height_m))
 
 
-def detect_marker_quad(frame: "P.Frame", *, min_area_frac: float = 0.02,
-                       bright_min: int = 170, spread: int = 60) -> tuple[Point, ...] | None:
-    """在画面里找那枚**最亮的矩形参考物**，返回它的 4 个角点（图像坐标）。
+def marker_channels(colour: tuple[int, int, int]) -> tuple[int, int, int]:
+    """把参考物颜色拆成 ``(弱通道, 强通道1, 强通道2)`` 三个下标。
 
-    做法与整个 vision 模块一致，全是能翻 Verilog 的算子：
+    参考物是一个**饱和色**，所以它必有一个通道接近 0、另外两个很高。
+    判据就看"弱通道是不是被两个强通道压住"，也就是 ``弱·k ≤ 强``。
+    """
+    order = sorted(range(3), key=lambda i: colour[i])
+    return order[0], order[1], order[2]
 
-    1. 逐像素阈值（比较器）→ 掩膜；
-    2. 扫描线连通域找**最大**的一块（一行游程缓存 + 累加器）；
-    3. 用"对角极值"取四角：``min(x+y) / max(x−y) / max(x+y) / min(x−y)``
-       —— 就是 4 个累加器，比轮廓/多边形拟合便宜得多，而且对凸四边形是准确的。
 
-    相机不可用时这个函数不参与测试（用合成图测）。
+def detect_marker_quad(frame: "P.Frame", *, min_area_frac: float = 0.004,
+                       colour: tuple[int, int, int] = (128, 0, 128),
+                       level_min: int = 60, weak_pct: int = 90,
+                       min_side: int = 16, max_aspect: float = 6.0,
+                       min_fill: float = 0.45, refine: bool = True
+                       ) -> tuple[Point, ...] | None:
+    """在画面里找那枚**饱和色矩形参考物**，返回 4 个角点（图像坐标）。
+
+    全是能直接翻 Verilog 的算子，没有浮点：
+
+    1. **颜色键**（比较器 + 常数乘）：参考物默认**半强度洋红** (128,0,128)，
+       判据是"弱通道 / 强通道 ≤ ``weak_pct``%"，即 ``弱·100 ≤ 强·weak_pct``。
+    2. **连通域**（一行游程缓存 + 重叠匹配，`primitives.scanline_blobs`）；
+    3. **面积 / 边长 / 填充率**三档过滤，把屏幕上零星的洋红 UI 像素筛掉；
+    4. **对角极值取角**：``min(x+y) / max(x−y) / max(x+y) / min(x−y)``，
+       就是 4 个累加器，比轮廓拟合便宜得多，对凸四边形是准确的。
+
+    ### 为什么判据不是 `2G ≤ R`（真实数据逼出来的两次改动）
+
+    第一版用白色（"三通道都亮且接近"）—— 被房间灯光在屏幕上糊出的反光淹没：
+    实测反光块 36065 px、白块 6468 px，"取最大亮块"必然选错。
+
+    第二版改成满强度洋红 + `2G ≤ R`（要 R/G ≥ 2）。离线渲染测试全过，
+    **真机却一个像素都认不出来**。原因在相机的色调曲线：暗房间里拍亮屏幕，
+    通道会往外扩。实测一帧（屏幕真值 → 相机）：
+
+    | 元素 | 相机 R / G / B | R/G |
+    |---|---|---|
+    | 参考物（满强度洋红 255,0,255） | 243 / 243 / 238 | **1.00** |
+    | 参考物（半强度洋红 128,0,128） | 254 / 166 / 245 | **1.53** |
+    | 场地暗背景 | 115 / 120 / 125 | 0.96 |
+    | 墙（亮线） | 127 / 127 / 126 | 1.00 |
+    | 玩家白圆 | 254 / 254 / 248 | 1.00 |
+
+    两个结论：①**满强度反而最差** —— 通道饱和后曲线把色差压平，反而是半强度
+    留出了余量；②真正的分界不在 R/G = 2，而在 **0.68（参考物） vs 0.96~1.00（其它一切）**。
+    所以默认色改成半强度洋红，判据改成比例阈值 85%。这两个数是**量出来的**，
+    不是拍的，`weak_pct` 和 `colour` 都留成了参数供现场微调。
+
+    相机不可用时这个函数不参与测试（用合成图 / 离屏渲染测）。
     """
     w, h = frame.width, frame.height
+    weak, sa, sb = marker_channels(colour)
+    chans = (frame.r, frame.g, frame.b)
+    weak_px, a_px, b_px = chans[weak], chans[sa], chans[sb]
+
     mask = bytearray(frame.n)
-    lo = bright_min
     for i in range(frame.n):
-        b, g, r = frame.b[i], frame.g[i], frame.r[i]
-        hi = r if r > g else g
-        if b > hi:
-            hi = b
-        low = r if r < g else g
-        if b < low:
-            low = b
-        if low > lo and (hi - low) < spread:
+        v = weak_px[i]
+        x = a_px[i]
+        y = b_px[i]
+        # 弱通道相对两个强通道都要够小（比例判据），且整体够亮。
+        # weak_pct ≤ 100 保证 v ≤ max(x, y)，所以 max(x, y) 就是三通道最大值。
+        if v * 100 <= x * weak_pct and v * 100 <= y * weak_pct and (x >= level_min or y >= level_min):
             mask[i] = 1
 
-    blobs = P.scanline_blobs(mask, w, 0, h - 1, 0, w - 1, min_area=32)
-    if not blobs:
+    min_area = max(32, int(min_area_frac * w * h))
+    blobs = P.scanline_blobs(mask, w, 0, h - 1, 0, w - 1, min_area=min_area)
+    # ``max_aspect`` 是分开"参考物"和"墙"的关键：参考物占场地 0.30x0.20（约 2:1，
+    # 斜视下最多也就 4:1 上下），而墙是 640x26（约 24:1）。少了这一条，
+    # 一堵用了同色系粉 (230,130,220) 的墙会被整根认成参考物。
+    cands = [b for b in blobs
+             if b.w >= min_side and b.h >= min_side
+             and b.aspect <= max_aspect and b.fill >= min_fill]
+    if not cands:
         return None
-    best = max(blobs, key=lambda b: b.area)
-    if best.area < min_area_frac * w * h:
-        return None
+    best = max(cands, key=lambda b: b.area)
 
     # 对角极值 → 四角（凸四边形上这四个点就是角点）
     # 注意四个量都取"最小化"：min(x+y) / min(x−y) / min(−(x+y)) / min(−(x−y))，
@@ -264,11 +309,30 @@ def detect_marker_quad(frame: "P.Frame", *, min_area_frac: float = 0.02,
                     corners[key] = (float(x), float(y))
     if any(v is None for v in corners.values()):
         return None
-    # 按"图像里"的左上/右上/右下/左下顺序返回，便于和 Marker 的四角一一对应
-    pts = [corners["sum_min"], corners["diff_max"],
-           corners["sum_max"], corners["diff_min"]]
+    # 顺序必须与 Marker.world_corners() 一致：**左下 → 右下 → 右上 → 左上**。
+    # 图像坐标系 y 向下，所以：
+    #   diff_min = x−y 最小 = 左下 (BL)      sum_max = x+y 最大 = 右下 (BR)
+    #   diff_max = x−y 最大 = 右上 (TR)      sum_min = x+y 最小 = 左上 (TL)
+    # 之前返回的是 [TL, TR, BR, BL]（图像顺序），与标定要求的循环**起点和方向都不同**，
+    # 会让解出来的 H 整体转 90°。
+    #
+    # **像素下标 → 连续坐标**：像素 i 覆盖连续区间 [i, i+1)。对角极值取到的是
+    # 最外侧的**内部**像素下标，所以边界落在最小边的左外沿 (= 下标) 和最大边的
+    # 右外沿 (= 下标 + 1)。少了这一步，参考物的宽高会各少 1 px，标定出来的
+    # 尺度就系统性偏大约 1/192 —— 单应残差看不出来，因为它是个整体缩放。
+    c = corners
+    pts = [(c["diff_min"][0], c["diff_min"][1] + 1),          # 左下
+           (c["sum_max"][0] + 1, c["sum_max"][1] + 1),        # 右下
+           (c["diff_max"][0] + 1, c["diff_max"][1]),          # 右上
+           (c["sum_min"][0], c["sum_min"][1])]                # 左上
     if len({p for p in pts}) < 4:
         return None
+    if refine:
+        # 掩膜只能给整数边界；这里沿四条边各取若干剖面、找半高穿越点，
+        # 把四条边平移到位后再求交 —— 亚像素四角。见 `subpixel.py`。
+        pts = S.refine_quad(
+            frame, pts,
+            score=lambda r, g, b: S.magenta_score(r, g, b, weak_pct=weak_pct))
     return tuple(pts)  # type: ignore[return-value]
 
 
@@ -285,9 +349,20 @@ class FieldCalibration:
 
     #: 图像 → 场地 的单应（3×3 行主序）。
     H: Mat3
-    #: 场地尺寸（世界单位）。0 表示不限制。
+    #: **场地的世界尺寸**（世界单位）。0 表示不知道，此时跳过"越界检查"。
+    #:
+    #: 注意别和下面的 ``marker_width_m``/``marker_height_m`` 搞混：
+    #: 这两个是**场地**多大，那两个是**参考物**多大。以前这里存的是参考物尺寸
+    #: （名字叫 field_* 却装 marker_*），于是"坐标有没有跑出场外"根本无从判断 ——
+    #: 实测踩过一次：窗口挪了位置、标定失效，算出来的角色坐标是 (796, 602)，
+    #: 场地只有 640x480，**一路没有任何提示**。
     field_width: float = 0.0
     field_height: float = 0.0
+    #: 标定时平台窗口的 X 几何 ``(x, y, w, h)``；拿不到就是 ``None``。
+    #:
+    #: 标定只在"相机与屏幕的相对几何不变"时有效。把窗口几何记下来，
+    #: 用的时候一比就知道这份标定是不是给当前这个窗口的。
+    window: tuple[int, int, int, int] | None = None
     #: **度量衡**：1 个世界单位 = 多少米。标定后必然确定。
     metres_per_unit: float = 1.0
     #: 标定所用的图像尺寸。
@@ -298,7 +373,27 @@ class FieldCalibration:
     marker_width_m: float = 0.0
     marker_height_m: float = 0.0
     #: 标定残差（像素）。越小越可信。
+    #:
+    #: **注意：只有 4 组对应点时它恒等于 0**（4 点唯一确定一个单应），
+    #: 所以它**完全不衡量外推质量** —— 参考物挤在一个角上时，
+    #: 残差 0.0000 px 而预测出来的场地能偏出 20%。要判断可信度请看
+    #: `marker_coverage`。
     rms_px: float = 0.0
+    #: 世界坐标的**单位名**：``"m"`` = 米；``"field"`` = 场地单位
+    #: （即"世界单位就是场地像素"，``--relative`` 模式）。
+    #:
+    #: 为什么必须显式记下来：``--relative`` 标出来的坐标是场地单位，
+    #: 如果下游按"米"理解，数值会被原样当成米用 —— 尺度错了却什么都看不出来。
+    #: ``localize.to_world`` 用它决定输出 ``units`` 是 ``m`` 还是 ``px``。
+    unit: str = "m"
+    #: 参考物面积 / 场地面积。**这才是标定可信度的指标**。
+    #:
+    #: 单应是靠参考物的 4 个角点解出来的，用它去预测参考物**以外**的区域
+    #: 属于外推。4 个点越集中，外推越不适定：实测参考物只占场地
+    #: 0.30x0.20（全挤在左下角）时，预测的场地四角比真实场地小一大截、
+    #: 透视也被拉过头；换成 0.92x0.92 后立刻贴合。
+    #: 经验阈值：< 0.5 就该警告用户加大参考物。
+    marker_coverage: float = 0.0
     #: 可选内参/畸变（有就先做去畸变再映射；相机不可用时留空）。
     K: tuple[float, ...] | None = None
     D: tuple[float, ...] | None = None
@@ -348,6 +443,7 @@ class FieldCalibration:
             "H": list(self.H),
             "field_width": self.field_width,
             "field_height": self.field_height,
+            "window": list(self.window) if self.window is not None else None,
             "metres_per_unit": self.metres_per_unit,
             "image_width": self.image_width,
             "image_height": self.image_height,
@@ -355,6 +451,8 @@ class FieldCalibration:
             "marker_width_m": self.marker_width_m,
             "marker_height_m": self.marker_height_m,
             "rms_px": self.rms_px,
+            "marker_coverage": self.marker_coverage,
+            "unit": self.unit,
             "K": list(self.K) if self.K is not None else None,
             "D": list(self.D) if self.D is not None else None,
             "notes": self.notes,
@@ -370,6 +468,8 @@ class FieldCalibration:
             H=tuple(float(x) for x in data["H"]),  # type: ignore[arg-type]
             field_width=float(data.get("field_width", 0.0)),
             field_height=float(data.get("field_height", 0.0)),
+            window=(None if data.get("window") is None
+                    else tuple(int(v) for v in data["window"])),
             metres_per_unit=float(data.get("metres_per_unit", 1.0)),
             image_width=int(data.get("image_width", 0)),
             image_height=int(data.get("image_height", 0)),
@@ -377,6 +477,8 @@ class FieldCalibration:
             marker_width_m=float(data.get("marker_width_m", 0.0)),
             marker_height_m=float(data.get("marker_height_m", 0.0)),
             rms_px=float(data.get("rms_px", 0.0)),
+            marker_coverage=float(data.get("marker_coverage", 0.0)),
+            unit=str(data.get("unit", "m")),
             K=tup("K"), D=tup("D"),
             version=int(data.get("version", CALIBRATION_VERSION)),
             notes=str(data.get("notes", "")),
@@ -400,12 +502,20 @@ def calibrate_from_marker(
     *,
     image_size: tuple[int, int] = (0, 0),
     extra_pairs: Iterable[tuple[Point, Point]] = (),
+    note: str | None = None,
+    field_size: tuple[float, float] = (0.0, 0.0),
+    unit: str = "m",
+    window: tuple[int, int, int, int] | None = None,
 ) -> FieldCalibration:
     """用参考物的 4 个角点做标定。
 
     ``marker_quad_px`` 是参考物在**图像里**的四角，顺序必须与
     :meth:`Marker.world_corners` 一致（左下 → 右下 → 右上 → 左上）。
     ``extra_pairs`` 可以再补几组已知点（例如场地四角）提高精度。
+
+    ``Marker`` 的宽高就是**世界单位**的定义：给它米，世界单位就是米；
+    给它场地像素（参考物占 0.30×0.20 的 640×480 场地 → 192×96），
+    世界单位就是场地单位，全程不涉及任何物理测量 —— 等有尺子时再乘一个系数即可。
     """
     if len(marker_quad_px) != 4:
         raise ValueError(f"参考物需要 4 个角点，得到 {len(marker_quad_px)}")
@@ -417,18 +527,24 @@ def calibrate_from_marker(
 
     H = solve_homography(src, dst)
     rms = rms_error(H, src, dst)
+    fw, fh = (float(field_size[0]), float(field_size[1]))
+    coverage = (marker.width_m * marker.height_m) / (fw * fh) if fw > 0 and fh > 0 else 0.0
     return FieldCalibration(
         H=H,
-        field_width=marker.width_m,
-        field_height=marker.height_m,
-        metres_per_unit=1.0,          # 世界单位就是米 —— 尺度由参考物的真实尺寸给出
+        # 场地尺寸 = 调用方告诉我们的那个；没给就是 0（越界检查自动跳过）
+        field_width=fw,
+        field_height=fh,
+        metres_per_unit=1.0,          # 世界单位就是参考物宽高的单位
         image_width=image_size[0],
         image_height=image_size[1],
         marker=marker.name,
         marker_width_m=marker.width_m,
         marker_height_m=marker.height_m,
         rms_px=rms,
-        notes="世界单位 = 米；原点在参考物左下角",
+        unit=str(unit),
+        window=window,
+        marker_coverage=coverage,
+        notes=note or "世界单位 = 米；原点在参考物左下角",
     )
 
 
@@ -436,6 +552,6 @@ __all__ = [
     "CALIBRATION_VERSION",
     "Point", "Mat3",
     "apply_homography", "invert_homography", "solve_homography", "rms_error",
-    "Marker", "detect_marker_quad",
+    "Marker", "detect_marker_quad", "marker_channels",
     "FieldCalibration", "calibrate_from_marker",
 ]

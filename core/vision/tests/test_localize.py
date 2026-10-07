@@ -22,6 +22,7 @@ from vision.localize import (
     distance,
     known_size_depth,
     length_scale,
+    out_of_field,
     points_to_world,
     to_world,
 )
@@ -212,6 +213,44 @@ def test_to_world_converts_units_and_geometry(cal):
     assert g.width == pytest.approx(0.06, abs=2e-3)
 
 
+def test_gap_world_centre_is_consistent_with_its_blockers(cal):
+    """缺口的世界中心必须与**它自己那两段墙**自洽，且两个轴取自不同的量。
+
+    实测踩过的不自洽：障碍物走 ``_rect_to_world`` —— 把**四个角点**各自映射后
+    取均值；而缺口原本把像素中心直接过单应。单应下这两者不是同一个量。
+    同一堵墙上实测：缺口世界 y=**244.36**，两个 blocker 是 248.15/248.36，
+    平台真值 **247.67** —— 吻合的是 blocker，缺口偏了 3.9 单位。
+
+    两个轴的来源不同，这是有道理的，不是随手写的：
+
+    * **垂直墙方向（y）**：缺口**就在这堵墙上**，所以取两个 blocker 世界 y 的中点；
+    * **沿墙方向（x）**：缺口是"两段之间那段**空隙**"的中心，由空隙的两条边决定，
+      所以取映射点。**不能**取两段中心的中点 —— 那等于整堵墙的中心，
+      两段长度不等时两者不同（实测：两段 130/334 px，墙中心 255.75 vs 缺口 192）。
+    """
+    left = Obstacle(id=1, type=ObstacleType.WALL_WITH_GAP, type_id=2,
+                    shape=ObstacleShape.RECT, x=100.0, y=200.0,
+                    half_w=60.0, half_h=5.0, rotation=0.0)
+    right = Obstacle(id=2, type=ObstacleType.WALL_WITH_GAP, type_id=2,
+                     shape=ObstacleShape.RECT, x=300.0, y=201.0,
+                     half_w=80.0, half_h=5.0, rotation=0.0)
+    gap_px = (220.0, 200.5)
+    frame = VisionFrame(
+        seq=0, stamp=0.0, units=Units.PX,
+        obstacles=[left, right],
+        gaps=[GapObs(id=1, center=gap_px, width=40.0, blockers=(1, 2))],
+    )
+    out = to_world(frame, cal)
+    by_id = {ob.id: ob for ob in out.obstacles}
+    g = out.gaps[0]
+
+    # y：就是这条墙的 y
+    assert g.center[1] == pytest.approx(0.5 * (by_id[1].y + by_id[2].y), abs=1e-12)
+    # x：映射点，不是两段中心的中点
+    assert g.center[0] == pytest.approx(cal.image_to_field(*gap_px)[0], abs=1e-12)
+    assert g.center[0] != pytest.approx(0.5 * (by_id[1].x + by_id[2].x), abs=1e-3)
+
+
 def test_to_world_is_idempotent_in_metres(cal):
     frame = _wall_frame(center_m=(0.10, 0.10), half_w_m=0.05, half_h_m=0.01,
                         player_m=(0.20, 0.05), player_r_m=0.008,
@@ -237,3 +276,69 @@ def test_gap_fits_player_works_after_conversion(cal):
                          gap_center_m=(0.15, 0.10), gap_half_m=0.03)
     out2 = to_world(frame2, cal)
     assert out2.gap_fits_player(out2.gaps[0]) is True
+
+
+# --------------------------------------------------------------------------
+# 标定还成立吗？—— 越界哨兵
+# --------------------------------------------------------------------------
+def _cal(field=(640.0, 480.0)):
+    return calibrate_from_marker([(0, 0), (1, 0), (1, 1), (0, 1)],
+                                 Marker("m", 192.0, 96.0),
+                                 field_size=field, unit="field")
+
+
+def _frame(player=None, obstacles=(), gaps=()):
+    return VisionFrame(seq=0, stamp=0.0, units=Units.PX,
+                       player=player, obstacles=list(obstacles), gaps=list(gaps))
+
+
+def _player(x, y):
+    return PlayerState(x=x, y=y, radius=10.0)
+
+
+def _rect(oid, x, y):
+    return Obstacle(id=oid, shape=ObstacleShape.RECT, x=x, y=y,
+                    half_w=40.0, half_h=5.0)
+
+
+def test_out_of_field_is_quiet_on_a_normal_frame():
+    f = _frame(player=_player(300.0, 200.0), obstacles=[_rect(1, 100.0, 400.0)])
+    assert out_of_field(f, _cal()) == []
+
+
+def test_out_of_field_catches_a_stale_calibration():
+    """回归：实测踩过 —— 窗口挪了位置、标定失效，角色算到 (796, 602)，
+    场地只有 640x480，而**一路静默**。错的单应不会报错，
+    它照样吐出一堆看着像坐标的数字。"""
+    f = _frame(player=_player(796.8, 602.9))
+    bad = out_of_field(f, _cal())
+    assert len(bad) == 1
+    assert "角色" in bad[0] and "场地外" in bad[0]
+
+
+def test_out_of_field_tolerates_the_margin_but_not_more():
+    cal = _cal()
+    # 10% 余量：贴着边界、甚至略微出去一点算正常（检测有噪声）
+    assert out_of_field(_frame(player=_player(-30.0, 200.0)), cal) == []
+    assert out_of_field(_frame(player=_player(640.0 + 30.0, 200.0)), cal) == []
+    # 超过余量就报
+    assert out_of_field(_frame(player=_player(640.0 + 100.0, 200.0)), cal)
+
+
+def test_out_of_field_flags_every_object_kind():
+    f = _frame(obstacles=[_rect(7, -500.0, 200.0)],
+               gaps=[GapObs(id=1, center=(300.0, 900.0), width=40.0, blockers=(1, 2))])
+    bad = out_of_field(f, _cal())
+    assert len(bad) == 2
+    assert any("障碍 id=7" in b for b in bad) and any("缺口 id=1" in b for b in bad)
+
+
+def test_out_of_field_says_so_when_the_field_size_is_unknown():
+    """不知道场地多大就**不能算"没问题"** —— 必须明说，否则又变回静默。"""
+    bad = out_of_field(_frame(player=_player(300.0, 200.0)), _cal(field=(0.0, 0.0)))
+    assert len(bad) == 1 and "没有场地尺寸" in bad[0]
+
+
+def test_out_of_field_flags_non_finite_coordinates():
+    bad = out_of_field(_frame(player=_player(float("nan"), 200.0)), _cal())
+    assert len(bad) == 1 and "有限数" in bad[0]

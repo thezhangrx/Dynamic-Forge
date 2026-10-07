@@ -43,7 +43,13 @@ from dataclasses import dataclass, replace
 from typing import Iterable, Sequence
 
 from standard.obstacle.obstacle import Obstacle, ObstacleShape
-from standard.vision.vision_output import GapObs, TargetObs, Units, VisionFrame
+from standard.vision.vision_output import (
+    Calibration,
+    GapObs,
+    TargetObs,
+    Units,
+    VisionFrame,
+)
 
 from .calibration import FieldCalibration, Point, apply_homography
 
@@ -204,10 +210,32 @@ def to_world(frame: VisionFrame, calib: FieldCalibration) -> VisionFrame:
             obstacles.append(replace(ob, x=X, y=Y, half_w=hw, half_h=hh,
                                      rotation=rot, frame_id=frame.frame_id))
 
-    # -- 缺口（派生关系：中心沿轴向的两端都映射过去） ----------------------
+    # -- 缺口（派生关系） --------------------------------------------------
+    # 缺口的**两个轴取自不同的量**，这不是随手定的，是实测逼出来的：
+    #
+    # * **沿墙方向（这里是 x）**：缺口是"两段之间那段空隙"，它的中心由空隙的
+    #   **两条边**决定（像素域 ``cx = (s0.x1 + s1.x0)/2``），所以取映射点。
+    #   **不能**取两段中心的中点 —— 那等于整堵墙的中心；两段长度不等时两者不同。
+    #   实测这一条踩过：两段长 130 / 334 px，墙中心 255.75 vs 缺口中心 192。
+    # * **垂直墙方向（这里是 y）**：缺口**就在这堵墙上**，所以它的 y 必须等于
+    #   这堵墙的 y，也就是取两个 blocker 的世界 y 的中点。
+    #
+    # 为什么 y 不能直接映射像素中心：障碍物走的是 :func:`_rect_to_world`
+    # —— 把**四个角点**各自映射后取均值；而映射一个点得到的是另一个量
+    # （单应下"矩形的中心"本身就是有歧义的）。实测同一堵墙：
+    # 缺口世界 y=**244.36**，两个 blocker 是 248.15/248.36，平台真值 **247.67**
+    # —— 吻合的是 blocker 那一侧，缺口偏了 3.9 单位。
+    by_id = {ob.id: (ob.x, ob.y) for ob in obstacles}
     gaps: list[GapObs] = []
     for g in frame.gaps:
-        X, Y = pt(*g.center)
+        X, _ = pt(*g.center)
+        ends = [by_id[b] for b in g.blockers if b in by_id]
+        if len(ends) == 2:
+            Y = 0.5 * (ends[0][1] + ends[1][1])
+        else:
+            # blocker 缺了（不该发生，GapObs.validate 要求两段都在）——
+            # 退回直接映射中心，并且**不静默**。
+            Y = pt(*g.center)[1]
         w = 2.0 * extent(g.center[0], g.center[1], g.width / 2.0, g.axis)
         X0, Y0 = pt(g.center[0], g.center[1])
         X1, Y1 = pt(g.center[0] + math.cos(g.axis), g.center[1] + math.sin(g.axis))
@@ -228,18 +256,25 @@ def to_world(frame: VisionFrame, calib: FieldCalibration) -> VisionFrame:
                 target.half_w or 0.0, target.half_h or 0.0, 0.0)
             target = replace(target, x=X2, y=Y2, half_w=hw, half_h=hh)
 
+    # 单位名跟着**标定**走，不跟着常数走：``--relative`` 标出来的是场地单位，
+    # 标成 ``m`` 会让下游（决策层）把场地单位当米用 —— 尺度全错却看不出来。
+    # 场地单位用 ``px`` + 带上单应：决策层据此知道"已经标定过，但单位不是米"。
     return replace(
         frame,
-        units=DEFAULT_WORLD_UNITS,
+        units=Units.M if getattr(calib, "unit", "m") == "m" else Units.PX,
         metres_per_unit=1.0,
+        calibration=Calibration(
+            id=str(calib.marker), K=calib.K, D=calib.D,
+            H_field_from_image=tuple(calib.H), rms_reprojection_px=calib.rms_px),
         obstacles=obstacles,
         gaps=gaps,
         player=player,
         target=target,
         diagnostics={**(frame.diagnostics or {}),
                      "calib_id": calib.marker,
-                     "calib_rms_px": calib.rms_px,
-                     "H_field_from_image": list(calib.H)},
+                     "calib_unit": getattr(calib, "unit", "m"),
+                     "calib_coverage": calib.marker_coverage,
+                     "calib_rms_px": calib.rms_px},
     )
 
 
@@ -308,4 +343,92 @@ __all__ = [
     "DEFAULT_WORLD_UNITS",
     "GroundCamera", "known_size_depth", "depth_error",
     "points_to_world", "distance", "length_scale", "to_world",
+    "OUT_OF_FIELD_FRAC", "out_of_field", "field_roi",
 ]
+
+
+# ==========================================================================
+# 标定还成立吗？—— 越界检查
+# ==========================================================================
+#: 允许超出场地多少（占场地尺寸的比例）才算"越界"。
+#:
+#: 不能卡在 0：检测本身有噪声，贴着边界的物体偶尔算出 -2 个单位是正常的。
+#: 但**标定失效时的偏差是"半个场地"这个量级**（实测角色跑到 (796, 602)，
+#: 场地只有 640x480），所以 10% 的余量足够把两者分开，又不会漏报。
+OUT_OF_FIELD_FRAC = 0.10
+
+
+def field_roi(calib: FieldCalibration, *, margin_frac: float = 0.02
+              ) -> tuple[float, float, float, float] | None:
+    """场地在**图像**里的外接框 ``(x0, y0, x1, y1)``。
+
+    为什么需要它：检测器是在**整幅相机画面**里找目标的，而相机拍的是**整个屏幕** ——
+    平台窗口只占其中一块。实测录到的一段真机视频里，窗口周围是 VS Code 的亮绿文字，
+    那些 9x9 的字母块在 ``fill × area`` 上**打败了真正的玩家圆**：
+    179/229 帧把文字当成了玩家，算出来的世界坐标跑到场地外。
+
+    标定已经把"图像 ↔ 场地"定下来了，所以场地的图像范围是**已知的**：
+    任何落在它外面的东西，按定义就不是场地上的东西。这一条把假阳性从 179 清到 0。
+
+    **算不出来就返回 ``None``（= 不缩范围），绝不返回一个退化的框。**
+    实测踩过一次：一个"保护"分支在缺 ``image_width`` 时返回了 ``(0,0,0,0)``，
+    于是把所有目标都排除掉了，检测率从 39% 直接掉到 0 ——
+    而且现象看起来只是"没检测到"，很难反推到"框算错了"。
+    """
+    fw, fh = float(calib.field_width), float(calib.field_height)
+    if not (fw > 0.0 and fh > 0.0):
+        return None                       # 不知道场地多大 -> 不缩范围
+    xs: list[float] = []
+    ys: list[float] = []
+    for xw, yw in ((0.0, 0.0), (fw, 0.0), (fw, fh), (0.0, fh)):
+        ix, iy = calib.field_to_image(xw, yw)
+        if not (math.isfinite(ix) and math.isfinite(iy)):
+            return None                   # 单应算出非有限数 -> 这份标定本身有问题
+        xs.append(ix)
+        ys.append(iy)
+    if max(xs) - min(xs) < 1.0 or max(ys) - min(ys) < 1.0:
+        return None                       # 退化的框比不缩更危险
+    mx = (max(xs) - min(xs)) * margin_frac
+    my = (max(ys) - min(ys)) * margin_frac
+    return (min(xs) - mx, min(ys) - my, max(xs) + mx, max(ys) + my)
+
+
+def out_of_field(frame: VisionFrame, calib: FieldCalibration,
+                 *, frac: float = OUT_OF_FIELD_FRAC) -> list[str]:
+    """这一帧里有没有东西落在场地外？返回**人话描述的清单**（空 = 正常）。
+
+    这是"标定还成立吗"的**哨兵**。标定只在"相机与屏幕的相对几何不变"时有效：
+    窗口挪了位置、相机被碰了、屏幕换了分辨率，单应就不再成立 ——
+    而错的单应**不会报错**，它照样吐出一堆看着像坐标的数字。
+    实测踩过一次：角色算到 (796, 602)，场地只有 640x480，一路静默。
+
+    为什么要显式返回清单而不是抛异常：越界**不一定**是标定坏了
+    （也可能真有东西在场外），所以把判断权交给调用方，
+    但**必须让它有机会看见** —— 这正是"不静默兜底"那条纪律。
+
+    场地尺寸为 0（标定时没告诉）时返回空清单：不知道就没法判断，
+    **不能说"没问题"**，所以清单里会明确写一句"未提供场地尺寸"。
+    """
+    fw, fh = float(calib.field_width), float(calib.field_height)
+    if fw <= 0.0 or fh <= 0.0:
+        return ["标定文件里没有场地尺寸，无法做越界检查（重新标定时请带上 --field）"]
+    mx, my = fw * frac, fh * frac
+    bad: list[str] = []
+
+    def check(tag: str, x: float, y: float) -> None:
+        if not (math.isfinite(x) and math.isfinite(y)):
+            bad.append(f"{tag} 坐标不是有限数：({x}, {y})")
+        elif x < -mx or x > fw + mx or y < -my or y > fh + my:
+            bad.append(f"{tag} 落在场地外：({x:.0f}, {y:.0f})，"
+                       f"场地 0..{fw:.0f} x 0..{fh:.0f}")
+
+    if frame.player is not None:
+        check("角色", frame.player.x, frame.player.y)
+    for ob in frame.obstacles:
+        check(f"障碍 id={ob.id}", ob.x, ob.y)
+    for g in frame.gaps:
+        check(f"缺口 id={g.id}", g.center[0], g.center[1])
+    return bad
+
+
+
