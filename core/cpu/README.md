@@ -48,6 +48,16 @@ python cpu_vision_loop.py --synthetic --episodes 5 --seconds 16
 
 ### A. `plan()` —— 唯一需要移植的算法
 
+> **C++ 移植已完成**（2026-10-12）：`core/cpu/cpp/gap_avoid.{hpp,cpp}`，
+> 10 条交叉验证用例在 `core/cpu/tests/test_cpp_gap_avoid.py`，
+> 构建/陷阱/反向验证见 `core/cpu/cpp/README.md`，移植检查表见
+> `core/cpu/docs/CPP_PORT.md`。验收口径：**`tier` 逐位一致 + 浮点量 rel_err < 1e-9**。
+> 板上入口 `core/board/main.cpp` 已经接上它。
+>
+> ```bash
+> python -m pytest core/cpu/tests/test_cpp_gap_avoid.py -q   # 10 passed
+> ```
+
 ```python
 from cpu.gap_avoid import (
     WorldView, GapMemory, AlgoConfig, Rect, plan, to_command,

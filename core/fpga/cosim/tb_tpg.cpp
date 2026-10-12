@@ -33,6 +33,7 @@ static void step()
 }
 
 static long g_checks = 0, g_fail = 0;
+static int  g_scenes_ok = 0;   // 全部对上手算值的场景数（假通过防线用）
 static bool g_verbose = false;
 
 static void chk(const char *what, long long idx, long long got, long long want)
@@ -102,6 +103,7 @@ int main(int argc, char **argv)
             if (dx * dx + dy * dy <= Scene::R * Scene::R) disc_area++;
 
     for (int f = 0; f < frames; f++) {
+        long scene_fail_before = g_fail;
         Scene sc = scene_of(f);
         top->frame_idx = (uint16_t)f;
         top->start = 1; step(); top->start = 0;
@@ -190,6 +192,10 @@ int main(int argc, char **argv)
         if (g_verbose)
             printf("场景 %d (wall_y=%d gap_x=%d player=(%d,%d)): %zu 字节，全部与手算一致\n",
                    f, sc.wall_y, sc.gap_x, sc.p_px, sc.p_py, bytes.size());
+
+        // 这一场从"帧完成"到"角色包围盒"全部对上手算值，才算跑成一场。
+        // 该计数与 --verbose 无关：判失败不能依赖有没有打开打印。
+        if (done && g_fail == scene_fail_before) g_scenes_ok++;
     }
 
     // ---- 自由运行模式（上板就是这条：auto_run=1，不需要任何外部激励）----
@@ -220,6 +226,24 @@ int main(int argc, char **argv)
 
     printf("\n=== 自检图案结果 ===\n");
     printf("比对项 %ld，不符 %ld\n", g_checks, g_fail);
+
+    // ---- 假通过防线（与 tb_vision.cpp 同一条规矩）--------------------------
+    // 光看 g_checks 不够：自由运行那一段固定产生 3 个比对项，所以
+    // `Vvision_selftest 0` 也会打印"比对项 3，不符 0"并以 0 退出 ——
+    // 一次几何比对都没做，看起来却是绿的。要按"跑成了几场"判。
+    int rc = (g_fail == 0) ? 0 : 1;
+    if (frames <= 0) {
+        printf("!! 请求了 %d 个场景 —— 没有任何几何比对，判为失败\n", frames);
+        rc = 1;
+    } else if (g_scenes_ok != frames) {
+        printf("!! 只跑成 %d / %d 个场景 —— 判为失败\n", g_scenes_ok, frames);
+        rc = 1;
+    }
+    if (g_checks == 0) {
+        printf("!! 一次比对都没发生 —— 判为失败\n");
+        rc = 1;
+    }
+
     delete top;
-    return g_fail == 0 ? 0 : 1;
+    return rc;
 }

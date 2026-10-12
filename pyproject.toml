@@ -51,6 +51,10 @@ fpga = ["rtl/*.v", "rtl/*.vh", "ref/*.c", "ref/*.h", "ref/*.py",
 [tool.pytest.ini_options]
 # `core/cpu/tests` 与 `core/harness/tests` 也在里面：漏掉时裸 `pytest` 会
 # **静默跳过**这两个模块（含闭环端到端），"本地全绿"就是个假象。
+# ⚠ `core/board/tests` 是同一个坑，2026-10-12 才补上：新加的几何帧对账 8 条
+#   用例当时**根本没被收集**，裸 `pytest` 照样报 830 全绿。
+#   **加新模块时一定要把它加进这一行**，否则新测试永远不跑。
 testpaths = ["core/bullet_sim/tests", "core/cpu/tests", "core/fpga/tests",
-             "core/harness/tests", "core/vision/tests", "core/standard/tests"]
+             "core/board/tests", "core/harness/tests", "core/vision/tests",
+             "core/standard/tests"]
 filterwarnings = ["error::DeprecationWarning:bullet_sim.*"]

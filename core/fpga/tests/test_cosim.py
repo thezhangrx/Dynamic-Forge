@@ -83,7 +83,7 @@ def test_rtl_lint_clean():
         [v, "--lint-only", "-Wall", "-Wno-DECLFILENAME", "--top-module", "vision_axi",
          f"-I{RTL}", str(RTL / "vision_selftest.v"), str(RTL / "vision_tpg.v"),
          str(RTL / "vision_axi.v"), str(RTL / "vision_top.v"),
-         str(RTL / "vision_ccl.v")],
+         str(RTL / "vision_ccl.v"), str(RTL / "vision_div.v")],
         capture_output=True, text=True, env=_env(), cwd=str(COSIM),
     )
     assert r.returncode == 0, r.stdout + r.stderr
@@ -269,3 +269,46 @@ def test_selftest_pattern_matches_hand_computed_geometry(exe):
     # 8 个场景全部要跑到（防止循环提前退化成 0 帧也算过）
     assert r.stdout.count("全部与手算一致") == 8, r.stdout
     assert "auto: 完成帧数" not in r.stdout   # 自由运行只是内部检查，不打印
+
+
+# ---------------------------------------------------------------------------
+# 8) **假通过防线**：什么都没验证的运行，不能长得像全绿。
+#
+# 这不是假想出来的风险。cosim/README.md 里的相对路径依赖 cwd，从
+# core/fpga/cosim/ 下少敲一层（`../../data/...` 而不是 `../../../data/...`）
+# 就会命中 —— 实测旧代码打印"比对项 0，不符 0，有差异的帧 0"，并以 **0** 退出。
+# 也就是说：一次什么都没验证的运行，和一次全绿通过，输出与退出码完全一样。
+#
+# 这一组用例守的是**二进制自己的行为**。test_cosim_bit_exact_on_real_frames
+# 那种"比对项 > 600000*frames"的断言只保护 pytest 这条路，保护不了 README
+# 里手敲命令的人 —— 而手敲正是文档规定的用法。
+# ---------------------------------------------------------------------------
+def test_missing_stimulus_is_a_failure(exe, tmp_path: pathlib.Path):
+    r = _run(exe, tmp_path / "does_not_exist", 4, timeout=600)
+    assert r.returncode != 0, f"激励目录不存在却报成功（假通过）：\n{r.stdout}"
+
+
+def test_short_stimulus_is_a_failure(exe, stim, tmp_path: pathlib.Path):
+    """请求 4 帧、目录里只有 2 帧 —— 必须失败，不能"比了 2 帧"就报绿。"""
+    stim_dir, _ = stim
+    few = tmp_path / "few"
+    few.mkdir()
+    for p in sorted(stim_dir.glob("*.ppm"))[:2]:
+        shutil.copy(p, few / p.name)
+    r = _run(exe, few, 4, timeout=600)
+    assert r.returncode != 0, f"只给了 2 帧却请求 4 帧，仍然报成功：\n{r.stdout}"
+    assert "只比对了 2 / 4 帧" in r.stdout, r.stdout
+
+
+def test_axi_missing_stimulus_is_a_failure(exe, tmp_path: pathlib.Path):
+    r = subprocess.run([str(EXE_AXI), str(tmp_path / "does_not_exist"), "4"],
+                       capture_output=True, text=True, timeout=600)
+    assert r.returncode != 0, f"AXI 路径激励读不到却报成功：\n{r.stdout}"
+
+
+@pytest.mark.parametrize("n", ["0", "-3"])
+def test_selftest_with_no_scenes_is_a_failure(exe, n: str):
+    """0 个场景时自由运行段照样产生 3 个比对项，所以"比对项 > 0"抓不住它。"""
+    r = subprocess.run([str(EXE_ST), n], capture_output=True, text=True, timeout=600)
+    assert r.returncode != 0, f"请求 {n} 个场景却报成功：\n{r.stdout}"
+    assert "一次比对都没发生" in r.stdout or "没有任何几何比对" in r.stdout, r.stdout

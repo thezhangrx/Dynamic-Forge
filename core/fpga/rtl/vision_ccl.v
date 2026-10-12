@@ -17,7 +17,6 @@
 // 组合展开就是 256 级级联比较器；顺序走只多花几拍，面积小一个量级。
 // ===========================================================================
 
-`include "vision_ops.vh"
 
 // ---------------------------------------------------------------------------
 // 编译检查（Verilator）的警告取舍，逐个说明，不是一刀切静音
@@ -49,6 +48,9 @@ module vision_ccl #(
     output reg         done,
 
     output reg  [17:0] rd_addr,          // 掩膜回读地址（指向 bright_mem）
+    // 预读地址：本拍将要赋给 rd_addr 的值。vision_top 用它提前一拍喂给 BRAM，
+    // 这样 BRAM 输出的 bright_rd 与本拍的 rd_addr 对齐（详见 vision_top 的说明）。
+    output reg  [17:0] rd_addr_nxt,
     input  wire        bright_rd,
 
     input  wire [31:0] min_area,
@@ -62,6 +64,9 @@ module vision_ccl #(
     output reg  [31:0] blob_area,
     output reg  [8:0]  n_labels
 );
+
+    // 纯组合算子。**必须 include 在模块体内**（见 vision_ops.vh 顶部说明）。
+    `include "vision_ops.vh"
 
     localparam integer W_BITS = $clog2(WIDTH);
     localparam integer H_BITS = $clog2(HEIGHT);
@@ -82,7 +87,31 @@ module vision_ccl #(
                      C_ACCDO  = 5'd10,
                      C_COPY   = 5'd11,
                      C_SEL    = 5'd12,
-                     C_DONE   = 5'd13;
+                     C_DONE   = 5'd13,
+                     C_PDIV   = 5'd14;    // 角色质心：多周期除法（见下）
+
+    // ---------------------------------------------------------------------
+    // 角色质心：多周期除法
+    //
+    //   player_x/y = vo_scale_round(cmp_s*, cmp_n[best_i], 64)
+    //              = (2*cmp_s*64 + n) / (2*n)
+    // 原来是组合除法。帧存搬进 BRAM 之后它成了**新的关键路径**
+    // （best_i → player_x，WNS −46.5 ns）—— 两处调用共用同一个分母，
+    // 所以用一台迭代除法器先后算两次。
+    // 结果与组合除法逐位相同，由 620 帧逐位对账守着。
+    // ---------------------------------------------------------------------
+    reg         pdiv_start;
+    reg  [39:0] pdiv_num;
+    reg  [19:0] pdiv_den;
+    wire [39:0] pdiv_quo;
+    wire        pdiv_busy, pdiv_done;
+    reg         pdiv_stage;      // 0 = 正在算 player_x，1 = 正在算 player_y
+
+    vision_div #(.WN(40), .WD(20)) u_pdiv (
+        .clk(clk), .rst_n(rst_n), .start(pdiv_start),
+        .num(pdiv_num), .den(pdiv_den),
+        .quo(pdiv_quo), .busy(pdiv_busy), .done(pdiv_done)
+    );
 
     reg [4:0]    state, find_ret;
     reg [8:0]    init_k;
@@ -160,6 +189,7 @@ module vision_ccl #(
             n_labels     <= 9'd0;
             in_run       <= 1'b0;
             rd_addr      <= 18'd0;
+            pdiv_start   <= 1'b0;
         end else begin
             done <= 1'b0;
             case (state)
@@ -362,25 +392,74 @@ module vision_ccl #(
             end
             // -------------------------------------------------------------
             C_DONE: begin
-                if (best_vld) begin
+                if (!best_vld) begin
+                    player_valid <= 1'b0;
+                    n_labels <= n_label[8:0];
+                    done     <= 1'b1;
+                    state    <= C_IDLE;
+                end else begin
+                    // 非除法的那几项就地写掉，除法交给 C_PDIV 两步走
                     player_valid <= 1'b1;
-                    player_x <= vo_scale_round({16'b0, cmp_sx[best_i]}, cmp_n[best_i], 16'd64);
-                    player_y <= vo_scale_round({16'b0, cmp_sy[best_i]}, cmp_n[best_i], 16'd64);
-                    player_r <= (cmp_x1[best_i] - cmp_x0[best_i] + 1'b1 +
-                                 cmp_y1[best_i] - cmp_y0[best_i] + 1'b1) * 32'd16;
                     blob_x0  <= cmp_x0[best_i];
                     blob_x1  <= cmp_x1[best_i];
                     blob_y0  <= cmp_y0[best_i];
                     blob_y1  <= cmp_y1[best_i];
                     blob_area<= cmp_n[best_i];
-                end else begin
-                    player_valid <= 1'b0;
+                    pdiv_num   <= {8'b0, cmp_sx[best_i]} * 40'd128 + {20'b0, cmp_n[best_i]};
+                    pdiv_den   <= {4'b0, cmp_n[best_i]} * 20'd2;
+                    pdiv_stage <= 1'b0;
+                    pdiv_start <= 1'b1;
+                    state      <= C_PDIV;
                 end
-                n_labels <= n_label[8:0];
-                done     <= 1'b1;
-                state    <= C_IDLE;
+            end
+            C_PDIV: begin
+                pdiv_start <= 1'b0;
+                if (pdiv_done) begin
+                    if (!pdiv_stage) begin
+                        // player_x 到手，接着算 player_y
+                        player_x   <= pdiv_quo[31:0];
+                        pdiv_num   <= {8'b0, cmp_sy[best_i]} * 40'd128 + {20'b0, cmp_n[best_i]};
+                        pdiv_den   <= {4'b0, cmp_n[best_i]} * 20'd2;
+                        pdiv_stage <= 1'b1;
+                        pdiv_start <= 1'b1;
+                    end else begin
+                        player_y <= pdiv_quo[31:0];
+                        player_r <= (cmp_x1[best_i] - cmp_x0[best_i] + 1'b1 +
+                                     cmp_y1[best_i] - cmp_y0[best_i] + 1'b1) * 32'd16;
+                        n_labels <= n_label[8:0];
+                        done     <= 1'b1;
+                        state    <= C_IDLE;
+                    end
+                end
             end
             default: state <= C_IDLE;
+            endcase
+        end
+    end
+
+    // =====================================================================
+    // 预读地址 rd_addr_nxt
+    //
+    // 与上面状态机对 rd_addr 的**4 处**赋值逐字对应。vision_top 拿它提前一拍
+    // 喂给 BRAM，使 bright_rd 与本拍的 rd_addr 对齐 —— 见 vision_top 里
+    // "帧存回读" 那段的长注释。
+    //
+    // ⚠ 这 4 条 if/case 条件必须与状态机里的一模一样。写错了不会静默通过：
+    //   620 帧逐位对账会当场报差异。
+    // =====================================================================
+    always @* begin
+        rd_addr_nxt = rd_addr;                   // 默认：保持
+        if (!rst_n) begin
+            rd_addr_nxt = 18'd0;
+        end else begin
+            case (state)
+                C_INIT: if (init_k + 9'd1 >= MAX_LABELS)
+                            rd_addr_nxt = 18'd0;
+                C_ROW:  if ((x < WIDTH) && (x + 1'b1 < WIDTH))
+                            rd_addr_nxt = row_base(y) + {7'b0, x} + 18'd1;
+                C_COPY: if (!(i_cur < n_cur) && !(y + 1'b1 >= HEIGHT))
+                            rd_addr_nxt = row_base(y + 1'b1);
+                default: ;
             endcase
         end
     end

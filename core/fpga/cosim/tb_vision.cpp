@@ -33,6 +33,7 @@ static const int MAX_W = 640;
 static const int MAX_H = 480;
 
 static Vvision_top *top = nullptr;
+static unsigned long long g_cycles = 0;  // 拍数（只为算“每帧多少拍”，不参与比对）
 static void step();          // 定义在下面；配置寄存器读写要先看到它
 
 // 配置寄存器地址（**必须与 rtl/vision_top.v 的 CFG_* 一致**，
@@ -108,6 +109,7 @@ static void cfg_apply(const VrRefParams &p)
 // ---- 时钟 ----------------------------------------------------------------
 static void step()
 {
+    g_cycles++;
     top->pix_clk = 0; top->eval();
     top->pix_clk = 1; top->eval();
     top->pix_clk = 0; top->eval();
@@ -141,6 +143,9 @@ static bool load_ppm(const std::string &path, int *w, int *h, std::vector<uint8_
 // ---- 计数器 --------------------------------------------------------------
 static long g_checks = 0, g_fail = 0;
 static int  g_fail_frames = 0;
+static int  g_frames_done = 0;   // 成功读到激励、进入比对的帧数（假通过防线用）
+static int  g_stim_err    = 0;   // 激励读不出来 / 超限的次数
+static int  g_timeouts    = 0;   // RTL 没在 guard 内出帧的次数
 static bool g_verbose = false;
 // 整轮几何帧字节的 FNV-1a 折叠：给"这组参数到底有没有改变输出"一个廉价判据。
 // 只比"两边一致"是不够的 —— 两边都没变也是"一致"，那样配置寄存器接错也发现不了。
@@ -245,9 +250,15 @@ int main(int argc, char **argv)
         int w = 0, h = 0;
         if (!load_ppm(path, &w, &h, rgb)) {
             printf("激励读取失败：%s（到此为止）\n", path.c_str());
+            g_stim_err++;
             break;
         }
-        if (w > MAX_W || h > MAX_H) { printf("帧 %dx%d 超过上限\n", w, h); break; }
+        if (w > MAX_W || h > MAX_H) {
+            printf("帧 %dx%d 超过上限\n", w, h);
+            g_stim_err++;
+            break;
+        }
+        g_frames_done++;
 
         // ---- 金标准 ----
         VrRefResult res;
@@ -296,7 +307,13 @@ int main(int argc, char **argv)
         // 纯字节流看不出来，但下游拿它定帧长就会算成 4 个字节。
         cmp_u32("dout_last 次数", f, (uint32_t)last_pulses, 1u);
         top->dout_ready = 0;
-        if (!done) { printf("帧 %d: RTL 超时未出帧（guard 用尽）\n", f); g_fail_frames++; continue; }
+        if (!done) {
+            printf("帧 %d: RTL 超时未出帧（guard 用尽）\n", f);
+            g_fail_frames++;
+            g_timeouts++;       // 单独计数并计入失败：早先只加 fail_frames，
+                                // 而退出码看的是 g_fail —— 部分帧超时会静默报绿
+            continue;
+        }
 
         // ---- 比对 ----
         long fail_before = g_fail;
@@ -379,6 +396,33 @@ int main(int argc, char **argv)
     printf("\n=== 协同仿真结果 ===\n");
     printf("比对项 %ld，不符 %ld，有差异的帧 %d\n", g_checks, g_fail, g_fail_frames);
     printf("几何帧指纹 %016llx\n", (unsigned long long)g_hash);
+    // 每帧拍数 → 换算成"跑 30 fps 需要多高的时钟"
+    if (frames > 0) {
+        unsigned long long cpf = g_cycles / (unsigned long long)frames;
+        printf("总拍数 %llu，每帧 %llu 拍；30 fps 需要 ≥ %.1f MHz\n",
+               g_cycles, cpf, (double)cpf * 30.0 / 1e6);
+    }
+
+    // ---- 假通过防线 ----------------------------------------------------------
+    // 没有这一条，激励路径写错时打印的是"比对项 0，不符 0"并以 0 退出 ——
+    // 一次什么都没验证的运行，和一次全绿通过长得一模一样。这不是假想：README
+    // 里的相对路径依赖 cwd，从 cosim/ 下用 `../../data/...`（少一层）就会命中。
+    // 规矩：请求了几帧就必须真比几帧，且至少要发生过一次比对。
+    int rc = (g_fail == 0) ? 0 : 1;
+    if (g_frames_done != frames) {
+        printf("!! 只比对了 %d / %d 帧（激励出错 %d 次）—— 判为失败\n",
+               g_frames_done, frames, g_stim_err);
+        rc = 1;
+    }
+    if (g_checks == 0) {
+        printf("!! 一次比对都没发生 —— 判为失败\n");
+        rc = 1;
+    }
+    if (g_timeouts != 0) {
+        printf("!! %d 帧 RTL 超时未出帧 —— 判为失败\n", g_timeouts);
+        rc = 1;
+    }
+
     delete top;
-    return g_fail == 0 ? 0 : 1;
+    return rc;
 }

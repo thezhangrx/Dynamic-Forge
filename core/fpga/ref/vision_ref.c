@@ -450,13 +450,84 @@ static void vr_extract_walls(VrFrame *f, const WallWithGapParamsC *p)
         n = vr_drop_short(runs, n, p->min_seg_px);
         if (n == 0) continue;
 
+        /* ------------------------------------------------------------------
+         * 两道过滤，**必须**与 core/vision/to_standard.py 的语义真值对齐：
+         *
+         *   ① `DEFAULT_MIN_SEGMENT_PX = 24`：检测器为了找缺口会把墙切成很多小段
+         *      （实测出现过 8 px、17 px 的碎片），它们不是真障碍。
+         *      上面 `vr_drop_short` 用的是 `p->min_seg_px`（默认 8），那是**检测
+         *      参数**；这 24 是 `to_standard` 的结构性过滤，两道都要。
+         *
+         *   ② 不变量 `half_w >= half_h`（half_w 是长边）：短于厚度的段会让 PS 侧
+         *      `decode_vision_frame().validate()` 当场抛异常。**真实照片实测
+         *      32 张里 6 张触发**（如 hw=5.0 < hh=8.5）。合成图永远产不出这种段，
+         *      所以 620 帧逐位对账全绿也照不出来 —— 这是拿真照片喂出来的。
+         *
+         * 顺序也照 Python：先按长度削，再判退化。
+         * ---------------------------------------------------------------- */
+        enum { VR_TO_STANDARD_MIN_SEG_PX = 24 };
+        VrRun keep[64];
+        int32_t kcy_q[64], kang_q[64];
+        int kthick[64];
+        int kseg = 0;
+        for (int i = 0; i < n && kseg < 64; i++) {
+            int sx0 = runs[i].a + f->x_min, sx1 = runs[i].b + f->x_min;
+            int len = sx1 - sx0 + 1;
+            if (len < VR_TO_STANDARD_MIN_SEG_PX) continue;          /* ① 太短 */
+            int32_t cy_q, ang_q; int thick;
+            vr_segment_stats(f, y0, y1, sx0, sx1, &cy_q, &thick, &ang_q);
+            int32_t hw_q = (int32_t)len * (VR_Q / 2);
+            int32_t hh_q = (int32_t)(thick > 0 ? thick : h) * (VR_Q / 2);
+            if (hw_q < hh_q) continue;                              /* ② 退化 */
+            keep[kseg] = runs[i];
+            kcy_q[kseg] = cy_q; kang_q[kseg] = ang_q; kthick[kseg] = thick;
+            kseg++;
+        }
+        if (kseg == 0) continue;
+        n = kseg;                       /* 缺口逻辑只看保留下来的段 */
+
+        /* ------------------------------------------------------------------
+         * **整堵墙共用一个朝向**（本带的 kseg 条段共享 ang_wall）。
+         *
+         * 为什么不能各段用自己的角 —— 这不是"稳定化一下"的小事，是**必须**：
+         *   决策的 `cpu/gap_avoid.group_walls()` 分桶键是
+         *       `(int(round(r.rotation * 1000.0)), int(round(band / 2.0)))`
+         *   —— 把角度的差异**放大 1000 倍**。逐段各自拟合出的角差 0.01 rad
+         *   （PL 的定点 atan2 是 Q6，量化格就有 0.0156 rad）就会让**同一堵墙的
+         *   两段落进不同的桶**，`plan()` 于是永远重建不出缺口、一直喊 NO_GAP。
+         *
+         *   实测（合成场景 16 s、48 个决策时刻）：
+         *     逐段角度           → tier 与 Python 不同 **48/48**
+         *     换成 Python 的角度 → tier 与 Python 不同 **0/48**
+         *   所以这一条是"板子链路能不能用"的分水岭。
+         *
+         * 与 core/vision/to_standard.py 的 `_wall_rotation` **同义**：
+         *   1 段 → 用那一段自己的角；
+         *   ≥2 段 → 段心连线的总体最小二乘主方向 `0.5*atan2(2·sxy, sxx−syy)`。
+         *   两点情形的 TLS 主方向**就是两点连线**，而本场景实测"每堵墙恰好 2 段"
+         *   （38/38 个墙带都是 2），所以这里用"首段心 → 末段心"是**精确等价**的。
+         *
+         * 量级：x 中点用 (a+b)*32、cy 用 Q6，两者同一标度；`vr_atan2_q6` 只看
+         * 比值，所以标度不影响结果，而且 a<<15 不会溢出（内部注释要求输入 ≤ 480*256，
+         * 这里最大 (639*2)*32 ≈ 4.1e4，安全）。
+         * ------------------------------------------------------------------ */
+        int32_t ang_wall;
+        if (kseg == 1) {
+            ang_wall = kang_q[0];
+        } else {
+            /* runs 是自左向右扫出来的，keep 保序，所以首段在左、末段在右 → dx > 0 */
+            int dx = ((keep[kseg - 1].a + keep[kseg - 1].b) -
+                      (keep[0].a + keep[0].b)) * (VR_Q / 2);
+            int dy = kcy_q[kseg - 1] - kcy_q[0];
+            ang_wall = (dx != 0) ? vr_atan2_q6(dy, dx) : kang_q[0];
+        }
+
         /* 本带的墙段转成障碍记录，并记下 id 供缺口引用 */
         int seg_count = 0;
         int sid[64]; int32_t scy_q[64];
         for (int i = 0; i < n && f->n_obstacles < VR_MAX_OBSTACLES; i++) {
-            int sx0 = runs[i].a + f->x_min, sx1 = runs[i].b + f->x_min;
-            int32_t cy_q, ang_q; int thick;
-            vr_segment_stats(f, y0, y1, sx0, sx1, &cy_q, &thick, &ang_q);
+            int sx0 = keep[i].a + f->x_min, sx1 = keep[i].b + f->x_min;
+            int32_t cy_q = kcy_q[i], ang_q = ang_wall; int thick = kthick[i];
             int id = f->n_obstacles + 1;          /* 1 起，与 Python 侧的 id 习惯一致 */
             int32_t *o = f->obstacles[f->n_obstacles];
             o[0] = id;
@@ -481,13 +552,13 @@ static void vr_extract_walls(VrFrame *f, const WallWithGapParamsC *p)
         /* 缺口：相邻两段之间最宽的那个，且 >= min_gap_px */
         int best = 0, bi = -1;
         for (int i = 0; i + 1 < seg_count; i++) {
-            int w = (runs[i + 1].a + f->x_min) - (runs[i].b + f->x_min) - 1;
+            int w = (keep[i + 1].a + f->x_min) - (keep[i].b + f->x_min) - 1;
             if (w >= p->min_gap_px && w > best) { best = w; bi = i; }
         }
         if (bi >= 0 && f->n_gaps < VR_MAX_GAPS) {
             int32_t *gp = f->gaps[f->n_gaps];
             gp[0] = f->n_gaps + 1;
-            gp[1] = (runs[bi].b + runs[bi + 1].a + 2 * f->x_min) * (VR_Q / 2); /* cx */
+            gp[1] = (keep[bi].b + keep[bi + 1].a + 2 * f->x_min) * (VR_Q / 2); /* cx */
             gp[2] = (scy_q[bi] + scy_q[bi + 1] + 1) >> 1;  /* 两个 Q6 的均值 */
             gp[3] = best * VR_Q;
             gp[4] = 0;
@@ -569,6 +640,19 @@ static void vr_extract_player(VrFrame *f, const WallWithGapParamsC *p)
         /* 与上一行重叠（8 邻接：允许斜接，即 x 范围各放宽 1）的游程合并 */
         for (int i = 0; i < n_cur; i++) {
             for (int j = 0; j < n_prev; j++) {
+                /* ⚠ `prev[j].label` **可能是 -1**：上一行某条游程因为标签表满
+                 *   被下面第 613 行 `continue` 掉了，label 保持 -1，再被 memcpy
+                 *   带进 prev。不跳过就会 `uf_find(-1)` → 读 `uf_parent[-1]`，
+                 *   是**越界读**。
+                 *
+                 *   这是拿真实照片喂出来的：`data/vision/_flash_after.jpg` 与
+                 *   `_flash_during.jpg`（亮掩膜极大 → 标签表被打满）在 `-O2`
+                 *   独立二进制下**段错误**，而在 `-fPIC` 的 .so 里侥幸不崩 ——
+                 *   典型的 UB 表现。合成图标签表打不满，所以从来没露过。
+                 *
+                 *   语义上"跳过"也是对的：没有标签的游程不属于任何分量，
+                 *   本来就不该参与合并。 */
+                if (prev[j].label < 0) continue;
                 if (cur[i].x0 <= prev[j].x1 + 1 && cur[i].x1 >= prev[j].x0 - 1) {
                     if (cur[i].label < 0) cur[i].label = uf_find(prev[j].label);
                     else uf_union(cur[i].label, prev[j].label);

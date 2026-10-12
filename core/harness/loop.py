@@ -284,7 +284,8 @@ def _contacts(env):
 
 def run_episode(env, camera, calib, *, steps: int, cfg: AlgoConfig,
                 control_hz: float = 30.0, verbose: bool = False,
-                classifier=None, policy: str = "gap_avoid") -> dict:
+                classifier=None, policy: str = "gap_avoid",
+                vision=None) -> dict:
     """跑一局。**决策只用摄像头**。
 
     ``control_hz`` 把"物理步进"和"看一次摄像头"解耦：相机不会 120 Hz 出图，
@@ -297,6 +298,16 @@ def run_episode(env, camera, calib, *, steps: int, cfg: AlgoConfig,
       而是**证明碰撞指标是活的**：如果连"站着不动"都报 0 碰撞，
       那说明计数器读错了（这个错真发生过），于是 gap_avoid 的 0 碰撞毫无意义。
       任何"无碰撞率"结论都必须和这个对照一起看。
+
+    ``vision``：**可插拔的视觉**，用来把板子的 PL 顶替物插进同一个闭环。
+
+    * ``None``（默认）—— 走 Python 视觉链（``core/vision``），行为与以前逐位一致；
+    * 传一个回调 —— 签名 ``vision(frame, *, seq, stamp, classifier) -> VisionFrame``，
+      **返回的必须是像素坐标的帧**（单应由本函数统一施加，只施加一次）。
+
+    板子模拟（``core/harness/board_loop.py``）就是靠它把"像素 → C 参考模型/RTL
+    → 几何帧字节 → 解码"接进来的 —— 世界的推进、碰撞统计、分档统计全部复用，
+    闭环保留。
     """
     from bullet_sim.entities.player import P_SPEED
 
@@ -341,11 +352,18 @@ def run_episode(env, camera, calib, *, steps: int, cfg: AlgoConfig,
             continue
 
         # ④ 视觉：像素 -> 标准帧 -> 世界坐标
+        #    **这是板子模拟唯一的接入点**：默认走 Python 视觉链；
+        #    给了 vision 回调就换成 PL 顶替物（C 参考模型 / Verilator RTL）。
+        #    注意回调返回的必须是**像素坐标** —— 单应统一在下面这一行做，
+        #    只做一次。让回调自己做单应会出现"两套标定"，那是最难查的一类错。
         stamp = float(env.world.state.timestamp)
-        std = to_standard.frame_to_standard(
-            detect(frame, WallWithGapParams(), roi=field_roi(calib),
-                   classifier=classifier),
-            seq=k, stamp=stamp)
+        if vision is None:
+            std = to_standard.frame_to_standard(
+                detect(frame, WallWithGapParams(), roi=field_roi(calib),
+                       classifier=classifier),
+                seq=k, stamp=stamp)
+        else:
+            std = vision(frame, seq=k, stamp=stamp, classifier=classifier)
         world_frame = to_world(std, calib)
 
         # ④.5 标定还成立吗？**闭环里这一步尤其不能省**：错的单应不会报错，

@@ -1,5 +1,18 @@
 # `gap_avoid.py` → C++ 移植检查表
 
+> **状态：已完成（2026-10-12）。**
+>
+> | 产物 | 位置 |
+> |---|---|
+> | 实现 | `core/cpu/cpp/gap_avoid.hpp` / `gap_avoid.cpp` |
+> | 交叉验证 | `core/cpu/tests/test_cpp_gap_avoid.py`（**10 条，全绿**） |
+> | 构建 / 陷阱 / 反向验证 | `core/cpu/cpp/README.md` |
+>
+> 一条命令复核：`python -m pytest core/cpu/tests/test_cpp_gap_avoid.py -q`
+>
+> 移植时**新发现了第四个陷阱**（`int(round(x))` 的五成双，见 §5.1），
+> 它和 §2.2 症状相同但根因不同。四个陷阱都做了反向验证（§5.2）。
+
 > 适用范围：**只有 `core/cpu/gap_avoid.py` 需要移植**。
 >
 > | 文件 | 移植？ |
@@ -177,6 +190,11 @@ const Cand& pick = *std::min_element(cands, cands + n, better);
 
 ## 5. 移植顺序（建议）
 
+> **已完成（2026-10-12）**。实现是 `core/cpu/cpp/gap_avoid.{hpp,cpp}`，
+> 交叉验证是 `core/cpu/tests/test_cpp_gap_avoid.py`（10 条），
+> 构建与运行说明见 `core/cpu/cpp/README.md`。
+> 下面保留原始的顺序建议，便于日后核对"哪一步对应哪些函数"。
+
 1. **先移植 `wrap_pi` + `_dot` + `_half_extent_along` + `_rect_sdf`** —— 四个纯函数，最容易对；
 2. **`group_walls`** —— 注意 §2.2 的排序；
 3. **`reconstruct_aperture`** —— 只有一段可见的分支要保留（实测约 4% 的帧）；
@@ -186,6 +204,44 @@ const Cand& pick = *std::min_element(cands, cands + n, better);
 每步都用同一批输入跑 Python 与 C++，逐位比对 `(wx, wy, tier, gap)`。
 平台的 `cpu/gap_wall_demo.py --headless --episodes N` 可以直接生成这批输入
 （它已经能在 5 局里给出 0 碰撞的基线）。
+
+### 5.1 移植时**新发现**的第四个陷阱：`int(round(x))`
+
+§2 只列了三个。实际动手时撞上了第四个，而且它的症状和 §2.2 一模一样
+（同一堵墙被拆进两个桶），但它来自**另一个**根因：
+
+| | Python | C++ 朴素写法 |
+|---|---|---|
+| `int(round(0.5))` | **0**（五成双） | `llround` → **1**（五入） |
+| `int(round(2.5))` | **2** | `llround` → **3** |
+
+`group_walls` 的分桶键是 `(int(round(rotation*1000)), int(round(band/2)))`，
+所以只要 `rotation*1000` 或 `band/2` 恰好落在 x.5 上，两侧的桶键就差 1。
+正确写法是 `std::nearbyint`（默认舍入模式 FE_TONEAREST 就是五成双），
+**不要**用 `std::llround` / `std::round` / `(int)(x+0.5)`。
+
+已补进 `CPP_PORT.md` 的陷阱清单（`gap_avoid.hpp` 文件头也标了），
+守卫是 `test_cpp_port_matches_on_round_half_boundaries`。
+
+### 5.2 反向验证：每个陷阱都**真的**能被现有用例抓住
+
+"加了守卫"和"守卫有用"是两回事。把 C++ 侧逐个改回朴素写法重跑，
+**每条只在对应的那一个用例上变红**：
+
+| 变异 | 变红的用例 |
+|---|---|
+| `nearbyint` → `llround` | `test_cpp_port_matches_on_round_half_boundaries` |
+| `wrap_pi` → 裸 `fmod` | `test_cpp_port_matches_on_the_wrap_pi_branch_cut` |
+| `stable_sort` → `sort` | `test_cpp_port_matches_on_stable_bucket_sort` |
+| 分桶键排序反向 | `test_cpp_port_is_byte_exact_on_drive` |
+
+两个坑中坑，都写进了 `core/cpu/cpp/README.md`：
+
+* **稳定性那个必须把桶塞到 ≥17 条**：libstdc++ 的 `std::sort` 在 n≤16 时走插入
+  排序，对并列元素恰好也稳定（实测 n=2..16 不打乱、n≥17 全部打乱）。真实场景每堵
+  墙只有 2 段，所以随手造的轨迹**永远照不出**这个 bug；
+* 而且桶里每条矩形的 `rotation` 必须**互不相同**。早先写成"两个值交替"，
+  `std::sort` 确实打乱了顺序，但落到下标 0 的还是同一批，墙一模一样 —— 测试全绿。
 
 ---
 

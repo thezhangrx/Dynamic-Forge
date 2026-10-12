@@ -27,7 +27,9 @@
 // ===========================================================================
 
 `include "vision_pkg.vh"
-`include "vision_ops.vh"
+// 注意 `vision_ops.vh` 不在这里 include —— 它里面是**函数**，放在模块外会落到
+// 根作用域，Verilog-2001 不允许（Vivado 报 [Synth 8-2644] root scope
+// declaration is not allowed）。它在模块体里 include，见下面。
 
 // ---------------------------------------------------------------------------
 // 编译检查（Verilator）的警告取舍，逐个说明，不是一刀切静音
@@ -90,6 +92,10 @@ module vision_top #(
     output reg  [31:0] dbg_data
 );
 
+    // 纯组合算子（灰度/分类/定点 atan2 表/CRC）。**必须 include 在模块体内** ——
+    // 放模块外会落到根作用域，Verilog-2001 不允许。见 vision_ops.vh 顶部说明。
+    `include "vision_ops.vh"
+
     // =====================================================================
     // 0. 参数（**必须等于** core/fpga/ref/vision_ref.c 的 VR_DEFAULT_*）
     //    跨语言测试逐项核对：core/fpga/tests/test_rtl_contract.py
@@ -104,6 +110,19 @@ module vision_top #(
     localparam integer MAX_SEGS   = 384;      // 一带最多 WIDTH/2 段
     localparam integer MAX_LABELS = 256;
     localparam integer MAX_RUNS   = 384;
+
+    // ---------------------------------------------------------------------
+    // `to_standard` 的结构性过滤阈值：段长短于它就丢掉。
+    //
+    // **必须等于** core/vision/to_standard.py 的 DEFAULT_MIN_SEGMENT_PX = 24，
+    // 也等于 vision_ref.c 里那个 VR_TO_STANDARD_MIN_SEG_PX。
+    // 检测器为了找缺口会把墙切成碎片（实测出现过 8 px、17 px 的），
+    // 它们不是真障碍，还会破坏 `half_w >= half_h` 的不变量。
+    //
+    // 注意它与 `r_min_seg_px`（默认 8，**运行时可配的检测参数**）是两回事：
+    // 那道在检测层，这道在"转标准结构"层，**两道都要**。
+    // ---------------------------------------------------------------------
+    localparam integer MIN_SEG_TO_STANDARD = 24;
 
     // 唯一还是 localparam 的检测参数：持续台阶的滞后行数 k。
     // 它决定 S_COL_SCAN 里移位寄存器的**级数**（结构），运行时不改。
@@ -163,9 +182,18 @@ module vision_top #(
     // =====================================================================
     // 1. 帧存与直方图
     // =====================================================================
-    reg [7:0]  gray_mem   [0:WIDTH*HEIGHT-1];
-    reg        wall_mem   [0:WIDTH*HEIGHT-1];
-    reg        bright_mem [0:WIDTH*HEIGHT-1];
+    // 三张帧存**必须**落进 BRAM，不能落 LUTRAM —— 这是实测出来的硬约束：
+    //   640×360 三张图共 2 304 000 bit。器件里的分布式 RAM 容量只有
+    //   26600 个 LUT，最多装 1.7 Mbit，**物理上装不下**；而 BRAM 有 9.3 Mb。
+    //   早先这里没有 ram_style，又用异步读，Vivado 只能推断成分布式 RAM ——
+    //   综合出来 "LUT as Distributed RAM 124092 / 26600 = 466%"，整个设计
+    //   超器件容量 331%，位流根本生成不了。
+    // ram_style="block" 是**必要条件但不是充分条件**：实测单独一个 1-bit×
+    //   230400 的异步读数组，加了 ram_style=block 照样落 LUTRAM、BRAM 用 0 个。
+    //   必须**同步读**（见下面的 mem_ra / gray_rd），两者齐备才落 BRAM。
+    (* ram_style = "block" *) reg [7:0]  gray_mem   [0:WIDTH*HEIGHT-1];
+    (* ram_style = "block" *) reg        wall_mem   [0:WIDTH*HEIGHT-1];
+    (* ram_style = "block" *) reg        bright_mem [0:WIDTH*HEIGHT-1];
     reg [15:0] row_count  [0:HEIGHT-1];
     reg [15:0] span_count [0:WIDTH-1];
 
@@ -190,8 +218,35 @@ module vision_top #(
     reg [31:0] gap_words [0:511];
 
     reg [AW-1:0] rd_addr;
-    wire [7:0] gray_rd   = gray_mem[rd_addr];
-    wire       wall_rd   = wall_mem[rd_addr];
+
+    // ---------------------------------------------------------------------
+    // 帧存回读：**同步读 + 单一读地址总线**
+    //
+    // 为什么要同步读：BRAM 只有同步读口，异步读会被强制落成分布式 RAM。
+    //   实测（见 core/fpga/docs/工具链现状.md）：三张图 2 304 000 bit，而器件的
+    //   分布式 RAM 只有 26600 个 LUT、最多装 1.7 Mbit —— **物理上装不下**。
+    //   加了 ram_style="block" 也救不了异步读（实测 BRAM 仍是 0 个）。
+    //
+    // 为什么用"下一拍地址" rd_nxt 而不是 rd_addr 本身：
+    //   BRAM 的地址也要打一拍，输出天然比地址晚一拍。若直接把 rd_addr 喂进去，
+    //   读回来的数据就比状态机期望的**晚一拍**，两个扫描器全错。
+    //   把"状态机本拍将要赋给 rd_addr 的那个值"提前一拍喂给 BRAM，就有
+    //       gray_rd(t) = gray_mem[rd_nxt(t-1)] = gray_mem[rd_addr(t)]
+    //   —— 与原来的异步读**逐拍对齐**，状态机一个字节都不用改。
+    //   这条思路就是 prefetch（ZipCPU《Building a prefetch module》），
+    //   参考出处见 core/fpga/docs/参考项目.md。
+    //   代价：rd_nxt 必须与状态机对 rd_addr 的 6 处赋值**逐字一致**。
+    //   这条由 620 帧逐位对账守着 —— 对不上会当场报差异，不会静默通过。
+    //
+    // 为什么三张图共用一个读地址：
+    //   行带/列扫描器、CCL、调试口**从不同时**要数据。BRAM 只有两个口，给每张图
+    //   各配独立读口会逼 Vivado 复制 BRAM（实测 1 写 + 2 读 → BRAM 数翻倍到 160/265），
+    //   共用则只要 80/265。仲裁见下面的 mem_ra。
+    // ---------------------------------------------------------------------
+    reg [AW-1:0] rd_nxt;        // 预读地址（= 本拍将要赋给 rd_addr 的值）
+    reg [7:0]    gray_rd;       // 下面三个都是 **寄存输出**，不是组合
+    reg          wall_rd;
+    reg          bright_rd;
 
     // =====================================================================
     // 2. 第一遍：像素流
@@ -226,10 +281,14 @@ module vision_top #(
         end
     endfunction
 
-    function [15:0] band_limit;
+    // 带高上限 = WIDTH 的 pct%。**必须带输入参数** ——
+    // Verilog-2001 不接受"无输入的函数"。Verilator 容忍，
+    // 但 Vivado 默认模式会直接报 [Synth 8-1549] a function must have
+    // at least one input —— 这一条只有综合能发现。
+    function [15:0] band_limit(input [15:0] pct);
         reg [31:0] t;
         begin
-            t = (WIDTH * r_band_row_pct) / 100;
+            t = (WIDTH * pct) / 100;
             if (t < 32'd1) t = 32'd1;
             band_limit = t[15:0];
         end
@@ -271,6 +330,14 @@ module vision_top #(
                        S_SEG        = 5'd10,
                        S_SEG_X      = 5'd11,
                        S_SEG_FIN    = 5'd12,
+                       S_SG_CYQ     = 5'd19,   // 多周期几何：算 cyq
+                       S_SG_LQ      = 5'd20,   //   算 lq
+                       S_SG_RQ      = 5'd21,   //   算 rq
+                       S_SG_ANG     = 5'd22,   //   算倾角（内部一次除法）
+                       // 带末后处理：整堵墙共用一个 rotation（见 S_ANG_INIT 的注释）
+                       S_ANG_INIT   = 5'd23,
+                       S_ANG_DIV    = 5'd24,
+                       S_ANG_WR     = 5'd25,
                        S_GAP        = 5'd13,
                        S_CCL        = 5'd14,
                        S_PACK_INIT  = 5'd15,
@@ -313,6 +380,19 @@ module vision_top #(
 
     // 段
     reg [8:0] seg_i, seg_limit;
+    //: **压缩写指针**：退化段（half_w < half_h）会被丢掉，被保留的段要写到
+    //: 紧凑的下标上，否则 `seg_x0/seg_x1/seg_id/seg_cy` 与 `seg_limit` 会错位，
+    //: S_GAP 读到的缺口两端就不是相邻的两段了。
+    //: 恒有 `seg_k <= seg_i`，所以回写 `seg_x0[seg_k]` 时那一格早已被读过，安全。
+    reg [8:0] seg_k;
+    // ---- 整堵墙共用一个朝向（带末后处理用）---------------------------------
+    //: 本带第一条障碍在 obs_words 里的下标。带内的障碍在 obs_words 里**连续**
+    //: （S_SEG 一条接一条写），所以后处理只要 [band_obs0, n_obs) 这一段。
+    reg [8:0] band_obs0;
+    //: 算出来的墙朝向（Q6），回写用。
+    reg [31:0] ang_wall;
+    //: 回写游标。
+    reg [8:0] ang_i;
     reg [W_BITS-1:0] sg_x0, sg_x1;
     reg [W_BITS:0]   sg_span;
     reg [W_BITS:0]   sx;
@@ -321,6 +401,36 @@ module vision_top #(
     reg [15:0]       sg_thick;
     reg [31:0]       sg_ls, sg_rs;
     reg [15:0]       sg_ln, sg_rn;
+
+    // ---------------------------------------------------------------------
+    // 墙段几何：**多周期除法**
+    //
+    // 原先是三个组合的 `vo_scale_round` + 一个 `vo_atan2_q6`（里面还有一次
+    // 除法），串起来成了整份设计的关键路径：438 级逻辑、404 个 CARRY4、
+    // WNS −85.9 ns。现在改用迭代除法器 vision_div，按
+    //     cyq → lq → rq → ang
+    // 的顺序一拍一位地算，状态机在 S_SG_* 几个新状态里等它。
+    //
+    // 每段多花 ~40×4 = 160 拍；一帧 23 万拍，几百个墙段，完全够。
+    // 结果与组合除法**逐位相同**（都是截断整除），由 620 帧逐位对账守着。
+    // ---------------------------------------------------------------------
+    reg        sgr_started;                 // 本步是否已发起
+    reg        div_start;
+    reg [39:0] div_num;
+    reg [19:0] div_den;
+    wire [39:0] div_quo;
+    wire        div_busy, div_done;
+
+    reg [31:0] sg_cyq_r;                    // 三个归约结果（原 sg_cyq_c/lq_c/rq_c）
+    reg [31:0] sg_lq_r;
+    reg [31:0] sg_rq_r;
+    reg [31:0] sg_ang_r;                    // 倾角（原 sg_ang_c）
+
+    vision_div #(.WN(40), .WD(20)) u_sgdiv (
+        .clk(pix_clk), .rst_n(rst_n), .start(div_start),
+        .num(div_num), .den(div_den),
+        .quo(div_quo), .busy(div_busy), .done(div_done)
+    );
 
     // 缺口
     reg [8:0]  gi;
@@ -332,6 +442,7 @@ module vision_top #(
     reg         ccl_start;
     wire        ccl_done;
     wire [17:0] ccl_addr;
+    wire [17:0] ccl_addr_nxt;   // CCL 的预读地址（见 vision_ccl 与下面的 mem_ra）
     wire        ccl_pv;
     wire [31:0] ccl_px, ccl_py, ccl_pr, ccl_area;
     wire [9:0]  ccl_bx0, ccl_bx1, ccl_by0, ccl_by1;
@@ -358,13 +469,42 @@ module vision_top #(
     vision_ccl #(.WIDTH(WIDTH), .HEIGHT(HEIGHT),
                  .MAX_LABELS(MAX_LABELS), .MAX_RUNS(MAX_RUNS)) u_ccl (
         .clk(pix_clk), .rst_n(rst_n), .start(ccl_start), .done(ccl_done),
-        .rd_addr(ccl_addr), .bright_rd(bright_mem[ccl_addr]),
+        .rd_addr(ccl_addr), .rd_addr_nxt(ccl_addr_nxt), .bright_rd(bright_rd),
         .min_area(r_player_min_area), .max_area(r_player_max_area),
         .min_fill_pct(r_player_min_fill_pct), .max_aspect_pct(r_player_max_aspect_pct),
         .player_valid(ccl_pv), .player_x(ccl_px), .player_y(ccl_py), .player_r(ccl_pr),
         .blob_x0(ccl_bx0), .blob_x1(ccl_bx1), .blob_y0(ccl_by0), .blob_y1(ccl_by1),
         .blob_area(ccl_area), .n_labels(ccl_nlabel)
     );
+
+    // =====================================================================
+    // 帧存读口：单一读地址总线 + 寄存输出
+    //
+    // 三个使用者在**不同时刻**要数据，所以共用一个读口（BRAM 只有两个口，
+    // 分开给会逼 Vivado 复制 BRAM，实测 80 → 160 个）：
+    //   * S_SPAN / S_COL_SCAN 的两个扫描器 → rd_nxt（预读地址）
+    //   * S_CCL 的 CCL                      → ccl_addr_nxt（预读地址）
+    //   * 调试口 sel=0/1/2 读掩膜像素       → dbg_idx
+    //
+    // 调试口为什么要让到帧间：它的读是**随机**地址，与扫描器无法共存于同一拍。
+    // 帧间（IDLE/DONE）扫描器不动，这时把口让给调试口，两边都不受影响。
+    // 代价：**掩膜像素的调试读只在帧间有效** —— 这是为了让设计装得下 030
+    // 而做的取舍，已在 core/fpga/docs/工具链现状.md 记明。
+    // =====================================================================
+    wire dbg_mask_sel  = (dbg_sel == 4'd0) || (dbg_sel == 4'd1) || (dbg_sel == 4'd2);
+    wire frame_idle    = (state == S_IDLE) || (state == S_DONE);
+    wire dbg_owns_read = dbg_mask_sel && frame_idle;
+    wire ccl_owns_read = (state == S_CCL);
+
+    wire [AW-1:0] mem_ra = dbg_owns_read ? dbg_idx[AW-1:0]
+                         : ccl_owns_read ? ccl_addr_nxt[AW-1:0]
+                         : rd_nxt;
+
+    always @(posedge pix_clk) begin
+        gray_rd   <= gray_mem[mem_ra];
+        wall_rd   <= wall_mem[mem_ra];
+        bright_rd <= bright_mem[mem_ra];
+    end
 
     // ---------------------------------------------------------------------
     // 配置寄存器（AXI-Lite 写进来；复位值 = C 参考模型的默认参数）
@@ -472,7 +612,11 @@ module vision_top #(
     // 列游程工具
     task seg_push(input [W_BITS-1:0] a, input [W_BITS-1:0] b);
         begin
-            if ((b - a + 1'b1 >= r_min_seg_px) && (n_segs < MAX_SEGS)) begin
+            // 两道长度门槛：`r_min_seg_px` 是运行时可配的**检测参数**，
+            // MIN_SEG_TO_STANDARD 是"转标准结构"的**结构性过滤**（见常量声明处）。
+            if ((b - a + 1'b1 >= r_min_seg_px) &&
+                (b - a + 1'b1 >= MIN_SEG_TO_STANDARD) &&
+                (n_segs < MAX_SEGS)) begin
                 seg_x0[n_segs] <= a + x_min;
                 seg_x1[n_segs] <= b + x_min;
                 n_segs <= n_segs + 1'b1;
@@ -573,23 +717,71 @@ module vision_top #(
     wire [15:0] bh      = band_y1[band_i] - band_y0[band_i] + 1'b1;
     wire [15:0] lim_now = wall_limit(bh);
     wire [15:0] el_now  = r_edge_min * EDGE_AVG[15:0];
-    wire [31:0] sg_cyq_c = (sg_total != 0)
-        ? vo_scale_round({16'b0, sg_sumy}, {16'b0, sg_total}, 16'd64)
-        : ({16'b0, band_y0[band_i]} + {16'b0, band_y1[band_i]}) * 32'd32;
-    // C 的退化分支是 `*cy_q * 4`（用**量化后**的 cy），不是重新量化 cy*256。
-    wire [31:0] sg_lq_c = (sg_ln != 0)
-        ? vo_scale_round({16'b0, sg_ls}, {16'b0, sg_ln}, 16'd256) : (sg_cyq_c * 32'd4);
-    wire [31:0] sg_rq_c = (sg_rn != 0)
-        ? vo_scale_round({16'b0, sg_rs}, {16'b0, sg_rn}, 16'd256) : (sg_cyq_c * 32'd4);
+    // 段几何的**组合部分**（不含除法）。三个 vo_scale_round 与 atan2 里的那次
+    // 除法已移到 S_SG_CYQ/LQ/RQ/ANG 四个多周期状态里，结果是 sg_cyq_r/lq_r/rq_r/ang_r。
     wire signed [31:0] sg_dx_c = $signed({16'b0, sg_x1 - sg_x0 + 1'b1}) + 32'sd1
                                  - $signed({16'b0, sg_span}) * 32'sd2;
-    // 倾角先算到一根**组合 wire** 上，再拿去写记录数组。
-    // 不是风格问题：把 `vo_atan2_q6(...)` 直接写进"数组元素的非阻塞赋值 RHS"
-    // 时（同一函数在别处还有一次调用），Verilator 5.020 -O2 落库的值会算错 ——
-    // 现象是 $display 打印的中间量全对、只有存进数组的字节不对。
-    // 提到 wire 上就对了；这条已在 rtl/README.md 的"踩过的坑"里记下。
-    wire signed [31:0] sg_ang_c = (sg_dx_c > 0)
-        ? vo_atan2_q6($signed(sg_rq_c - sg_lq_c), sg_dx_c <<< 8) : 32'sd0;
+    wire signed [31:0] sg_ang_y = sg_rq_r - sg_lq_r;
+
+    // atan2 前半段的组合部分：取 |y| 与 x，必要时对调（保证 a <= b）。
+    // 与 C 的 `neg = y<0; a=|y|; b=x; if (a>b) swap, inv=1;` 一致。
+    // ⚠ C 的调用是 vr_atan2_q6(rq-lq, dx << 8) —— 第二个参数是 **x_q8**，
+    //   不是裸的 dx。这里漏过 `<< 8` 一次，症状是角度整体算错（v 落在错的
+    //   表区间），而 cyq/lq/rq 全对，所以只有帧里的角度字段不符。
+    wire signed [31:0] an_x8_w = sg_dx_c <<< 8;          // x_q8
+    wire        an_neg_w = (sg_ang_y < 32'sd0);
+    wire [31:0] an_ay_w  = an_neg_w ? -sg_ang_y : sg_ang_y;
+    wire        an_inv_w = (an_ay_w > an_x8_w);
+    wire [31:0] an_a_w   = an_inv_w ? an_x8_w : an_ay_w;
+    wire [31:0] an_b_w   = an_inv_w ? an_ay_w : an_x8_w;
+
+    // ---------------------------------------------------------------------
+    // 后处理用的 atan2 组合部分：**整堵墙的朝向**。
+    //
+    // 与 C 参考模型这段逐字对应（vision_ref.c 的 vr_extract_walls）：
+    //     dx = ((keep[last].a + keep[last].b) - (keep[0].a + keep[0].b)) * (VR_Q/2)
+    //     dy = kcy_q[last] - kcy_q[0]
+    //     ang_wall = (dx != 0) ? vr_atan2_q6(dy, dx) : kang_q[0]
+    //
+    // `seg_x0/seg_x1` 含 x_min、C 的 keep[].a/.b 不含 —— 但这里只用**差值**，
+    // x_min 自己抵消，所以两边等价。
+    //
+    // 量级：x 中点用 (x0+x1)*32（≤ 639*2*32 ≈ 4.1e4），cy 是 Q6，两者同一标度。
+    // vr_atan2_q6 只看比值，标度不影响结果；而且内部 `a<<15` 不会溢出
+    // （C 侧注释要求输入 ≤ 480*256，这里远小于它）。注意这里**不做 `<<8`** ——
+    // 与逐段那次的 `<<8` 不同，因为两边给的本来就是 Q6 量级，再移位会溢出。
+    // ---------------------------------------------------------------------
+    wire signed [31:0] aw_dy_w = seg_cy[seg_k - 9'd1] - seg_cy[9'd0];
+    wire signed [31:0] aw_dx_w = (({16'b0, seg_x1[seg_k - 9'd1]} + {16'b0, seg_x0[seg_k - 9'd1]}) -
+                                  ({16'b0, seg_x1[9'd0]}          + {16'b0, seg_x0[9'd0]})) * 32'sd32;
+    wire        aw_neg_w = (aw_dy_w < 32'sd0);
+    wire [31:0] aw_ay_w  = aw_neg_w ? -aw_dy_w : aw_dy_w;
+    wire [31:0] aw_x_w   = aw_dx_w[31:0];
+    wire        aw_inv_w = (aw_ay_w > aw_x_w);
+    wire [31:0] aw_a_w   = aw_inv_w ? aw_x_w : aw_ay_w;
+    wire [31:0] aw_b_w   = aw_inv_w ? aw_ay_w : aw_x_w;
+
+    // atan2 的后半段：拿到 r 之后的查表 + 线性插值。
+    // 与 C 参考模型 vr_atan2_q6 的后半段逐位一致；两处 `/4096`、`/4` 换成
+    // 算术右移 —— 被除数恒非负（AT 单调递增、frac ≥ 0、v 的符号分支已拆开），
+    // 所以 `>>>` 与整除等价。
+    function signed [31:0] atan2_post(input [39:0] r_in, input inv, input neg);
+        reg signed [31:0] v, dv;
+        reg [3:0]  idx;
+        reg [31:0] frac;
+        begin
+            if (r_in >= 40'd32768) v = 32'sd201;
+            else begin
+                idx  = r_in[15:12];
+                frac = {20'b0, r_in[11:0]};
+                dv   = $signed({16'b0, vo_at(idx + 4'd1)}) - $signed({16'b0, vo_at(idx)});
+                v = $signed({16'b0, vo_at(idx)}) + ((dv * $signed({1'b0, frac})) >>> 12);
+            end
+            if (inv) v = 32'sd402 - v;
+            if (neg) v = -v;
+            atan2_post = (v >= 0) ? ((v + 32'sd2) >>> 2) : -(((-v) + 32'sd2) >>> 2);
+        end
+    endfunction
     wire [7:0]  cur_gray = gray_rd;
     wire [7:0]  cur_step = (({1'b0, cy} + EDGE_AVG) <= {1'b0, band_y1[band_i]})
                            ? abs_diff(gray_rd, sr1) : 8'd0;
@@ -600,6 +792,57 @@ module vision_top #(
     wire        flag_now  = (next_cnt >= lim_now) ||
                             ((next_cnt >= r_edge_min_cols) && ({8'b0, step_next} >= el_now));
 
+    // =====================================================================
+    // 帧存预读地址 rd_nxt
+    //
+    // 与状态机原来对 rd_addr 的 **6 处** 赋值逐字对应（那 6 处已全部搬到这里，
+    // 状态机里只剩一句 `rd_addr <= rd_nxt`）。同一个值一拍两用：
+    //   * 进 BRAM 地址口 —— **提前一拍**，正好抵消 BRAM 的读延迟
+    //   * 进 rd_addr 寄存器 —— 时序与改动前完全一致
+    // 于是
+    //     gray_rd(t) = gray_mem[rd_nxt(t-1)] = gray_mem[rd_addr(t)]
+    // 与原来的异步读**逐拍等价**，两个扫描器的判据一个字都不用改。
+    //
+    // ⚠ 下面这 6 条条件必须与状态机里的一模一样。写错了**不会静默通过**：
+    //   core/fpga/cosim 那 620 帧、4.3 亿次逐位对账会当场报差异。
+    // =====================================================================
+    always @* begin
+        rd_nxt = rd_addr;                        // 默认：保持
+        case (state)
+            // (1) 行带扫描：进入第一条带时定位到带首
+            S_SPAN_CLR: begin
+                if (!(ctr < WIDTH) && !(n_bands == 0))
+                    rd_nxt = base_of(band_y0[0]);
+            end
+            // (2)(3) 行带扫描：换带时跳到新带首，否则逐像素前进
+            S_SPAN: begin
+                if (!(band_i >= n_bands)) begin
+                    if (sp_rows_left == 16'd0) begin
+                        if (band_i + 1'b1 < n_bands)
+                            rd_nxt = base_of(band_y0[band_i + 1'b1]);
+                    end else begin
+                        rd_nxt = rd_addr + 1'b1;
+                    end
+                end
+            end
+            // (4) 列扫描：进入时定位到首列的带底
+            S_COL_CLEAR: begin
+                if (!(band_i >= n_bands) && !(ctr < WIDTH))
+                    rd_nxt = base_of(band_y1[band_i]) + x_min;
+            end
+            // (5)(6) 列扫描：列内自下而上（-WIDTH），列末跳到下一列的带底
+            S_COL_SCAN: begin
+                if (cy == band_y0[band_i]) begin
+                    if (cx != x_max)
+                        rd_nxt = base_of(band_y1[band_i]) + cx + 1'b1;
+                end else begin
+                    rd_nxt = rd_addr - WIDTH[AW-1:0];
+                end
+            end
+            default: ;
+        endcase
+    end
+
     always @(posedge pix_clk) begin
         if (!rst_n) begin
             state <= S_IDLE; ctr <= 0;
@@ -608,10 +851,17 @@ module vision_top #(
             wr_col <= 0; wr_row <= 0; rc_run <= 0;
             n_bands <= 0; n_obs <= 0; n_gaps <= 0; n_segs <= 0;
             player_valid <= 0; ccl_start <= 0; ccl_started <= 0;
+            sgr_started <= 1'b0; div_start <= 1'b0;
         end else begin
             frame_done <= 1'b0;
             ccl_start  <= 1'b0;
             dout_vld   <= (state == S_PACK);
+
+            // 帧存回读地址：统一由下面的 rd_nxt 组合块给出"下一拍的地址"。
+            // 状态机里**不再**直接写 rd_addr —— 原来的 6 处赋值全部搬进了 rd_nxt，
+            // 于是同一个值既进 BRAM 地址口（提前一拍，补偿 BRAM 的读延迟），
+            // 又进 rd_addr 寄存器（时序与原来完全一致）。
+            rd_addr <= rd_nxt;
 
             case (state)
             // =============================================================
@@ -653,7 +903,7 @@ module vision_top #(
             S_BAND: begin
                 if (band_phase == 2'd0) begin
                     if (bi < HEIGHT) begin
-                        if (row_count[bi[H_BITS-1:0]] >= band_limit()) begin
+                        if (row_count[bi[H_BITS-1:0]] >= band_limit(r_band_row_pct)) begin
                             if (!band_in_run) begin
                                 band_in_run <= 1'b1;
                                 band_run_a  <= bi[H_BITS-1:0];
@@ -691,7 +941,6 @@ module vision_top #(
                     band_i       <= 0;
                     sp_cx        <= 0;
                     sp_rows_left <= band_y1[0] - band_y0[0] + 1'b1;
-                    rd_addr      <= base_of(band_y0[0]);
                     state        <= S_SPAN;
                 end
             end
@@ -704,13 +953,11 @@ module vision_top #(
                     band_i <= band_i + 1'b1;
                     if (band_i + 1'b1 < n_bands) begin
                         sp_rows_left <= band_y1[band_i+1'b1] - band_y0[band_i+1'b1] + 1'b1;
-                        rd_addr      <= base_of(band_y0[band_i+1'b1]);
                         sp_cx        <= 0;
                     end
                 end else begin
                     if (wall_rd) span_count[sp_cx[W_BITS-1:0]] <=
                                      span_count[sp_cx[W_BITS-1:0]] + 16'd1;
-                    rd_addr <= rd_addr + 1'b1;
                     if (sp_cx == WIDTH - 1) begin
                         sp_cx <= 0;
                         sp_rows_left <= sp_rows_left - 1'b1;
@@ -747,7 +994,6 @@ module vision_top #(
                 end else begin
                     cx      <= x_min;
                     cy      <= band_y1[band_i];
-                    rd_addr <= base_of(band_y1[band_i]) + x_min;
                     acc_cnt <= 0; acc_sumy <= 0; acc_step <= 0;
                     sr0 <= 8'd0; sr1 <= 8'd0;
                     n_segs <= 0;
@@ -773,13 +1019,11 @@ module vision_top #(
                     end else begin
                         cx      <= cx + 1'b1;
                         cy      <= band_y1[band_i];
-                        rd_addr <= base_of(band_y1[band_i]) + cx + 1'b1;
                         acc_cnt <= 0; acc_sumy <= 0; acc_step <= 0;
                         sr0 <= 8'd0; sr1 <= 8'd0;
                     end
                 end else begin
                     cy      <= cy - 1'b1;
-                    rd_addr <= rd_addr - WIDTH[AW-1:0];
                 end
             end
             // =============================================================
@@ -813,13 +1057,17 @@ module vision_top #(
             S_COL_RF2: begin
                 seg_limit <= n_segs;
                 seg_i     <= 0;
+                seg_k     <= 0;          // 压缩写指针归零（见 seg_k 的声明）
+                band_obs0 <= n_obs;      // 本带第一条障碍的下标（带末后处理用）
                 state     <= S_SEG;
             end
             // =============================================================
             // 每个墙段：一次扫过它的 x 范围，算 cy/厚度/倾角
             S_SEG: begin
                 if ((seg_i >= seg_limit) || (n_obs >= MAX_OBS)) begin
-                    seg_limit <= seg_i;
+                    // 结算成**压缩后**的段数：丢掉的退化段不能再让 S_GAP 看到，
+                    // 否则它会拿"被丢掉的段"当缺口的一端（缺口宽度与两端 id 全错）。
+                    seg_limit <= seg_k;
                     gi <= 0; gp_best <= 0; gp_bi <= 0; gp_vld <= 0;
                     state <= S_GAP;
                 end else begin
@@ -847,28 +1095,210 @@ module vision_top #(
                     sg_rs <= sg_rs + col_sumy[sx[W_BITS-1:0]];
                     sg_rn <= sg_rn + col_cnt[sx[W_BITS-1:0]];
                 end
-                if (sx == sg_x1) state <= S_SEG_FIN;
+                if (sx == sg_x1) state <= S_SG_CYQ;   // 累加完 → 多周期几何
                 else             sx <= sx + 1'b1;
             end
+            // =============================================================
+            // 多周期几何：cyq → lq → rq → ang，每步一次迭代除法（约 40 拍）
+            //
+            // 每一步的套路一样：
+            //   * 进入本状态的第一拍（!sgr_started）：分母为 0 就走退化分支
+            //     直接给结果；否则把除法器要的 num/den 摆好并 start
+            //   * 之后等 div_done，把商锁存下来，交棒给下一步
+            // 退化分支与原来组合写法**完全一致**（含 `sg_cyq_r * 4` 用的是
+            // **量化后**的 cyq，不是重新量化 cy*256）。
+            // =============================================================
+            S_SG_CYQ: begin
+                if (!sgr_started) begin
+                    sgr_started <= 1'b1;
+                    if (sg_total == 16'd0) begin
+                        sg_cyq_r    <= ({16'b0, band_y0[band_i]} + {16'b0, band_y1[band_i]}) * 32'd32;
+                        sgr_started <= 1'b0;   // 直接跳走：别留下"已发起"，否则下一状态死等 div_done
+                        state       <= S_SG_LQ;
+                    end else begin
+                        div_num   <= {8'b0, sg_sumy} * 40'd128 + {20'b0, sg_total};
+                        div_den   <= {4'b0, sg_total} * 20'd2;
+                        div_start <= 1'b1;
+                    end
+                end else begin
+                    div_start <= 1'b0;
+                    if (div_done) begin
+                        sg_cyq_r    <= div_quo[31:0];
+                        sgr_started <= 1'b0;
+                        state       <= S_SG_LQ;
+                    end
+                end
+            end
+            S_SG_LQ: begin
+                if (!sgr_started) begin
+                    sgr_started <= 1'b1;
+                    if (sg_ln == 16'd0) begin
+                        sg_lq_r     <= sg_cyq_r * 32'd4;
+                        sgr_started <= 1'b0;
+                        state       <= S_SG_RQ;
+                    end else begin
+                        div_num   <= {8'b0, sg_ls} * 40'd512 + {20'b0, sg_ln};
+                        div_den   <= {4'b0, sg_ln} * 20'd2;
+                        div_start <= 1'b1;
+                    end
+                end else begin
+                    div_start <= 1'b0;
+                    if (div_done) begin
+                        sg_lq_r     <= div_quo[31:0];
+                        sgr_started <= 1'b0;
+                        state       <= S_SG_RQ;
+                    end
+                end
+            end
+            S_SG_RQ: begin
+                if (!sgr_started) begin
+                    sgr_started <= 1'b1;
+                    if (sg_rn == 16'd0) begin
+                        sg_rq_r     <= sg_cyq_r * 32'd4;
+                        sgr_started <= 1'b0;
+                        state       <= S_SG_ANG;
+                    end else begin
+                        div_num   <= {8'b0, sg_rs} * 40'd512 + {20'b0, sg_rn};
+                        div_den   <= {4'b0, sg_rn} * 20'd2;
+                        div_start <= 1'b1;
+                    end
+                end else begin
+                    div_start <= 1'b0;
+                    if (div_done) begin
+                        sg_rq_r     <= div_quo[31:0];
+                        sgr_started <= 1'b0;
+                        state       <= S_SG_ANG;
+                    end
+                end
+            end
+            S_SG_ANG: begin
+                if (!sgr_started) begin
+                    sgr_started <= 1'b1;
+                    // 与 C 的 vr_atan2_q6 前半段一致：
+                    //   x_q8 <= 0 或 y_q8 == 0 → 0；否则取 |y|、x，必要时对调
+                    if (sg_dx_c <= 32'sd0 || sg_ang_y == 32'sd0) begin
+                        sg_ang_r    <= 32'sd0;
+                        sgr_started <= 1'b0;
+                        state       <= S_SEG_FIN;
+                    end else begin
+                        div_num   <= {6'b0, an_a_w} <<< 15;   // (uint32)a << 15
+                        div_den   <= an_b_w[19:0];
+                        div_start <= 1'b1;
+                    end
+                end else begin
+                    div_start <= 1'b0;
+                    if (div_done) begin
+                        sg_ang_r    <= atan2_post(div_quo, an_inv_w, (sg_ang_y < 0));
+                        sgr_started <= 1'b0;
+                        state       <= S_SEG_FIN;
+                    end
+                end
+            end
             S_SEG_FIN: begin
+                // ------------------------------------------------------------------
+                // 不变量 `half_w >= half_h`（half_w 是长边）。
+                //
+                // 段短于厚度时 half_w 会小于 half_h，PS 侧
+                // `decode_vision_frame().validate()` 会**当场抛异常，整条链断**。
+                // 实测真实照片 32 张里 6 张触发（如 hw=5.0 < hh=8.5）；合成图永远
+                // 产不出这种段，所以 620 帧逐位对账全绿也照不出来。
+                //
+                // 处理办法与 core/vision/to_standard.py 的 `_segment_obstacle` 一致：
+                // **丢掉**（返回 None），而不是交换长短边 —— 交换会把一个碎片
+                // 说成"一堵竖直的墙"，那是编造出来的几何。
+                //
+                // 丢掉时要**同时**做三件事，缺一不可：
+                //   ① 不写 obs_words（不占障碍名额）；
+                //   ② `seg_k` 不前进（保留下来的段才占紧凑下标）；
+                //   ③ `seg_i` 照常前进（继续处理下一条）。
+                // 而且 `seg_x0/seg_x1` 要**回写到 seg_k**，让 S_GAP 看到的是
+                // 压缩后的相邻关系。三条漏一条，缺口的两端就会错位。
+                // ------------------------------------------------------------------
+                if (({16'b0, sg_x1} - {16'b0, sg_x0} + 32'd1) <
+                    (thick_or_h(sg_thick, bh))) begin
+                    if (dbg_dump_seg)
+                        $display("V  seg x=[%0d,%0d] **丢掉**（half_w < half_h）",
+                                 sg_x0, sg_x1);
+                    seg_i <= seg_i + 1'b1;
+                    state <= S_SEG;
+                end else begin
                 obs_words[n_obs*9 + 0] <= {24'b0, n_obs} + 32'd1;
                 obs_words[n_obs*9 + 1] <= 32'd1;                    // VSHAPE_RECT
                 obs_words[n_obs*9 + 2] <= 32'd2;                    // VTYPE_WALL_WITH_GAP
                 obs_words[n_obs*9 + 3] <= ({16'b0, sg_x0} + {16'b0, sg_x1}) * 32'd32;
-                obs_words[n_obs*9 + 4] <= sg_cyq_c;
+                obs_words[n_obs*9 + 4] <= sg_cyq_r;
                 obs_words[n_obs*9 + 5] <= 32'd0;                    // radius：矩形没有
                 obs_words[n_obs*9 + 6] <= ({16'b0, sg_x1} - {16'b0, sg_x0} + 32'd1) * 32'd32;
                 obs_words[n_obs*9 + 7] <= thick_or_h(sg_thick, bh) * 32'd32;
-                obs_words[n_obs*9 + 8] <= sg_ang_c;
+                obs_words[n_obs*9 + 8] <= sg_ang_r;
                 if (dbg_dump_seg)
                     $display("V  seg x=[%0d,%0d] span=%0d ls=%0d ln=%0d rs=%0d rn=%0d lq=%0d rq=%0d dx=%0d ang=%0d",
                              sg_x0, sg_x1, sg_span, sg_ls, sg_ln, sg_rs, sg_rn,
-                             sg_lq_c, sg_rq_c, sg_dx_c, sg_ang_c);
-                seg_id[seg_i] <= n_obs + 1'b1;
-                seg_cy[seg_i] <= sg_cyq_c;
+                             sg_lq_r, sg_rq_r, sg_dx_c, sg_ang_r);
+                // 回写到**压缩下标** seg_k（恒 <= seg_i，那一格已被读过，安全）
+                seg_x0[seg_k] <= sg_x0;
+                seg_x1[seg_k] <= sg_x1;
+                seg_id[seg_k] <= n_obs + 1'b1;
+                seg_cy[seg_k] <= sg_cyq_r;
+                seg_k <= seg_k + 1'b1;
                 n_obs <= n_obs + 1'b1;
                 seg_i <= seg_i + 1'b1;
                 state <= S_SEG;
+                end
+            end
+            // =============================================================
+            // 带末后处理：**整堵墙共用一个朝向**
+            //
+            // 为什么必须有：决策的 `group_walls` 分桶键是
+            // `(int(round(rotation*1000)), int(round(band/2)))` —— 把角度差异
+            // **放大 1000 倍**。逐段各自拟合的角差 0.01 rad（PL 的定点 atan2 是
+            // Q6，一格就 0.0156 rad）会让**同一堵墙的两段落进不同的桶**，
+            // `plan()` 于是永远重建不出缺口、一直喊 NO_GAP。
+            //
+            // 实测（合成场景 16 s、48 个决策时刻）：逐段角度 → 与 Python 的 tier
+            // **48/48 全不同**；换成"整堵墙共用" → **0/48**。这是分水岭。
+            //
+            // 与 core/vision/to_standard.py 的 `_wall_rotation` 同义：段心连线的
+            // 总体最小二乘主方向。本场景实测每堵墙**恰好 2 段**（38/38 个墙带），
+            // 两点情形的主方向就是两点连线，所以"首段心 → 末段心"与 Python 的 TLS
+            // **精确等价**。
+            //
+            // `seg_k <= 1` 时什么都不用做：单段本来就用它自己的角（C 侧同样是
+            // `kang_q[0]`），而 S_SEG_FIN 已经那么写了。
+            //
+            // ⚠ `aw_dx_w <= 0` 这一支**不可达**：keep[] 保序、段自左向右，
+            //   所以末段心的 x 恒 > 首段心。C 侧 `dx != 0` 也走不到。这里显式
+            //   挡住只是为了别在 RTL 里出现除零，不改变可达行为。
+            // =============================================================
+            S_ANG_INIT: begin
+                if ((seg_k <= 9'd1) || (aw_dx_w <= 32'sd0)) begin
+                    band_i <= band_i + 1'b1;
+                    ctr    <= 0;
+                    state  <= S_COL_CLEAR;
+                end else begin
+                    div_num   <= {22'b0, aw_a_w[17:0]} <<< 15;
+                    div_den   <= aw_b_w[19:0];
+                    div_start <= 1'b1;
+                    state     <= S_ANG_DIV;
+                end
+            end
+            S_ANG_DIV: begin
+                div_start <= 1'b0;
+                if (div_done) begin
+                    ang_wall <= atan2_post(div_quo, aw_inv_w, aw_neg_w);
+                    ang_i    <= band_obs0;
+                    state    <= S_ANG_WR;
+                end
+            end
+            S_ANG_WR: begin
+                if (ang_i >= n_obs) begin
+                    band_i <= band_i + 1'b1;
+                    ctr    <= 0;
+                    state  <= S_COL_CLEAR;
+                end else begin
+                    obs_words[ang_i*9 + 8] <= ang_wall;   // 只改 rotation 那一格
+                    ang_i <= ang_i + 1'b1;
+                end
             end
             // =============================================================
             S_GAP: begin
@@ -887,9 +1317,9 @@ module vision_top #(
                         n_gaps <= n_gaps + 1'b1;
                     end
                     gp_vld <= 1'b0;
-                    band_i <= band_i + 1'b1;
-                    ctr    <= 0;
-                    state  <= S_COL_CLEAR;
+                    // 先做**整堵墙朝向**的后处理，再进下一个带（见 S_ANG_INIT）。
+                    // 从前这里直接 `band_i <= band_i+1; state <= S_COL_CLEAR;`
+                    state  <= S_ANG_INIT;
                 end else begin
                     if ((seg_x0[gi+1'b1] - seg_x1[gi] - 1'b1 >= r_min_gap_px) &&
                         (seg_x0[gi+1'b1] - seg_x1[gi] - 1'b1 > gp_best)) begin
@@ -977,13 +1407,21 @@ module vision_top #(
     end
 
     // =====================================================================
-    // 6. 调试/回读口（组合）
+    // 6. 调试/回读口
+    //
+    // 除掩膜像素外都是**组合**读（row_count / band / seg / obs / gap / player …）。
+    //
+    // sel=0/1/2 读三张掩膜的像素**走寄存读**，而且**只在帧间（IDLE/DONE）有效**：
+    //   BRAM 没有组合读口，若在这里写 `gray_mem[dbg_idx]`，Vivado 就只能把整张
+    //   帧存退回分布式 RAM —— 那正是本设计装不下 030 的原因。所以这三项复用
+    //   扫描器的读口（见上面 mem_ra 的仲裁），代价是帧内读回来的是扫描器的数据。
+    //   调试用足够：一帧跑完（frame_done）之后再读即可。
     // =====================================================================
     always @* begin
         case (dbg_sel)
-            4'd0:  dbg_data = {24'b0, gray_mem[dbg_idx[AW-1:0]]};
-            4'd1:  dbg_data = {31'b0, wall_mem[dbg_idx[AW-1:0]]};
-            4'd2:  dbg_data = {31'b0, bright_mem[dbg_idx[AW-1:0]]};
+            4'd0:  dbg_data = {24'b0, gray_rd};
+            4'd1:  dbg_data = {31'b0, wall_rd};
+            4'd2:  dbg_data = {31'b0, bright_rd};
             4'd3:  dbg_data = {16'b0, row_count[dbg_idx[H_BITS-1:0]]};
             4'd4:  dbg_data = {16'b0, span_count[dbg_idx[W_BITS-1:0]]};
             4'd5:  dbg_data = {{(32-H_BITS){1'b0}}, band_y0[dbg_idx[5:0]]};

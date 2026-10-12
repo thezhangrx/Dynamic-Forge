@@ -55,6 +55,8 @@ static Vvision_axi *top = nullptr;
 static void step();
 
 static long g_checks = 0, g_fail = 0;
+static int  g_frames_done = 0;   // 真正跑完比对的帧数（假通过防线用）
+static int  g_stim_err    = 0;   // 激励读不出来 / 超限的次数
 static bool g_verbose = false;
 
 static void cmp_u32(const char *what, long long idx, uint32_t got, uint32_t want)
@@ -191,7 +193,12 @@ int main(int argc, char **argv)
         char name[64];
         snprintf(name, sizeof(name), "%06d.ppm", f);
         int w = 0, h = 0;
-        if (!load_ppm(dir + "/" + name, &w, &h, rgb)) { printf("激励读取失败：%s\n", name); break; }
+        if (!load_ppm(dir + "/" + name, &w, &h, rgb)) {
+            printf("激励读取失败：%s\n", name);
+            g_stim_err++;
+            break;
+        }
+        g_frames_done++;
 
         // 每帧都重写一遍配置（顺便测配置寄存器的读写）
         CHECK(axi_write(A_CFG_WALL_RB,    (uint32_t)params.wall_rb), "写 WALL_RB 超时");
@@ -288,6 +295,19 @@ int main(int argc, char **argv)
 
     printf("\n=== AXI 协同仿真结果 ===\n");
     printf("比对项 %ld，不符 %ld\n", g_checks, g_fail);
+
+    // ---- 假通过防线（与 tb_vision.cpp 同一条规矩，理由见那边）----------------
+    int rc = (g_fail == 0) ? 0 : 1;
+    if (g_frames_done != frames) {
+        printf("!! 只比对了 %d / %d 帧（激励出错 %d 次）—— 判为失败\n",
+               g_frames_done, frames, g_stim_err);
+        rc = 1;
+    }
+    if (g_checks == 0) {
+        printf("!! 一次比对都没发生 —— 判为失败\n");
+        rc = 1;
+    }
+
     delete top;
-    return g_fail == 0 ? 0 : 1;
+    return rc;
 }

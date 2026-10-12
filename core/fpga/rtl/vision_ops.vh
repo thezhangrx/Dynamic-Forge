@@ -18,8 +18,6 @@
 // ⚠ 只对**非负** num 调用 vo_scale_round（C 里也只这么用：坐标、面积、矩）。
 // ===========================================================================
 
-`ifndef VISION_OPS_VH
-
 // ---------------------------------------------------------------------------
 // 编译检查（Verilator）的警告取舍，逐个说明，不是一刀切静音
 //   WIDTHEXPAND   — 设计里到处是 `窄寄存器 < 32'd常数`（检测参数写成了
@@ -37,8 +35,6 @@
 /* verilator lint_off WIDTHTRUNC */
 /* verilator lint_off BLKSEQ */
 /* verilator lint_off UNUSEDSIGNAL */
-`define VISION_OPS_VH
-
 // ---- 灰度化：BT.601 整数权重 77/150/29，+128 四舍五入 --------------------
 // C: (uint8_t)((77*r + 150*g + 29*b + 128) >> 8)
 function [7:0] vo_gray(input [7:0] r, input [7:0] g, input [7:0] b);
@@ -158,8 +154,6 @@ function [31:0] vo_crc_step(input [31:0] crc, input [7:0] data);
         vo_crc_step = x;
     end
 endfunction
-
-`endif // VISION_OPS_VH
 
 /* verilator lint_on WIDTHEXPAND */
 /* verilator lint_on WIDTHTRUNC */

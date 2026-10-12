@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import pathlib
 import statistics
 import subprocess
@@ -82,13 +83,24 @@ def _check_params_agree(effective: dict, c_args: dict[str, int]) -> None:
             f"{c_name}={want}。多半是缩放做了 0 次或 2 次（见本函数注释）。")
 
 
-def _python_chain(bgr):
-    """跑 Python 视觉链，返回像素单位的 (player, gaps, obstacles, 生效参数)。
+def _python_chain(bgr, seq: int = 0, stamp: float = 0.0):
+    """跑 Python 视觉链，返回**像素单位的 ``VisionFrame``** 与生效参数。
+
+    ⚠ **必须比到 `to_standard` 这一层，不能停在 `detect()`**。
+    C 参考模型的产物是"转成标准结构之后"的帧；而 `detect()` 的原始墙段里
+    还带着**结构性的碎片**（实测 8 px、17 px 的），它们在 Python 侧的
+    `to_standard._segment_obstacle` 里会被丢掉（`DEFAULT_MIN_SEGMENT_PX = 24`
+    以及 `half_w >= half_h` 的不变量）。
+
+    早先这里停在 `detect()`，于是拿"含碎片的段数"去比"过滤后的障碍数" ——
+    两侧阶段不同，一旦 Ref 侧补上过滤就会**凭空多出一堆"差异"**。
+    比同一层，才是对账。
 
     参数走 `detect()` 内部的 `rescaled()`，所以 C 侧也要按同一套缩放后的值跑
     （见 `_c_args_for`）。
     """
     from vision.primitives import Frame
+    from vision.to_standard import frame_to_standard
     from vision.wall_with_gap import WallWithGapParams, detect
 
     fr = Frame(bgr.shape[1], bgr.shape[0], bgr[:, :, 2].tobytes(),
@@ -98,12 +110,8 @@ def _python_chain(bgr):
     # band_min_rows 会从 4 变成 3，多出半条墙带。C 侧的 `_c_args_for` 是
     # 独立算一次的，两边各自一次才对得上。
     obs = detect(fr, WallWithGapParams(), name="cmp")
-    player = None if obs.player is None else (obs.player.x, obs.player.y, obs.player.r)
-    # 缺口挂在 Wall 上（每个墙带最多一个）：`detect_walls` 把 gap 放进 Wall
-    gaps = [(w.gap.cx, w.gap.width_px, w.gap.cy) for w in obs.walls if w.gap is not None]
-    # 墙段：与 C 模型的障碍记录一一对应（一条段 = 一条记录）
-    segments = [seg for w in obs.walls for seg in w.segments]
-    return player, gaps, segments, obs.diagnostics["params"]
+    vf = frame_to_standard(obs, seq=int(seq), stamp=float(stamp))
+    return vf, obs.diagnostics["params"]
 
 
 def _nearest_gap_error(py_gaps, c_gaps) -> float | None:
@@ -118,6 +126,40 @@ def _nearest_gap_error(py_gaps, c_gaps) -> float | None:
     for (px, _pw, py) in py_gaps:
         ds.append(min(((px - cx) ** 2 + (py - cy) ** 2) ** 0.5 for (cx, _w, cy) in c_gaps))
     return statistics.median(ds)
+
+
+def _nearest_angle_error(py_angled, c_obstacles) -> float | None:
+    """按**位置**配对之后比较角度（弧度）。
+
+    为什么要先配对再比：两边的记录顺序不同（C 按行带顺序吐，Python 按墙带的段序），
+    直接按索引比会把"顺序不同"误报成"角度不同"。
+
+    配对的可靠性：墙段之间相距远大于它们自身厚度，所以"位置最近的 C 记录"
+    就是同一条段。
+
+    **这一项为什么必须有**：决策的 `group_walls()` 用
+    ``key = (round(rotation * 1000), ...)`` 分桶 —— 把角度的微小差异放大 1000 倍。
+    实测 C（定点 atan2）与 Python（浮点 atan2）的角度差约 0.012 rad，
+    桶键就从 {1,2} 变成 {−9,4,5}，**墙被分进不同的桶**，闭环里直接撞墙。
+    而当时这份对账只比缺口中心/角色位置，**角度从来没进过比较**，
+    所以它报的是"0.00 px，满分" —— 差异就这样漏到了闭环。
+    """
+    if not py_angled or not c_obstacles:
+        return None
+    ds = []
+    for (px, py, pa) in py_angled:
+        best = None
+        for o in c_obstacles:
+            d2 = (px - float(o.x)) ** 2 + (py - float(o.y)) ** 2
+            if best is None or d2 < best[0]:
+                best = (d2, o)
+        if best is None:
+            continue
+        da = abs(pa - float(best[1].rotation))
+        # 角度是周期量：绕回来取最小差
+        da = min(da, abs(2.0 * math.pi - da))
+        ds.append(da)
+    return statistics.median(ds) if ds else None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -138,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"{args.stim} 里没有 PPM/PGM")
 
     rows = []
-    for name in names:
+    for i, name in enumerate(names):
         path = args.stim / name
         bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if bgr is None:
@@ -160,16 +202,26 @@ def main(argv: list[str] | None = None) -> int:
         cf = decode_vision_frame(out_bin.read_bytes())     # 顺带验证线格式
         out_bin.unlink(missing_ok=True)
 
-        py_player, py_gaps, py_segs, py_eff = _python_chain(bgr)
+        py_vf, py_eff = _python_chain(bgr, seq=i, stamp=float(i))
         _check_params_agree(py_eff, c_map)
         c_player = None if cf.player is None else (cf.player.x, cf.player.y, cf.player.radius)
         c_gaps = [(g.center[0], g.width, g.center[1]) for g in cf.gaps]
 
+        # 两边现在都是**标准帧**（转标准结构之后），可以直接逐项比。
+        py_player = (None if py_vf.player is None
+                     else (py_vf.player.x, py_vf.player.y, py_vf.player.radius))
+        py_gaps = [(g.center[0], g.width, g.center[1]) for g in py_vf.gaps]
+        py_obs = list(py_vf.obstacles or [])
+        c_obs = list(cf.obstacles or [])
+        # 角度：两边都是**弧度、同一个坐标系**，直接取最小绝对差
+        py_angled = [(float(o.x), float(o.y), float(o.rotation)) for o in py_obs]
+
         rows.append({
             "file": name,
             "py_n_gaps": len(py_gaps), "c_n_gaps": len(c_gaps),
-            "py_n_obs": len(py_segs), "c_n_obs": len(cf.obstacles),
+            "py_n_obs": len(py_obs), "c_n_obs": len(c_obs),
             "gap_err": _nearest_gap_error(py_gaps, c_gaps),
+            "angle_err": _nearest_angle_error(py_angled, c_obs),
             "py_player": py_player, "c_player": c_player,
             "player_err": (None if not py_player or not c_player else
                            ((py_player[0] - c_player[0]) ** 2
@@ -198,6 +250,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  角色位置误差(像素): 中位 {statistics.median(pl_errs):.2f} max {max(pl_errs):.2f}")
     else:
         print("  角色位置误差: 无可用对比帧")
+
+    # ---- 墙段角度（关键的一项，别再漏）-----------------------------------
+    # 决策按 `round(rotation*1000)` 给墙分桶，把角度的微小差异放大 1000 倍。
+    # 这里如果报大数，**闭环一定出问题** —— 见 _nearest_angle_error 的文档。
+    ang_errs = [r["angle_err"] for r in rows if r["angle_err"] is not None]
+    if ang_errs:
+        med = statistics.median(ang_errs)
+        worst = max(ang_errs)
+        # 1e-3 rad 会让分桶键（×1000）动 1 档 —— 这是"能不能分到同一个桶"的量级
+        flag = "  ⚠ **超过 1e-3 rad：分桶键会跨档，闭环墙分组会不同**" if med > 1e-3 else ""
+        print(f"  墙段角度误差(弧度): 中位 {med:.6f} max {worst:.6f}{flag}")
+        print(f"    （决策分桶键 = round(rotation×1000)；角度差 ×1000 就是桶键差）")
+    else:
+        print("  墙段角度误差: 无可用对比帧")
 
     if args.json_out:
         args.json_out.write_text(json.dumps(rows, indent=2, ensure_ascii=False),

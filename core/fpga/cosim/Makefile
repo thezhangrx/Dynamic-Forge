@@ -22,9 +22,9 @@ TOP   = vision_top
 Mdir  = obj_dir
 
 REF_OBJ = $(abspath $(REF))/vision_ref.o
-RTL_SRC = $(RTL)/vision_top.v $(RTL)/vision_ccl.v
-AXI_SRC = $(RTL)/vision_axi.v $(RTL)/vision_top.v $(RTL)/vision_ccl.v
-ST_SRC  = $(RTL)/vision_selftest.v $(RTL)/vision_tpg.v $(RTL)/vision_top.v $(RTL)/vision_ccl.v
+RTL_SRC = $(RTL)/vision_top.v $(RTL)/vision_ccl.v $(RTL)/vision_div.v
+AXI_SRC = $(RTL)/vision_axi.v $(RTL)/vision_top.v $(RTL)/vision_ccl.v $(RTL)/vision_div.v
+ST_SRC  = $(RTL)/vision_selftest.v $(RTL)/vision_tpg.v $(RTL)/vision_top.v $(RTL)/vision_ccl.v $(RTL)/vision_div.v
 HDR_SRC = $(RTL)/vision_pkg.vh $(RTL)/vision_ops.vh
 REF_SRC = $(REF)/vision_ref.c $(REF)/ref_api.h
 
