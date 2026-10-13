@@ -134,6 +134,15 @@ module vision_ccl #(
     reg              cur_lv [0:MAX_RUNS-1];
     reg [LB-1:0]     cur_lb [0:MAX_RUNS-1];
     reg [LB-1:0]     prv_lb [0:MAX_RUNS-1];
+    // 上一行这条游程**有没有标签**。对应 C 的 `prev[j].label < 0`。
+    //
+    // 为什么必须有：标签表打满（n_label == MAX_LABELS）时 C_CREATE 什么都不写，
+    // 于是这条游程 `cur_lv = 0`，而 `cur_lb` 保留的是**上一行的陈旧值**。
+    // C_COPY 又会把它搬进 prv_lb，下一行的 C_MATCH 若不加判断就会拿这个陈旧
+    // 标签去做并查集合并 —— C 那边 `if (prev[j].label < 0) continue;` 是**跳过**。
+    // 真实照片会把标签表打满（实测 n_labels = 256），合成语料最多 3 个连通域，
+    // 这条路径在合成语料里一次都走不到。见 docs/帧存改造.md §14.4。
+    reg              prv_lv [0:MAX_RUNS-1];
 
     reg [LB-1:0]     parent [0:MAX_LABELS-1];
     reg [31:0]       cmp_n  [0:MAX_LABELS-1];
@@ -227,26 +236,41 @@ module vision_ccl #(
             end
             // -------------------------------------------------------------
             // 扫一行，收集游程
+            //
+            // ⚠ 游程表的上界（**可以证出来，不是拍的**）：
+            //   一行里 n 条游程至少占 `2n-1` 个像素（游程之间至少有 1 个非亮像素
+            //   把它们隔开），而一行只有 WIDTH=640 个像素
+            //   ⇒ n <= (WIDTH+1)/2 = 320。
+            //   C 侧 `VR_MAX_RUNS = 2048`、这里 `MAX_RUNS = 384` **都碰不到**，
+            //   所以两边"触顶语义"永远用不上 —— 但契约上它仍要一致（C 是一撞上限
+            //   就停止扫这一行，见 vision_ref.c 的 `while (x < width && n_cur < ...)`）。
+            //   这里加这道闸只为**别在越界时静默写坏 prv_x0/prv_lv 这些相邻数组**：
+            //   仿真器会照写，硬件会写坏同一块 RAM 里的别的位。
+            // -------------------------------------------------------------
             C_ROW: begin
                 if (x < WIDTH) begin
                     if (bright_rd) begin
                         if (!in_run) begin in_run <= 1'b1; r_a <= x[W_BITS-1:0]; end
                     end else if (in_run) begin
                         in_run <= 1'b0;
-                        cur_x0[n_cur] <= r_a;
-                        cur_x1[n_cur] <= x[W_BITS-1:0] - 1'b1;
-                        cur_lv[n_cur] <= 1'b0;
-                        n_cur <= n_cur + 1'b1;
+                        if (n_cur < MAX_RUNS) begin
+                            cur_x0[n_cur] <= r_a;
+                            cur_x1[n_cur] <= x[W_BITS-1:0] - 1'b1;
+                            cur_lv[n_cur] <= 1'b0;
+                            n_cur <= n_cur + 1'b1;
+                        end
                     end
                     x <= x + 1'b1;
                     if (x + 1'b1 < WIDTH) rd_addr <= row_base(y) + {7'b0, x} + 18'd1;
                 end else begin
                     if (in_run) begin
                         in_run <= 1'b0;
-                        cur_x0[n_cur] <= r_a;
-                        cur_x1[n_cur] <= WIDTH[W_BITS-1:0] - 1'b1;
-                        cur_lv[n_cur] <= 1'b0;
-                        n_cur <= n_cur + 1'b1;
+                        if (n_cur < MAX_RUNS) begin
+                            cur_x0[n_cur] <= r_a;
+                            cur_x1[n_cur] <= WIDTH[W_BITS-1:0] - 1'b1;
+                            cur_lv[n_cur] <= 1'b0;
+                            n_cur <= n_cur + 1'b1;
+                        end
                     end
                     i_cur <= {RB{1'b0}};
                     j_prev<= {RB{1'b0}};
@@ -260,6 +284,10 @@ module vision_ccl #(
                     state <= C_ACC;
                 end else if (j_prev >= n_prev) begin
                     state <= C_CREATE;
+                end else if (!prv_lv[j_prev]) begin
+                    // 上一行这条游程没有标签（标签表当时满了），**跳过不合并** ——
+                    // 与 C 的 `if (prev[j].label < 0) continue;` 同义。
+                    j_prev <= j_prev + 1'b1;
                 end else if (overlap) begin
                     if (!cur_lv[i_cur]) begin
                         find_target <= prv_lb[j_prev];
@@ -355,6 +383,7 @@ module vision_ccl #(
                     prv_x0[i_cur] <= cur_x0[i_cur];
                     prv_x1[i_cur] <= cur_x1[i_cur];
                     prv_lb[i_cur] <= cur_lb[i_cur];
+                    prv_lv[i_cur] <= cur_lv[i_cur];
                     i_cur <= i_cur + 1'b1;
                 end else begin
                     n_prev <= n_cur;
@@ -373,26 +402,58 @@ module vision_ccl #(
                 end
             end
             // -------------------------------------------------------------
+            // 选角色：与 C 的 `for (int i = 0; i < n_label; i++)` 同序同判据。
+            //
+            // ⚠ **这里曾经是死循环**，而且是真实照片才暴露的那种：
+            //   `sel_i` 只有 `LB = clog2(MAX_LABELS) = 8` 位（0..255），
+            //   而 `n_label` 可以饱和到 `MAX_LABELS = 256`（标签表满时 C 的语义
+            //   就是"多的游程不建标签"，RTL 照抄，见 C_CREATE）。
+            //   原判据 `{1'b0, sel_i} >= n_label` 在 `n_label == 256` 时
+            //   **恒为假**（左边最大 255 < 256）→ `sel_i` 加到 255 绕回 0 → 永不退出。
+            //
+            //   实测：`data/fpga/stim_photo`（真实照片 640×360）**32 张全部超时**，
+            //   卡在 vision_top 的 S_CCL 等 `ccl_done`；内部 state=12 (C_SEL)、
+            //   `n_label=256`。而合成语料 320 帧全绿 —— 它最多只产生 3 个连通域，
+            //   标签表永远打不满。见 core/fpga/docs/帧存改造.md §14.4。
+            //
+            //   改法：**先处理 sel_i，再用 9 位判"是否还有下一个"**。
+            //   `+1` 必须显式加宽到 9 位：`sel_i = 255` 时 255+1=256 才能和饱和在
+            //   256 的 `n_label` 相等。写成 8 位的话 255+1 绕回 0，又回到死循环。
+            // -------------------------------------------------------------
             C_SEL: begin
-                if ({1'b0, sel_i} >= n_label) begin
-                    state <= C_DONE;
-                end else begin
-                    sel_i <= sel_i + 1'b1;
-                    if (parent[sel_i] == sel_i) begin
-                        if (area_ok && edge_ok && fill_ok && asp_ok) begin
-                            if (score_num * best_den > best_num * {32'b0, wh_c}) begin
-                                best_num <= score_num;
-                                best_den <= {32'b0, wh_c};
-                                best_i   <= sel_i;
-                                best_vld <= 1'b1;
-                            end
+                if ((n_label != {NB{1'b0}}) && (parent[sel_i] == sel_i)) begin
+                    if (area_ok && edge_ok && fill_ok && asp_ok) begin
+                        if (score_num * best_den > best_num * {32'b0, wh_c}) begin
+                            best_num <= score_num;
+                            best_den <= {32'b0, wh_c};
+                            best_i   <= sel_i;
+                            best_vld <= 1'b1;
                         end
                     end
                 end
+                if (({1'b0, sel_i} + 9'd1) >= n_label) state <= C_DONE;
+                else                                     sel_i <= sel_i + 1'b1;
             end
             // -------------------------------------------------------------
             C_DONE: begin
                 if (!best_vld) begin
+                    // 没选中任何连通域时，输出必须**逐项清零**。
+                    //
+                    // C 参考模型是 `vr_frame_begin()` 里 `memset(f, 0, sizeof(*f))`，
+                    // 而 `vr_extract_player()` 在 `best < 0` 时直接 return，一个字段
+                    // 都不写 —— 所以 player[0..3] 与 blob_* 全是 0。
+                    //
+                    // RTL 这边它们是**寄存器**，不清零就保留**上一帧**的值，而几何帧
+                    // 里 player 那 16 个字节是照打包的 —— 帧字节于是和 C 对不上。
+                    // 实测（`data/fpga/stim_photo` 真实照片）：21 帧各差 18 处，
+                    // 首个不符恒在**字节 32**（player_x 最低位），因为只有这一项在
+                    // "上一帧有玩家、这一帧没有"时才会露出来。
+                    // 合成语料 320 帧全绿 —— 它几乎每帧都有玩家，走不到这条路径。
+                    // 见 core/fpga/docs/帧存改造.md §14.4。
+                    player_x  <= 32'd0; player_y  <= 32'd0; player_r  <= 32'd0;
+                    blob_x0   <= 10'd0; blob_x1   <= 10'd0;
+                    blob_y0   <= 10'd0; blob_y1   <= 10'd0;
+                    blob_area <= 32'd0;
                     player_valid <= 1'b0;
                     n_labels <= n_label[8:0];
                     done     <= 1'b1;

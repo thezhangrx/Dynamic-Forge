@@ -16,6 +16,8 @@ RTL 要**逐位比对**，对手必须和它一一对应：整数、定标、位
 | `vision_ref.c` | 视觉链路的 C 参考模型；纯 C11，无第三方依赖。`-DVR_NO_MAIN` 编成 .o 给协同仿真用 |
 | `ref_api.h` | 协同仿真的接口（`vr_ref_process`）与结果结构体 |
 | `export_frames.py` | 把真实录像导成 **P5 PGM / P6 PPM** 激励 |
+| `export_photos.py` | 把**真实照片**（`data/vision/*.jpg`）导成 **640×360 P6 PPM** 激励。见下 |
+| `dump_cc.c` | 把 C 的**候选连通域全表**打出来。`#include "vision_ref.c"` + `-DVR_NO_MAIN`，于是文件作用域的 `static`（`vr_comp`/`uf_parent`/`uf_find`）也能读 —— 拿到的是真中间状态，不是复制品 |
 | `compare_with_python.py` | C 模型 vs Python 视觉链的语义对账（P1 验收） |
 
 ## 跑起来
@@ -135,6 +137,25 @@ VR_DEBUG_SEG=1 /tmp/vision_ref frame.ppm out.bin    # C 侧打印每段的 ls/ln
 ```
 
 两边格式故意做成一样，`diff` 一眼就能看出是哪一段、哪一项先分叉。
+
+```bash
+# 连通域全表对账（分不清"表算错了"还是"判据判错了"时用）
+gcc -O2 -DVR_NO_MAIN -I. -o /tmp/dump_cc dump_cc.c
+/tmp/dump_cc frame.ppm                       # C 侧：L / n / x0 / x1 / y0 / y1 / 判据
+./obj_dir/Vvision_top <dir> 3 --dump-cc      # RTL 侧：同一组列，可逐列 diff
+./obj_dir/Vvision_top <dir> 3 --verbose      # 每帧的障碍/缺口/角色表
+```
+
+**卡死时**测试台会自己把状态机位置打出来（`dump_stuck()`）：`state`（带名字）、
+各计数器，以及 CCL 子模块内部的 `state/n_cur/n_label/i_cur/j_prev/find_target`。
+从前只有一句"RTL 超时未出帧"，拿到它等于什么都没拿到。
+
+### 为什么还要 `export_photos.py`（真实照片 ≠ 真实录像）
+
+录屏导出的帧**结构上太良性**：段永远够长、标签表永远填不满、几乎每帧都有玩家。
+于是 620 帧逐位对账全绿也说明不了真实输入下的行为。
+真实照片**第一次喂进 RTL 就把 32 帧全部卡死**，连带挖出 3 个独立缺陷。
+详见 `../docs/帧存改造.md` §14.5。
 
 ## 一个必须记住的限制
 

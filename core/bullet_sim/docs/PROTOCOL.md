@@ -1,4 +1,10 @@
-# CPU/FPGA State & Action 协议 (v2)
+# CPU/FPGA State & Action 协议 (v3)
+
+> **真值顺序：代码 > 本文档。** 版本与布局的唯一来源是
+> `bullet_sim/core/version.py` 的 `STATE_PROTOCOL_VERSION` 与
+> `bullet_sim/entities/bullet.py` 的 `PROTOCOL_FIELDS` /
+> `PROTOCOL_FIELDS_V1` / `PROTOCOL_FIELDS_V2`。
+> 本文档曾长期停留在 v2（stride 13、`88+52n`），与代码不符 —— 已按代码订正。
 
 本文件是模拟器与硬件/外部进程之间的**唯一契约**。它位于 `interface/`，
 不依赖模拟器内部实现，因此 `Virtual Simulator → CPU → FPGA` 与
@@ -9,7 +15,7 @@
 | offset | size | type | 字段 |
 |---|---|---|---|
 | 0 | 4 | uint32 | magic = `'BHL1'` = `0x314C4842` |
-| 4 | 2 | uint16 | version = 2 |
+| 4 | 2 | uint16 | version = 3（当前值；v1/v2 帧仍可读）|
 | 6 | 2 | uint16 | flags（bit0: 弹幕已压缩） |
 | 8 | 4 | uint32 | step_index |
 | 12 | 4 | uint32 | n_bullets |
@@ -19,26 +25,38 @@
 | 28 | 4 | float32 | dt |
 | 32 | 28 | float32[7] | player: `x, y, vx, vy, radius, speed, alive` |
 | 60 | 24 | float32[6] | target: `x, y, radius, shape, half_w, half_h` |
-| 84 | 52·n | float32[n][13] | bullets（固定 stride = 13 floats） |
-| 84+52n | 4 | uint32 | 之前所有字节的 crc32 |
+| 84 | 68·n | float32[n][17] | bullets（固定 stride = 17 floats） |
+| 84+68n | 4 | uint32 | 之前所有字节的 crc32 |
 
-**总长度 = 88 + 52 × n_bullets 字节**（v1 为 88 + 40 × n）
+**总长度 = 88 + 68 × n_bullets 字节**
 
-弹幕行字段顺序（`stride = 13`）：
+弹幕行字段顺序（`stride = 17`）：
 
 ```
-x, y, vx, vy, ax, ay, angle, angular_velocity, radius, ttl, type_id, group_id, id
+x, y, vx, vy, ax, ay, angle, angular_velocity, radius, ttl, type_id, group_id, id,
+shape, half_w, half_h, rotation
 ```
 
-> v2 相对 v1 新增 `angle`、`angular_velocity`、`id`（规格 §5 要求的弹幕字段）。
-> `decode_state()` **同时接受 v1 与 v2 帧**：v1 缺失的字段由 `vx,vy` 推导
-> （`angle = atan2(vy, vx)`）、`angular_velocity = 0`、`id` 按顺序补 1..n；
-> `encode_state()` 只产出 v2。带版本号的旧抓包因此不会失效。
+> **v3 相对 v2** 追加 `shape`、`half_w`、`half_h`、`rotation` ——
+> 一条"子弹"从圆变成一个**可旋转矩形**（即 dynamic obstacle），
+> stride 13 → 17，帧长 `88+52n` → `88+68n`。
+> `shape` 取值见 `SHAPE_CODES`（0 = circle、1 = rect）；
+> 圆形障碍填 `half_w = half_h = radius`、`rotation = 0`。
+>
+> **v2 相对 v1** 新增 `angle`、`angular_velocity`、`id`。
+>
+> `decode_state()` **同时接受 v1 / v2 / v3 帧**（`STATE_PROTOCOL_VERSION_MIN_READABLE = 1`）：
+> v1 缺失的字段由 `vx,vy` 推导（`angle = atan2(vy, vx)`）、`angular_velocity = 0`、
+> `id` 按顺序补 1..n；v2 缺失的四个字段按圆形补默认值。
+> `encode_state()` 只产出 v3。带版本号的旧抓包因此不会失效。
+>
+> ⚠ **`stride` 随版本变，不要写死 17**：按帧内版本查
+> `stride_for(h.version)` / `fields_for(h.version)`。
 
 ### 为什么这样设计
 
-* **固定 stride**：任意一条弹幕都能以 `base + i*52` 定位，天然映射 DMA
-  descriptor / BRAM 行 / 流水线寄存器。
+* **固定 stride**：任意一条弹幕都能以 `base + i*stride` 定位（v3 是 `i*68`），
+  天然映射 DMA descriptor / BRAM 行 / 流水线寄存器。
 * **header 全部定长**：CPU 侧可只读前 32 字节做路由与合法性检查，无需解析变长部分。
 * **CRC32 尾校验**：跨板卡/串口传输时能检出位翻转，避免污染决策。
 * **float32**：与 FPGA DSP 常见数据路径对齐；模拟器内部默认 float64，
@@ -70,7 +88,7 @@ from bullet_sim.interface.protocol import (
 
 frame = encode_state(world.get_state())      # bytes
 hdr   = read_header(frame)                   # 零拷贝读 header
-m     = bullet_matrix(frame)                 # float32[n,10] 零拷贝视图
+m     = bullet_matrix(frame)                 # float32[n,stride] 零拷贝视图
 snap  = decode_state(frame)                  # 完整解码（含 CRC 校验）
 ```
 
@@ -79,10 +97,16 @@ snap  = decode_state(frame)                  # 完整解码（含 CRC 校验）
 
 ## 3.1 版本兼容表
 
-| version | bullet stride | 字段 | 可读 | 可写 |
-|---|---|---|---|---|
-| 1 | 10 floats (40 B) | 无 angle/angular_velocity/id | ✅ `decode_state` | ❌ |
-| 2 | 13 floats (52 B) | 全量 | ✅ | ✅ `encode_state` |
+| version | bullet stride | 帧长 | 字段 | 可读 | 可写 |
+|---|---|---|---|---|---|
+| 1 | 10 floats (40 B) | `88 + 40n` | 无 angle/angular_velocity/id | ✅ `decode_state` | ❌ |
+| 2 | 13 floats (52 B) | `88 + 52n` | + angle/angular_velocity/id | ✅ | ❌ |
+| **3** | **17 floats (68 B)** | **`88 + 68n`** | **+ shape/half_w/half_h/rotation** | ✅ | ✅ `encode_state` |
+
+上表（以及本文档的标题、header 表版本号、v3 字段顺序、布局表尺寸）由
+**`core/bullet_sim/tests/test_protocol_doc_consistency.py`** 钉住 ——
+代码改了而这里没改会红。这正是它之前停在 v2 的原因：`test_protocol.py` 只管代码，
+`test_readme_consistency.py` 只管 README，**没有一条测试看这份唯一契约**。
 
 ```python
 from bullet_sim.interface.protocol import read_header, stride_for, fields_for

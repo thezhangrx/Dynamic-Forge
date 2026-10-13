@@ -568,10 +568,13 @@ def calibrate_from_video(path: pathlib.Path, *, process_width: int = 640,
     **拿错单应不会报错**，只会让墙和角色被搬到场地外面去（可视化里一眼就看得见）。
     四角标记全程可见，所以直接现标最可靠。
 
-    ⚠ **必须用 ``standard.fiducial.FiducialLayout``**：``vision/fiducial.py:65``
-    里有一个**同名的重复定义**，它的 ``corners()`` 角点顺序是反的
-    （16 点重投影 RMS 47.9 px，正确的那份是 0.31 px）。这是踩过的坑，
-    见 ``坐标系约定.md`` §9。
+    ℹ️ 这里**显式**从 ``standard.fiducial`` 导入。原先 ``vision/fiducial.py``
+    里有一个同名的重复定义，它的 ``corners()`` 角点顺序是反的
+    （16 点重投影 RMS 47.9 px，正确的那份是 0.31 px）。
+    **那个重复定义已在 2026-10-13 删除**，现在两个模块拿到的是同一个类
+    （有身份守卫 ``test_layout_class_is_the_shared_one`` 钉住）。
+    这里保留显式导入，是因为"从哪个模块拿几何布局"本来就该一眼看清 ——
+    它是共享契约，权威定义在 ``core/standard/fiducial.py``。见 ``坐标系约定.md`` §9。
 
     返回 ``(标定, 质量报告, 用的帧号)``。
     """

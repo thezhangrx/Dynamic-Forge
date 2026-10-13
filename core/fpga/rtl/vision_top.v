@@ -107,7 +107,19 @@ module vision_top #(
     localparam integer MAX_BANDS  = 64;
     localparam integer MAX_OBS    = 32;
     localparam integer MAX_GAPS   = 16;
-    localparam integer MAX_SEGS   = 384;      // 一带最多 WIDTH/2 段
+    // 一带最多几个墙段。**上界可以证出来，不是拍的**：
+    //   * `seg_push` 只接受 `长度 >= MIN_SEG_TO_STANDARD (=24)` 的段，
+    //     而 24 是**硬常量**，不受运行时配置影响（`r_min_seg_px` 可以配得更小，
+    //     但 24 那道永远在）；
+    //   * 被接受的段之间至少隔 1 个 `flags == 0` 的列（它们是 flags 的游程）；
+    //   * 索引范围 `x_max - x_min + 1 <= WIDTH = 640`。
+    //   ⇒ 24k + (k-1) <= 640  ⇒  k <= 25
+    // 取 32 留余量。**缩小这个常量不改变任何行为** —— 由 620 帧逐位对账守着。
+    //
+    // 为什么值得缩：实测 `MAX_SEGS=384` 时，`seg_*` 四个数组是**寄存器**实现的
+    // （被组合变址读，推论不成 RAM），值约 20 800 个 LUT + 23 424 个 FF。
+    // 384→96 的二分实验省下 15 592 LUT + 15 192 FF。见 docs/帧存改造.md §13。
+    localparam integer MAX_SEGS   = 32;
     localparam integer MAX_LABELS = 256;
     localparam integer MAX_RUNS   = 384;
 
@@ -214,8 +226,9 @@ module vision_top #(
     reg [31:0]       seg_cy [0:MAX_SEGS-1];
 
     reg [7:0]  n_obs, n_gaps;
-    reg [31:0] obs_words [0:511];
-    reg [31:0] gap_words [0:511];
+    // **单写口**记录存储。写进程见 §5.4（一个数组只有一个 `mem[a] <= d`）。
+    (* ram_style = "distributed" *) reg [31:0] obs_words [0:511];
+    (* ram_style = "distributed" *) reg [31:0] gap_words [0:511];
 
     reg [AW-1:0] rd_addr;
 
@@ -396,11 +409,25 @@ module vision_top #(
     reg [W_BITS-1:0] sg_x0, sg_x1;
     reg [W_BITS:0]   sg_span;
     reg [W_BITS:0]   sx;
-    reg [15:0]       sg_total;
+    // ⚠ 累加器位宽必须能装下**最坏情况**，C 侧是 `long total/sum_y` 不会溢出。
+    //
+    // `sg_total` 原来是 16 位（上限 65535），而一段最多能覆盖
+    // `WIDTH × HEIGHT = 640 × 360 = 230400` 个墙像素 —— **会回绕**。
+    // 回绕后它当了除数，`cyq = (sumy*128+total)/(2*total)` 直接算错。
+    //
+    // 实测（data/fpga/stim_photo 真实照片）：帧 11 的 `[0,603]` 段
+    // （len=604、thick=323，几乎整幅图）算出 cyq=28998 ⇒ y=453，
+    // 而图像只有 360 高 —— 物理上不可能。32 张里 2 张触发。
+    // 合成语料 320 帧全绿：它的段都很小，远远碰不到 65535。
+    // 见 core/fpga/docs/帧存改造.md §14.4。
+    //
+    // 上界：total ≤ 230400（18 位）、sumy ≤ 230400×359 ≈ 8.3e7（27 位）、
+    //       ln/rn ≤ 20×360 = 7200（13 位）。32 位都有很大余量。
+    reg [31:0]       sg_total;
     reg [31:0]       sg_sumy;
     reg [15:0]       sg_thick;
     reg [31:0]       sg_ls, sg_rs;
-    reg [15:0]       sg_ln, sg_rn;
+    reg [31:0]       sg_ln, sg_rn;
 
     // ---------------------------------------------------------------------
     // 墙段几何：**多周期除法**
@@ -761,6 +788,80 @@ module vision_top #(
     wire [31:0] aw_a_w   = aw_inv_w ? aw_x_w : aw_ay_w;
     wire [31:0] aw_b_w   = aw_inv_w ? aw_ay_w : aw_x_w;
 
+    // =====================================================================
+    // 5.4 `obs_words` / `gap_words`：**单写口**记录存储
+    //
+    // 为什么必须单写口：Vivado 只要在一个 always 块里看到**多条** `mem[..] <= ..`
+    // 就判成"多写口 RAM"（WARNING: [Synth 8-4767] "RAM has multiple writes via
+    // different ports in same process"），于是拒绝推断，把 512×32 拆成
+    // **16 384 个寄存器 + 一片 512:1 的读出多路器**。两个数组合计约
+    // 11 000 个 LUT + 32 768 个 FF —— 这是"装不下"的第二大来源
+    // （第一大是 MAX_SEGS=384 的 seg_*，已按证明收到 32）。见 docs/帧存改造.md §13/§14。
+    //
+    // 改法：**逐字段写**。每个数组只留一个写进程、一个写口；状态机在一个小计数器
+    // 上把 9 个字段一拍一个写进去。
+    //
+    // 读口**一个都没动**：打包器的 `obs_words[pk_widx]` / `gap_words[pk_widx]`
+    // 和调试口的 `obs_words[dbg_idx]` 都是**组合读**，而
+    // `ram_style = "distributed"` 的 LUTRAM 天生支持异步读 ——
+    // 所以流水线不用加级、协同仿真测试台一行都不用改。
+    //
+    // 代价：每条记录 9 拍。段数有上界 25（见 MAX_SEGS 处的证明）、缺口 ≤ 16，
+    // 每帧最多多几百拍，相对实测 521 230 拍/帧可忽略。
+    // =====================================================================
+    reg  [3:0]  wf      = 4'd0;   // S_SEG_FIN 的字段计数 0..8
+    reg  [3:0]  gw_f    = 4'd0;   // S_GAP     的字段计数 0..8
+    reg         gw_busy = 1'b0;   // S_GAP 正在逐字段写（期间不再搜缺口）
+
+    // ---------------- obs_words ----------------
+    // 丢掉 `half_w < half_h` 的段时**一个字段都不写**（见 S_SEG_FIN 的三条要求）。
+    wire        sg_drop = (({16'b0, sg_x1} - {16'b0, sg_x0} + 32'd1) <
+                           thick_or_h(sg_thick, bh));
+    // 两个写来源：S_SEG_FIN 写整条新记录；S_ANG_WR 只回写 rotation 那一格。
+    wire        ow_ang  = (state == S_ANG_WR);
+    wire [8:0]  ow_ix   = ow_ang ? {4'b0, ang_i} : {4'b0, n_obs};
+    wire [11:0] ow_b12  = {3'b0, ow_ix} + {ow_ix, 3'b0};       // = ow_ix * 9
+    wire [8:0]  ow_ad   = ow_b12[8:0] + (ow_ang ? 9'd8 : {5'b0, wf});
+    wire        ow_en   = ow_ang ? (ang_i < n_obs)
+                                 : ((state == S_SEG_FIN) && !sg_drop);
+    reg  [31:0] ow_fld;
+    always @* case (wf)
+        4'd0: ow_fld = {24'b0, n_obs} + 32'd1;
+        4'd1: ow_fld = 32'd1;                                  // VSHAPE_RECT
+        4'd2: ow_fld = 32'd2;                                  // VTYPE_WALL_WITH_GAP
+        4'd3: ow_fld = ({16'b0, sg_x0} + {16'b0, sg_x1}) * 32'd32;
+        4'd4: ow_fld = sg_cyq_r;
+        4'd5: ow_fld = 32'd0;                                  // radius：矩形没有
+        4'd6: ow_fld = ({16'b0, sg_x1} - {16'b0, sg_x0} + 32'd1) * 32'd32;
+        4'd7: ow_fld = thick_or_h(sg_thick, bh) * 32'd32;
+        default: ow_fld = sg_ang_r;
+    endcase
+    wire [31:0] ow_da = ow_ang ? ang_wall : ow_fld;
+
+    always @(posedge pix_clk)
+        if (ow_en) obs_words[ow_ad] <= ow_da;                  // **唯一**写口
+
+    // ---------------- gap_words ----------------
+    wire [11:0] gw_b12 = {4'b0, n_gaps} + {{1{1'b0}}, n_gaps, 3'b0};  // = n_gaps * 9
+    wire [8:0]  gw_ad  = gw_b12[8:0] + {5'b0, gw_f};
+    wire        gw_en  = gw_busy;
+    reg  [31:0] gw_fld;
+    always @* case (gw_f)
+        4'd0: gw_fld = {24'b0, n_gaps} + 32'd1;
+        4'd1: gw_fld = ({16'b0, seg_x1[gp_bi]} +
+                        {16'b0, seg_x0[gp_bi + 1'b1]}) * 32'd32;
+        4'd2: gw_fld = (seg_cy[gp_bi] + seg_cy[gp_bi + 1'b1] + 32'd1) >> 1;
+        4'd3: gw_fld = {16'b0, gp_best} * 32'd64;
+        4'd4: gw_fld = 32'd0;
+        4'd5: gw_fld = seg_id[gp_bi];
+        4'd6: gw_fld = seg_id[gp_bi + 1'b1];
+        4'd7: gw_fld = 32'd2;
+        default: gw_fld = 32'd1;                               // VGF_RELIABLE
+    endcase
+
+    always @(posedge pix_clk)
+        if (gw_en) gap_words[gw_ad] <= gw_fld;                 // **唯一**写口
+
     // atan2 的后半段：拿到 r 之后的查表 + 线性插值。
     // 与 C 参考模型 vr_atan2_q6 的后半段逐位一致；两处 `/4096`、`/4` 换成
     // 算术右移 —— 被除数恒非负（AT 单调递增、frac ≥ 0、v 的符号分支已拆开），
@@ -852,6 +953,7 @@ module vision_top #(
             n_bands <= 0; n_obs <= 0; n_gaps <= 0; n_segs <= 0;
             player_valid <= 0; ccl_start <= 0; ccl_started <= 0;
             sgr_started <= 1'b0; div_start <= 1'b0;
+            wf <= 4'd0; gw_f <= 4'd0; gw_busy <= 1'b0;
         end else begin
             frame_done <= 1'b0;
             ccl_start  <= 1'b0;
@@ -872,6 +974,7 @@ module vision_top #(
                     n_bands <= 0; n_obs <= 0; n_gaps <= 0; n_segs <= 0;
                     player_valid <= 1'b0; ccl_started <= 1'b0;
                     bi <= 0; band_phase <= 0; band_in_run <= 0; m_vld <= 0;
+                    wf <= 4'd0; gw_f <= 4'd0; gw_busy <= 1'b0;
                     state <= S_RECV;
                 end
             end
@@ -1111,13 +1214,14 @@ module vision_top #(
             S_SG_CYQ: begin
                 if (!sgr_started) begin
                     sgr_started <= 1'b1;
-                    if (sg_total == 16'd0) begin
+                    if (sg_total == 32'd0) begin
                         sg_cyq_r    <= ({16'b0, band_y0[band_i]} + {16'b0, band_y1[band_i]}) * 32'd32;
                         sgr_started <= 1'b0;   // 直接跳走：别留下"已发起"，否则下一状态死等 div_done
                         state       <= S_SG_LQ;
                     end else begin
-                        div_num   <= {8'b0, sg_sumy} * 40'd128 + {20'b0, sg_total};
-                        div_den   <= {4'b0, sg_total} * 20'd2;
+                        // 加宽后必须一并改窄化切片：`total` 上界 230400 需要 18 位
+                        div_num   <= {8'b0, sg_sumy} * 40'd128 + {8'b0, sg_total};
+                        div_den   <= sg_total[18:0] * 20'd2;
                         div_start <= 1'b1;
                     end
                 end else begin
@@ -1132,13 +1236,13 @@ module vision_top #(
             S_SG_LQ: begin
                 if (!sgr_started) begin
                     sgr_started <= 1'b1;
-                    if (sg_ln == 16'd0) begin
+                    if (sg_ln == 32'd0) begin
                         sg_lq_r     <= sg_cyq_r * 32'd4;
                         sgr_started <= 1'b0;
                         state       <= S_SG_RQ;
                     end else begin
-                        div_num   <= {8'b0, sg_ls} * 40'd512 + {20'b0, sg_ln};
-                        div_den   <= {4'b0, sg_ln} * 20'd2;
+                        div_num   <= {8'b0, sg_ls} * 40'd512 + {8'b0, sg_ln};
+                        div_den   <= sg_ln[18:0] * 20'd2;
                         div_start <= 1'b1;
                     end
                 end else begin
@@ -1153,13 +1257,13 @@ module vision_top #(
             S_SG_RQ: begin
                 if (!sgr_started) begin
                     sgr_started <= 1'b1;
-                    if (sg_rn == 16'd0) begin
+                    if (sg_rn == 32'd0) begin
                         sg_rq_r     <= sg_cyq_r * 32'd4;
                         sgr_started <= 1'b0;
                         state       <= S_SG_ANG;
                     end else begin
-                        div_num   <= {8'b0, sg_rs} * 40'd512 + {20'b0, sg_rn};
-                        div_den   <= {4'b0, sg_rn} * 20'd2;
+                        div_num   <= {8'b0, sg_rs} * 40'd512 + {8'b0, sg_rn};
+                        div_den   <= sg_rn[18:0] * 20'd2;
                         div_start <= 1'b1;
                     end
                 end else begin
@@ -1214,36 +1318,32 @@ module vision_top #(
                 // 而且 `seg_x0/seg_x1` 要**回写到 seg_k**，让 S_GAP 看到的是
                 // 压缩后的相邻关系。三条漏一条，缺口的两端就会错位。
                 // ------------------------------------------------------------------
-                if (({16'b0, sg_x1} - {16'b0, sg_x0} + 32'd1) <
-                    (thick_or_h(sg_thick, bh))) begin
+                if (sg_drop) begin
                     if (dbg_dump_seg)
                         $display("V  seg x=[%0d,%0d] **丢掉**（half_w < half_h）",
                                  sg_x0, sg_x1);
                     seg_i <= seg_i + 1'b1;
+                    wf    <= 4'd0;
+                    state <= S_SEG;
+                end else if (wf == 4'd8) begin
+                    // 第 8 个字段在本拍已经提交（§5.4 的 ow_en/ow_ad）。收尾必须与
+                    // 最后一个字段**同拍**：`ow_ad` 组合自**当前**（未更新的）n_obs，
+                    // 所以"先写后加"的顺序天然成立。
+                    seg_x0[seg_k] <= sg_x0;
+                    seg_x1[seg_k] <= sg_x1;
+                    seg_id[seg_k] <= n_obs + 1'b1;
+                    seg_cy[seg_k] <= sg_cyq_r;
+                    seg_k <= seg_k + 1'b1;
+                    n_obs <= n_obs + 1'b1;
+                    seg_i <= seg_i + 1'b1;
+                    wf    <= 4'd0;
                     state <= S_SEG;
                 end else begin
-                obs_words[n_obs*9 + 0] <= {24'b0, n_obs} + 32'd1;
-                obs_words[n_obs*9 + 1] <= 32'd1;                    // VSHAPE_RECT
-                obs_words[n_obs*9 + 2] <= 32'd2;                    // VTYPE_WALL_WITH_GAP
-                obs_words[n_obs*9 + 3] <= ({16'b0, sg_x0} + {16'b0, sg_x1}) * 32'd32;
-                obs_words[n_obs*9 + 4] <= sg_cyq_r;
-                obs_words[n_obs*9 + 5] <= 32'd0;                    // radius：矩形没有
-                obs_words[n_obs*9 + 6] <= ({16'b0, sg_x1} - {16'b0, sg_x0} + 32'd1) * 32'd32;
-                obs_words[n_obs*9 + 7] <= thick_or_h(sg_thick, bh) * 32'd32;
-                obs_words[n_obs*9 + 8] <= sg_ang_r;
-                if (dbg_dump_seg)
-                    $display("V  seg x=[%0d,%0d] span=%0d ls=%0d ln=%0d rs=%0d rn=%0d lq=%0d rq=%0d dx=%0d ang=%0d",
-                             sg_x0, sg_x1, sg_span, sg_ls, sg_ln, sg_rs, sg_rn,
-                             sg_lq_r, sg_rq_r, sg_dx_c, sg_ang_r);
-                // 回写到**压缩下标** seg_k（恒 <= seg_i，那一格已被读过，安全）
-                seg_x0[seg_k] <= sg_x0;
-                seg_x1[seg_k] <= sg_x1;
-                seg_id[seg_k] <= n_obs + 1'b1;
-                seg_cy[seg_k] <= sg_cyq_r;
-                seg_k <= seg_k + 1'b1;
-                n_obs <= n_obs + 1'b1;
-                seg_i <= seg_i + 1'b1;
-                state <= S_SEG;
+                    if (dbg_dump_seg && (wf == 4'd0))
+                        $display("V  seg x=[%0d,%0d] span=%0d ls=%0d ln=%0d rs=%0d rn=%0d lq=%0d rq=%0d dx=%0d ang=%0d",
+                                 sg_x0, sg_x1, sg_span, sg_ls, sg_ln, sg_rs, sg_rn,
+                                 sg_lq_r, sg_rq_r, sg_dx_c, sg_ang_r);
+                    wf <= wf + 1'b1;
                 end
             end
             // =============================================================
@@ -1296,30 +1396,36 @@ module vision_top #(
                     ctr    <= 0;
                     state  <= S_COL_CLEAR;
                 end else begin
-                    obs_words[ang_i*9 + 8] <= ang_wall;   // 只改 rotation 那一格
+                    // `obs_words[ang_i*9 + 8] <= ang_wall` 交给 §5.4 的单写口：
+                    // ow_ang = (state == S_ANG_WR)，ow_en 另加 ang_i < n_obs。
                     ang_i <= ang_i + 1'b1;
                 end
             end
             // =============================================================
             S_GAP: begin
-                if (gi + 1'b1 >= seg_limit) begin
-                    if (gp_vld && (n_gaps < MAX_GAPS)) begin
-                        gap_words[n_gaps*9 + 0] <= {24'b0, n_gaps} + 32'd1;
-                        gap_words[n_gaps*9 + 1] <= ({16'b0, seg_x1[gp_bi]} +
-                                                    {16'b0, seg_x0[gp_bi+1'b1]}) * 32'd32;
-                        gap_words[n_gaps*9 + 2] <= (seg_cy[gp_bi] + seg_cy[gp_bi+1'b1] + 32'd1) >> 1;
-                        gap_words[n_gaps*9 + 3] <= {16'b0, gp_best} * 32'd64;
-                        gap_words[n_gaps*9 + 4] <= 32'd0;
-                        gap_words[n_gaps*9 + 5] <= seg_id[gp_bi];
-                        gap_words[n_gaps*9 + 6] <= seg_id[gp_bi+1'b1];
-                        gap_words[n_gaps*9 + 7] <= 32'd2;
-                        gap_words[n_gaps*9 + 8] <= 32'd1;              // VGF_RELIABLE
-                        n_gaps <= n_gaps + 1'b1;
+                if (gw_busy) begin
+                    // 逐字段写记录（§5.4）：gw_en = gw_busy，gw_ad = n_gaps*9 + gw_f。
+                    // 这 9 拍里 gp_bi / gp_vld / seg_* 都保持不变，所以 gw_fld 的
+                    // 组合读数稳定。
+                    if (gw_f == 4'd8) begin
+                        gw_f    <= 4'd0;
+                        gw_busy <= 1'b0;
+                        n_gaps  <= n_gaps + 1'b1;      // 第 8 个字段已用旧 n_gaps 写完
+                        gp_vld  <= 1'b0;
+                        state   <= S_ANG_INIT;
+                    end else begin
+                        gw_f <= gw_f + 1'b1;
                     end
-                    gp_vld <= 1'b0;
-                    // 先做**整堵墙朝向**的后处理，再进下一个带（见 S_ANG_INIT）。
-                    // 从前这里直接 `band_i <= band_i+1; state <= S_COL_CLEAR;`
-                    state  <= S_ANG_INIT;
+                end else if (gi + 1'b1 >= seg_limit) begin
+                    if (gp_vld && (n_gaps < MAX_GAPS)) begin
+                        gw_f    <= 4'd0;
+                        gw_busy <= 1'b1;               // 下一拍起逐字段写
+                    end else begin
+                        gp_vld <= 1'b0;
+                        // 先做**整堵墙朝向**的后处理，再进下一个带（见 S_ANG_INIT）。
+                        // 从前这里直接 `band_i <= band_i+1; state <= S_COL_CLEAR;`
+                        state  <= S_ANG_INIT;
+                    end
                 end else begin
                     if ((seg_x0[gi+1'b1] - seg_x1[gi] - 1'b1 >= r_min_gap_px) &&
                         (seg_x0[gi+1'b1] - seg_x1[gi] - 1'b1 > gp_best)) begin

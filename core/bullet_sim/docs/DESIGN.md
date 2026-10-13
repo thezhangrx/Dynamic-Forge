@@ -353,7 +353,8 @@ ObstacleScenario(name, seed, duration, dt, field_w, field_h,
 `resolve_spec` 只在**唯一一处**把它换算成世界单位；圆形障碍保持
 `half_w == half_h == radius`。
 
-**生成区域与入口方向**：`SPAWN_REGIONS`（`left/right/top/bottom/center_edge/
+**生成区域与入口方向**：`SPAWN_REGIONS`（`left/right/top/bottom/farthest_side/nearest_side`，共 **6** 个 —— 权威定义见
+`core/bullet_sim/generators/patterns.py` 的 `SPAWN_REGIONS`，由 `tests/test_protocol_doc_consistency.py` 钉住）
 farthest_side/nearest_side`）给出边界锚点与指向场内的入口角；
 `sparse` / `cross` 保留锚点的**边坐标**、沿该边散布——障碍永远从边界进入，
 不会在场地中线凭空出现；`min_player_distance` 再兜底丢弃"生成在玩家身上"的障碍。

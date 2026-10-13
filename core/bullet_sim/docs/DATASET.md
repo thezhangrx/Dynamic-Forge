@@ -41,7 +41,7 @@ data/
 | `player` | (T+1, 7) | float32 | `x, y, vx, vy, radius, speed, alive` |
 | `target` | (T+1, 6) | float32 | `x, y, radius, shape, half_w, half_h` |
 | `env` | (T+1, 7) | float32 | `field_w, field_h, dt, step_index, sim_time, wrap, bullet_budget` |
-| `bullets` | (Σn_t, 10) | float32 | 每步存活弹幕（紧凑前缀），列见下 |
+| `bullets` | (Σn_t, **17**) | float32 | 每步存活弹幕（紧凑前缀），列见下 |
 | `bullet_counts` | (T+1,) | int32 | 每个状态的真实存活弹幕数 |
 | `bullets_offsets` | (T+1,) | int32 | 该状态在 `bullets` 中的起始行 |
 | `bullet_sampled` | (T+1,) | bool | 该状态是否记录了弹幕块（`--bullet-stride>1` 时为 False） |
@@ -59,11 +59,18 @@ data/
 | `step_indices` | (T,) | int32 | 该步之后的步序号 |
 | `state_hashes` | (T+1,) | U32 | 每个状态的规范化摘要（`--hashes`） |
 
-弹幕行 `bullets[:, :]` 的 10 列顺序与硬件协议一致：
+弹幕行 `bullets[:, :]` 的 **17 列**顺序与硬件协议 v3 **逐列一致**
+（`dataset/schema.py` 的 `BULLET_COLUMNS = tuple(PROTOCOL_FIELDS)`，
+所以列数会跟着协议走，不会各自漂移）：
 
 ```
-x, y, vx, vy, ax, ay, radius, ttl, type_id, group_id
+x, y, vx, vy, ax, ay, angle, angular_velocity, radius, ttl, type_id, group_id, id,
+shape, half_w, half_h, rotation
 ```
+
+> ⚠ 这里曾经写的是 **10 列**（v1 时代的 `x,y,vx,vy,ax,ay,radius,ttl,type_id,group_id`）。
+> 协议已经两次扩容（v2 +3 列、v3 +4 列），文档没跟上。
+> 现在由 `tests/test_protocol_doc_consistency.py` 钉住。
 
 ## 3. 读取
 

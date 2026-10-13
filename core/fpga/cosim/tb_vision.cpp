@@ -34,6 +34,8 @@ static const int MAX_H = 480;
 
 static Vvision_top *top = nullptr;
 static unsigned long long g_cycles = 0;  // 拍数（只为算“每帧多少拍”，不参与比对）
+static int g_max_nsegs = 0;   // 观察到的 n_segs 最大值（判断 MAX_SEGS 有没有开大）
+static int g_max_segi  = 0;   // 观察到的 seg_i 最大值
 static void step();          // 定义在下面；配置寄存器读写要先看到它
 
 // 配置寄存器地址（**必须与 rtl/vision_top.v 的 CFG_* 一致**，
@@ -110,9 +112,105 @@ static void cfg_apply(const VrRefParams &p)
 static void step()
 {
     g_cycles++;
+    // 纯观测：记录 n_segs / seg_i 的最大值（不参与任何比对，只影响打印）
+    {
+        int ns = (int)top->rootp->vision_top__DOT__n_segs;
+        int si = (int)top->rootp->vision_top__DOT__seg_i;
+        if (ns > g_max_nsegs) g_max_nsegs = ns;
+        if (si > g_max_segi)  g_max_segi  = si;
+    }
     top->pix_clk = 0; top->eval();
     top->pix_clk = 1; top->eval();
     top->pix_clk = 0; top->eval();
+}
+
+// ---- 超时诊断 -------------------------------------------------------------
+// 卡死时把状态机的位置与各个计数器打出来。
+//
+// 为什么值得单写一个函数：从前超时只有一句"RTL 超时未出帧"，拿到它等于什么都
+// 没拿到。**真实照片第一次喂进 RTL 就把 32 帧全部卡死**，而合成语料 320 帧全绿——
+// 没有这张表就只能靠猜。见 core/fpga/docs/帧存改造.md §14.4。
+static const char *state_name(int s)
+{
+    switch (s) {
+        case  0: return "S_IDLE";      case  1: return "S_RECV";
+        case  2: return "S_BAND";      case  3: return "S_SPAN_CLR";
+        case  4: return "S_SPAN";      case  5: return "S_SPAN_FIND";
+        case  6: return "S_COL_CLEAR"; case  7: return "S_COL_SCAN";
+        case  8: return "S_COL_RUNS";  case  9: return "S_COL_RF";
+        case 10: return "S_SEG";       case 11: return "S_SEG_X";
+        case 12: return "S_SEG_FIN";   case 13: return "S_GAP";
+        case 14: return "S_CCL";       case 15: return "S_PACK_INIT";
+        case 16: return "S_PACK";      case 17: return "S_DONE";
+        case 18: return "S_COL_RF2";   case 19: return "S_SG_CYQ";
+        case 20: return "S_SG_LQ";     case 21: return "S_SG_RQ";
+        case 22: return "S_SG_ANG";    case 23: return "S_ANG_INIT";
+        case 24: return "S_ANG_DIV";   case 25: return "S_ANG_WR";
+        default: return "?";
+    }
+}
+
+static void dump_stuck()
+{
+    int st = (int)top->rootp->vision_top__DOT__state;
+    printf("     卡在 state=%d (%s)  ctr=%d  band_i=%d/%d  bi=%d\n",
+           st, state_name(st),
+           (int)top->rootp->vision_top__DOT__ctr,
+           (int)top->rootp->vision_top__DOT__band_i,
+           (int)top->rootp->vision_top__DOT__n_bands,
+           (int)top->rootp->vision_top__DOT__bi);
+    printf("     x=[%d,%d] cx=%d cy=%d  seg_i=%d/%d seg_k=%d n_segs=%d\n",
+           (int)top->rootp->vision_top__DOT__x_min,
+           (int)top->rootp->vision_top__DOT__x_max,
+           (int)top->rootp->vision_top__DOT__cx,
+           (int)top->rootp->vision_top__DOT__cy,
+           (int)top->rootp->vision_top__DOT__seg_i,
+           (int)top->rootp->vision_top__DOT__seg_limit,
+           (int)top->rootp->vision_top__DOT__seg_k,
+           (int)top->rootp->vision_top__DOT__n_segs);
+    printf("     gi=%d n_obs=%d n_gaps=%d n_labels=%d ang_i=%d wf=%d gw_busy=%d\n",
+           (int)top->rootp->vision_top__DOT__gi,
+           (int)top->rootp->vision_top__DOT__n_obs,
+           (int)top->rootp->vision_top__DOT__n_gaps,
+           (int)top->rootp->vision_top__DOT__n_labels,
+           (int)top->rootp->vision_top__DOT__ang_i,
+           (int)top->rootp->vision_top__DOT__wf,
+           (int)top->rootp->vision_top__DOT__gw_busy);
+    // CCL 内部：S_CCL 只是在等 ccl_done，真正卡住的是子模块。u_ccl 的
+    // C_FIND 是并查集路径压缩，父链一旦成环就永远跳不出来 ——
+    // 而 cur_* 的深度是 MAX_RUNS=384，n_cur 却是 9 位（能到 511）。
+    printf("     CCL: state=%d n_cur=%d n_prev=%d n_label=%d i_cur=%d j_prev=%d"
+           " find_target=%d x=%d y=%d\n",
+           (int)top->rootp->vision_top__DOT__u_ccl__DOT__state,
+           (int)top->rootp->vision_top__DOT__u_ccl__DOT__n_cur,
+           (int)top->rootp->vision_top__DOT__u_ccl__DOT__n_prev,
+           (int)top->rootp->vision_top__DOT__u_ccl__DOT__n_label,
+           (int)top->rootp->vision_top__DOT__u_ccl__DOT__i_cur,
+           (int)top->rootp->vision_top__DOT__u_ccl__DOT__j_prev,
+           (int)top->rootp->vision_top__DOT__u_ccl__DOT__find_target,
+           (int)top->rootp->vision_top__DOT__u_ccl__DOT__x,
+           (int)top->rootp->vision_top__DOT__u_ccl__DOT__y);
+}
+
+// ---- RTL 侧的连通域全表 -----------------------------------------------
+// 与 core/fpga/ref/dump_cc.c 的行格式刻意对齐，两边可以逐列 diff。
+// 真实照片上 RTL 选中了 area=134 的 blob（268..280 × 309..321）而 C 一个都没选，
+// 只看 vr_ref_process_ex 的接口分不清是"表算错了"还是"判据判错了"。
+static void dump_rtl_cc()
+{
+    int nlab = (int)top->rootp->vision_top__DOT__u_ccl__DOT__n_label;
+    printf("RTL CCL: n_label=%d  best_vld=%d  best_i=%d\n", nlab,
+           (int)top->rootp->vision_top__DOT__u_ccl__DOT__best_vld,
+           (int)top->rootp->vision_top__DOT__u_ccl__DOT__best_i);
+    for (int i = 0; i < nlab && i < 256; i++) {
+        if ((int)top->rootp->vision_top__DOT__u_ccl__DOT__parent[i] != i) continue;
+        printf("L=%-4d n=%-8d x0=%-5d x1=%-5d y0=%-5d y1=%-5d\n", i,
+               (int)top->rootp->vision_top__DOT__u_ccl__DOT__cmp_n[i],
+               (int)top->rootp->vision_top__DOT__u_ccl__DOT__cmp_x0[i],
+               (int)top->rootp->vision_top__DOT__u_ccl__DOT__cmp_x1[i],
+               (int)top->rootp->vision_top__DOT__u_ccl__DOT__cmp_y0[i],
+               (int)top->rootp->vision_top__DOT__u_ccl__DOT__cmp_y1[i]);
+    }
 }
 
 // ---- P6 PPM 读取（export_frames.py 写的就是这个）-------------------------
@@ -147,6 +245,7 @@ static int  g_frames_done = 0;   // 成功读到激励、进入比对的帧数�
 static int  g_stim_err    = 0;   // 激励读不出来 / 超限的次数
 static int  g_timeouts    = 0;   // RTL 没在 guard 内出帧的次数
 static bool g_verbose = false;
+static bool g_dump_cc = false;   // --dump-cc：每帧把 RTL 的连通域全表打出来
 // 整轮几何帧字节的 FNV-1a 折叠：给"这组参数到底有没有改变输出"一个廉价判据。
 // 只比"两边一致"是不够的 —— 两边都没变也是"一致"，那样配置寄存器接错也发现不了。
 static uint64_t g_hash = 1469598103934665603ull;
@@ -199,6 +298,7 @@ int main(int argc, char **argv)
     int rtl_only_addr = -1; uint32_t rtl_only_val = 0;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--verbose")) g_verbose = true;
+        else if (!strcmp(argv[i], "--dump-cc")) g_dump_cc = true;
         // 改一个参数（两边一起改）：用来验证"配置寄存器真的接到了那个判据上"。
         // 只改 RTL 不改 C，或者改了却接错寄存器，这一条立刻挂。
         else if (!strcmp(argv[i], "--bright") && i + 1 < argc) params.bright_min = atoi(argv[++i]);
@@ -309,11 +409,14 @@ int main(int argc, char **argv)
         top->dout_ready = 0;
         if (!done) {
             printf("帧 %d: RTL 超时未出帧（guard 用尽）\n", f);
+            dump_stuck();
             g_fail_frames++;
             g_timeouts++;       // 单独计数并计入失败：早先只加 fail_frames，
                                 // 而退出码看的是 g_fail —— 部分帧超时会静默报绿
             continue;
         }
+
+        if (g_dump_cc) dump_rtl_cc();
 
         // ---- 比对 ----
         long fail_before = g_fail;
@@ -401,6 +504,8 @@ int main(int argc, char **argv)
         unsigned long long cpf = g_cycles / (unsigned long long)frames;
         printf("总拍数 %llu，每帧 %llu 拍；30 fps 需要 ≥ %.1f MHz\n",
                g_cycles, cpf, (double)cpf * 30.0 / 1e6);
+        printf("观测到的 n_segs 最大值 %d，seg_i 最大值 %d（MAX_SEGS 现在 32，证明的上界 25）\n",
+               g_max_nsegs, g_max_segi);
     }
 
     // ---- 假通过防线 ----------------------------------------------------------

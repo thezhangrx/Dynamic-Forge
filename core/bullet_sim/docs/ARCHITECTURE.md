@@ -278,7 +278,7 @@ observation = {
   "target":       float32[4],    # x,y,radius,dist_to_player
   "env":          float32[6],    # field_w,field_h,sim_time,step_index,density,n_alive
   # --- 变长，供预测/规划/监督学习 ---
-  "bullets":      float32[N,7],  # x,y,vx,vy,radius,ttl,type  (紧凑前缀)
+  "bullets":      float32[N,7],  # x,y,vx,vy,radius,ttl,type_id  (紧凑前缀)
   "bullets_mask": bool[N],
   # --- 监督信号 ---
   "collision":    bool,

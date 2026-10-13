@@ -34,7 +34,7 @@ cv2 的边界
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Sequence
 
 from .calibration import FieldCalibration, rms_error, solve_homography
@@ -60,48 +60,27 @@ class FiducialError(ValueError):
 
 # ---------------------------------------------------------------------------
 # 布局：标记在场地里的已知位置
+#
+# ⚠ 这里**曾经**有一个与 ``standard.fiducial.FiducialLayout`` **同名的重复定义**
+#   （旧的第 65 行），它把 ``corners()`` 的 y 方向写反了::
+#
+#       return ((cx-h, cy-h), (cx+h, cy-h), (cx+h, cy+h), (cx-h, cy+h))   # ← 反的
+#
+#   而权威版（``core/standard/fiducial.py``，有 ``test_corner_order_matches_opencv``
+#   现场跟 OpenCV 对过）是::
+#
+#       return ((cx-h, cy+h), (cx+h, cy+h), (cx+h, cy-h), (cx-h, cy-h))
+#
+#   后果不是报错，而是**静默标错**：16 点重投影 RMS 从 0.31 px 变成 **47.9 px**，
+#   墙和角色被搬到场地外面去。``core/harness/board_sim.py`` 为此专门绕过它
+#   （改成从 ``standard.fiducial`` 导入）。见 ``docs/坐标系约定.md`` §9。
+#
+#   现在删掉了。模块开头已经从 ``standard.fiducial`` 导入同名类，在这里重定义
+#   只会把它**遮蔽**掉 —— 而本文件自己的约定就是"位图与几何布局属于共享契约，
+#   这里只做'在图像里找它'和'据此标定'"。
+#   ``core/vision/tests/`` 里有一条身份守卫钉住
+#   ``vision.fiducial.FiducialLayout is standard.fiducial.FiducialLayout``。
 # ---------------------------------------------------------------------------
-@dataclass(frozen=True)
-class FiducialLayout:
-    """四角标记在**场地坐标**里的位置。这就是整套标定的"已知量"。"""
-
-    field_w: float = 640.0
-    field_h: float = 480.0
-    #: 标记**黑边外沿**的边长（场地单位）。检测到的四边形就是这个尺寸。
-    marker_side: float = 48.0
-    #: 黑边外沿到场地边的距离（场地单位）。
-    margin: float = 8.0
-
-    @property
-    def module(self) -> float:
-        """一个模块多少场地单位。"""
-        return self.marker_side / GRID_MODULES
-
-    @property
-    def quiet(self) -> float:
-        """留白边宽度（场地单位）。"""
-        return self.module * QUIET_MODULES
-
-    def centre(self, slot: int) -> Point:
-        """第 ``slot`` 枚标记的中心（场地坐标）。"""
-        _, sx, sy = SLOTS[slot]
-        x = self.margin + self.marker_side / 2.0 if sx < 0 else \
-            self.field_w - self.margin - self.marker_side / 2.0
-        y = self.margin + self.marker_side / 2.0 if sy < 0 else \
-            self.field_h - self.margin - self.marker_side / 2.0
-        return (x, y)
-
-    def corners(self, slot: int) -> tuple[Point, Point, Point, Point]:
-        """第 ``slot`` 枚标记的四角（场地坐标）。
-
-        顺序与 ``cv2.aruco.detectMarkers`` 在**正立摆放**时返回的顺序一致：
-        **左上 -> 右上 -> 右下 -> 左下**（实测确认，见
-        ``test_fiducial_corner_order_matches_opencv``）。
-        场地 y 与图像 y 同向（向下为正），所以"上下"就是字面意思。
-        """
-        cx, cy = self.centre(slot)
-        h = self.marker_side / 2.0
-        return ((cx - h, cy - h), (cx + h, cy - h), (cx + h, cy + h), (cx - h, cy + h))
 
 # ---------------------------------------------------------------------------
 # 检测（唯一用到 cv2 的地方）

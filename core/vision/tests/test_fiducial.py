@@ -273,3 +273,47 @@ def test_layout_geometry_is_sane() -> None:
     body = 4 * LAY.marker_side ** 2 / (LAY.field_w * LAY.field_h)
     total = 4 * (LAY.marker_side + 2 * LAY.quiet) ** 2 / (LAY.field_w * LAY.field_h)
     assert body < 0.04 and total < 0.06
+
+
+# ---------------------------------------------------------------------------
+# 契约守卫：布局类只能有**一个**
+#
+# 踩过的坑：``core/vision/fiducial.py`` 里曾经又定义了一个同名的
+# ``FiducialLayout``，把从 ``standard.fiducial`` 导入的那个**遮蔽**掉了，
+# 而且它的 ``corners()`` **y 方向是反的** —— 16 点重投影 RMS 从 0.31 px
+# 变成 47.9 px，墙和角色被搬到场地外面去，全程**不报错**。
+# 两份定义对"场地 y 向上还是向下"的说法甚至互相矛盾。
+#
+# 这个坑很难靠现有测试发现：``test_corner_order_matches_opencv`` 用的是从
+# ``standard.fiducial`` 导入的那份，永远走不到遮蔽版。所以单加一条**身份**守卫：
+# 只要有人再写一个重复定义，这里立刻红。
+# ---------------------------------------------------------------------------
+def test_layout_class_is_the_shared_one() -> None:
+    import vision.fiducial as vf
+    import standard.fiducial as sf
+
+    assert vf.FiducialLayout is sf.FiducialLayout, (
+        "vision.fiducial.FiducialLayout 不是 standard.fiducial 里那个 —— "
+        "有人在 vision/fiducial.py 里写了重复定义把它遮蔽了。"
+        "位图与几何布局是共享契约，只能在 core/standard/fiducial.py 定义一次。"
+    )
+
+
+def test_layout_corner_order_y_is_up() -> None:
+    """角点顺序与场地 y 向上一致：第 0 个角在 y **较大**那一侧。
+
+    遮蔽版正是把这条写反了（第 0 个角在 y 较小侧）。断言写在**共享类**上，
+    所以无论从哪个模块导入都守得住。
+    """
+    import vision.fiducial as vf
+
+    # 两个模块都查：修好之后它们是同一个类，但万一有人再写重复定义，
+    # `vision` 那一份会独立地错，这里就抓得住（身份守卫是第一条防线，
+    # 这条是第二条 —— 两条都失败时能直接看出**错的是方向**）。
+    for tag, cls in (("standard.fiducial", FiducialLayout),
+                     ("vision.fiducial", vf.FiducialLayout)):
+        ys = [p[1] for p in cls().corners(0)]
+        assert ys[0] > ys[2] and ys[1] > ys[3], (
+            f"{tag}.FiducialLayout().corners(0) 的 y 方向反了："
+            f"第 0/1 个角应在 y 较大那一侧（场地 y 向上），实际 y={ys}"
+        )

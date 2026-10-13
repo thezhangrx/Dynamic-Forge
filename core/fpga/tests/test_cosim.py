@@ -312,3 +312,132 @@ def test_selftest_with_no_scenes_is_a_failure(exe, n: str):
     r = subprocess.run([str(EXE_ST), n], capture_output=True, text=True, timeout=600)
     assert r.returncode != 0, f"请求 {n} 个场景却报成功：\n{r.stdout}"
     assert "一次比对都没发生" in r.stdout or "没有任何几何比对" in r.stdout, r.stdout
+
+
+# ---------------------------------------------------------------------------
+# 9) 真实世界的结构性盲区
+#
+# 合成语料（录屏导帧）在结构上是"良性"的：段永远短小、标签表永远填不满、
+# 几乎每帧都选得出玩家。于是 620 帧逐位对账全绿，却漏掉了三个只在**真实输入**
+# 下才暴露的缺陷（2026-10-13 一起修掉，见 core/fpga/docs/帧存改造.md §14.4）：
+#
+#   ① **标签表打满时 C_SEL 死循环**
+#      `sel_i` 只有 `clog2(MAX_LABELS)=8` 位（0..255），而 `n_label` 能饱和到
+#      256 —— 判据 `{1'b0,sel_i} >= n_label` **恒为假**，sel_i 绕圈永不退出。
+#      症状是 RTL **完全不出帧**（vision_top 卡在 S_CCL 等 ccl_done）。
+#
+#   ② **超大墙段把 16 位累加器冲爆**
+#      `sg_total` 原来只有 16 位，而一段最多覆盖 `640×360=230400` 个墙像素。
+#      它是除数，一回绕 cyq 就算错（实测算出 y=453，图只有 360 高）。
+#      症状是**只有 cyq 一个字段**不符，且只在 2/32 张真实照片上出现。
+#
+#   ③ **没选中玩家时输出不清零**
+#      C 侧是 `memset(f,0,sizeof(*f))` + 提前 return；RTL 侧它们是寄存器，
+#      不清零就保留上一帧的值，而几何帧照打包那 16 个字节。
+#
+# 这一节用**确定性生成的**图像把三条钉住（不依赖 data/，裸检出也跑得了），
+# 另外再挂一条真实照片语料（有就跑，没有就 skip）。
+# ---------------------------------------------------------------------------
+WALL_RGB  = (200, 120, 100)   # R-B=100>40、R=200>110、G=120>60 → 判墙
+WHITE_RGB = (255, 255, 255)   # min=255>195、max-min=0<45      → 判亮
+BLACK_RGB = (0, 0, 0)
+
+
+def _ppm_write(path: pathlib.Path, w: int, h: int, buf: bytearray) -> None:
+    path.write_bytes(b"P6\n%d %d\n255\n" % (w, h) + bytes(buf))
+
+
+def _fill(buf: bytearray, w: int, x0: int, x1: int, y0: int, y1: int,
+          color: tuple[int, int, int]) -> None:
+    px = bytes(color)
+    for y in range(y0, y1 + 1):
+        base = y * w
+        for x in range(x0, x1 + 1):
+            i = (base + x) * 3
+            buf[i:i + 3] = px
+
+
+def _blindspot_frames(dirpath: pathlib.Path) -> tuple[pathlib.Path, int]:
+    """三帧，分别打中三个盲区。**确定性**，不依赖任何数据文件。"""
+    dirpath.mkdir(parents=True, exist_ok=True)
+    W, H = 640, 360
+    blank = lambda: bytearray(W * H * 3)          # noqa: E731
+
+    # 帧 0：一面几乎铺满的墙（604 列 × 341 行）+ 一个合法玩家。
+    #   列计数总和 ≈ 2e5 ≫ 65535 —— 旧的 16 位 sg_total 必回绕。
+    #   玩家 20×20=400 px，落在 [60,1500]、填充 100%、长宽比 100%、不贴边。
+    a = blank()
+    _fill(a, W, 0, 603, 0, 340, WALL_RGB)
+    _fill(a, W, 300, 319, 200, 219, WHITE_RGB)
+    _ppm_write(dirpath / "000000.ppm", W, H, a)
+
+    # 帧 1：左上角 24×24 的亮色点阵（点间空 1 像素，8 邻接下互不相连）
+    #   ⇒ 576 个独立连通域 ⇒ 标签表 256 必定打满 ⇒ 走 C_SEL 的终止边界。
+    #   ★ 点阵只占 x,y ∈ [0,46]，与 (300,200) 的玩家方块离得很远，
+    #     不会和它连成一片把面积顶出 [60,1500]。
+    b = blank()
+    for j in range(24):
+        for i in range(24):
+            _fill(b, W, 2 * i, 2 * i, 2 * j, 2 * j, WHITE_RGB)
+    _fill(b, W, 300, 319, 200, 219, WHITE_RGB)
+    _ppm_write(dirpath / "000001.ppm", W, H, b)
+
+    # 帧 2：全黑 ⇒ 一个玩家都选不出来。上一帧刚选过 —— 输出寄存器若不清零，
+    #   就会把上一帧的 player_x/y/r 与 blob_* 打进这一帧的字节流。
+    _ppm_write(dirpath / "000002.ppm", W, H, blank())
+    return dirpath, 3
+
+
+@pytest.fixture(scope="module")
+def blindspot(tmp_path_factory: pytest.TempPathFactory) -> tuple[pathlib.Path, int]:
+    return _blindspot_frames(tmp_path_factory.mktemp("blindspot"))
+
+
+def test_blindspot_frames_bit_exact(exe, blindspot):
+    """三个真实世界盲区：标签表打满 / 超大墙段溢出 / 没玩家时输出不清零。"""
+    d, n = blindspot
+    r = _run(exe, d, n, "--verbose")
+    assert "有差异的帧 0" in r.stdout, r.stdout + r.stderr
+    assert "不符 0" in r.stdout, r.stdout + r.stderr
+
+
+def test_real_photo_frames_bit_exact(exe):
+    """真实照片（`data/fpga/stim_photo`）逐位对账。
+
+    **没有语料就 skip** —— `data/` 是 gitignore 的，队友那边拿不到。
+    但只要语料在，它就是保真度最高的那道闸：录屏合成帧的段结构太良性，
+    上面三个缺陷一个都逼不出来。语料用
+    `python core/fpga/ref/export_photos.py --out data/fpga/stim_photo` 生成。
+    """
+    d = ROOT / "data" / "fpga" / "stim_photo"
+    ppts = sorted(d.glob("*.ppm"))
+    if not ppts:
+        pytest.skip(f"没有真实照片语料（{d}）")
+    for exe_path, name in ((EXE, "vision_top"), (EXE_AXI, "vision_axi")):
+        r = subprocess.run([str(exe_path), str(d), str(len(ppts))],
+                           capture_output=True, text=True, timeout=1800)
+        assert "不符 0" in r.stdout, f"{name}：\n{r.stdout}{r.stderr}"
+
+
+def test_rtl_has_no_verilator_metacomment_lookalikes():
+    """RTL 注释不许长得像 Verilator 元注释。
+
+    踩过一次：`//   Verilator 会照写，…` 被 Verilator 当成元注释（它认的是
+    `// verilator <指令>`，**大小写不敏感**），直接
+    `%Error: Unknown verilator comment` —— 报错行号指在注释上，一眼看不出是
+    "中文注释碰巧以 Verilator 开头"。这条把合法指令白名单固化下来，
+    以后要用新指令就得显式加进来（有意为之，而不是碰巧）。
+    """
+    ok = ("lint_on", "lint_off", "tracing_on", "tracing_off",
+          "coverage_on", "coverage_off", "public", "noinline",
+          "isolate_assignments", "waiver", "hierarchical", "clock_enable",
+          "inline", "no_inline", "lint_only", "stats", "trace")
+    bad = []
+    for f in sorted(RTL.glob("*.v")) + sorted(RTL.glob("*.vh")):
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            m = re.match(r"\s*(?://|/\*)\s*[Vv]erilator\s+(\S+)", line)
+            if m and not m.group(1).startswith(ok):
+                bad.append(f"{f.name}:{i}: {line.strip()}")
+    assert not bad, (
+        "这些注释会被 Verilator 当成元注释，改掉措辞或在白名单里登记：\n  "
+        + "\n  ".join(bad))
