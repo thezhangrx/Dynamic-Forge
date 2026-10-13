@@ -124,6 +124,20 @@ int main(int argc, char **argv)
         chk("dout_last 次数", f, last_pulses, 1);
         chk("帧长", f, (long long)bytes.size(), 76 + 36 * 2 + 36 * 1);
 
+        // ---- 给"片上自检"提取期望常数 ------------------------------------
+        // 几何帧的最后 4 字节**本身就是 vision_top 算的 CRC32**（小端）。
+        // 所以板上不需要再实现一遍 CRC：只要把每帧的「字节数 + 这 4 个字节」
+        // 与这里打印出来的常数比一比，就能证明"真硅跑出来的字节和协同仿真一致"
+        // （CRC32 撞上不同内容的概率 2^-32）。
+        // 用法见 core/fpga/docs/板上验证.md §2。
+        {
+            size_t nb = bytes.size();
+            uint32_t crc = 0;
+            for (int k = 0; k < 4 && (size_t)k < nb; k++)
+                crc |= ((uint32_t)bytes[nb - 4 + (size_t)k]) << (8 * k);
+            printf("EXPECT_SCENE %d LEN %zu CRC 0x%08X\n", f, nb, crc);
+        }
+
         // ---- 帧头 ----------------------------------------------------
         chk("magic", f, (int32_t)((uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
                                   ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24)),
