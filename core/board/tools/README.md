@@ -1,0 +1,150 @@
+# `core/board/tools/` —— 板上验证用的小工具
+
+这些是**在板子上直接 gcc 编**的小程序（不是 `core/board/` 那套 C++17 交叉编译的
+驱动），用途是把 PL 侧的设计在真硅上验证掉。每个都是单文件、无依赖。
+
+```bash
+# 本机先过一遍告警（和 pytest 里那条守卫同一条命令）
+gcc -O2 -Wall -Wextra -std=c11 -Werror -c core/board/tools/axi_soak.c -o /dev/null
+
+# 送到板子上编（板子上 gcc 直接编，不需要交叉工具链）
+scp -i data/fpga/board_ssh/board_key core/board/tools/*.c root@192.168.137.242:/root/tools/
+ssh -i data/fpga/board_ssh/board_key root@192.168.137.242 \
+    'cd /root/tools && for f in *.c; do gcc -O2 -Wall -Wextra -std=c11 -Werror -o ${f%.c} $f; done'
+```
+
+---
+
+## ⚠ 先读这一条：哪些工具**会写** AXI
+
+| 工具 | 写寄存器？ | 在**旧**位流（含 AXI 写死锁）上 |
+|---|---|---|
+| `read_frame --watch` | **不写**（纯读） | 安全，不会挂死 |
+| `read_frame` | 写 `CTRL` bit0 | **会挂死 CPU** |
+| `axi_soak` | 写配置块 + `CTRL` | **会挂死 CPU** |
+| `dbg_probe` | 写配置块 + `DBG_SEL` | **会挂死 CPU** |
+
+"挂死"是指 **CPU 卡在 AXI 上、网络掉线，且复位键无效，只能彻底断电冷启动**。
+（原因见 `core/fpga/docs/板上验证.md` §4：`s_awready`/`s_wready`/`s_arready`
+原来全绑在 `idle_all` 上，AW 一被接收 `wready` 就掉，W 永远进不来。）
+
+**所以顺序永远是：先用只读工具确认位流加载成功，再用会写的工具。**
+`deploy_and_verify.sh` 就是照这个顺序编排的，推荐直接用它。
+
+---
+
+## 推荐入口：`deploy_and_verify.sh`（在 **WSL 侧**跑）
+
+```bash
+bash core/board/tools/deploy_and_verify.sh
+```
+
+送位流 → 经 `fpga_manager` 加载 → `read_frame --watch`（零风险探针）→
+`axi_soak`（真正的判据）→ 汇总。它会打印位流 md5，并且**拒绝烧写比 RTL 还旧的
+位流**（D: 上会一直留着上一轮的产物，光看"文件存在"会把含写死锁的旧位流烧上去，
+实测拦下过一次）。
+
+可调项：`SOAK_ROUNDS`（默认 3000）、`SOAK_FRAMES`（默认 8）、
+`EXPECT_MD5`（精确校验位流）、`BOARD`（默认 `192.168.137.242`）。
+
+---
+
+## 逐个工具
+
+### `read_frame.c` —— 读回几何帧，和协同仿真的期望值逐位对账
+
+端到端验证 `tpg_source → vision_axi → AXI 窗口` 这条链。
+
+```bash
+./read_frame              # 启动 1 帧并对账
+./read_frame 40           # 连续 40 帧，统计图案命中分布
+./read_frame 1 --watch    # **只读**：不启动，光等自由运行的帧
+```
+
+期望值来自 `core/fpga/cosim/tb_tpg.cpp` 的 `Vvision_selftest`（8 个图案的帧长
+184 与 CRC32），块设计里的图案源是同一个 `vision_tpg`、同样的默认配置，所以两
+组常数应当完全相同。
+
+**正确时序是"写 `CTRL` bit0 → 轮询帧计数/busy → 读 `flen` → 读窗口"。**
+`vision_top` 在 `S_RECV` 里等 `din_sof` 对齐，所以任意时刻启动都安全，不必和
+图案源对相位。
+
+> ⚠ 原版是"只等 `frame_done` 翻转、从不写 start"，**从来不可能跑通**：
+> `tpg_source` 只送像素、不启动几何帧，`frame_start` 的唯一来源就是 AXI 的
+> `ADDR_CTRL` bit0（已逐条核实，见 `板上验证.md` §6.2）。所以 `--watch` 的
+> **预期结果就是"帧计数不动"** —— 那不是故障。
+
+退出码：`0` 全部一致 / `2` 有帧不符或超时 / `3` 地址没被 PL 译码
+（位流没加载 —— 程序会明确报出来，而不是崩在 mmap 访问上）。
+
+### `axi_soak.c` —— AXI **写通路**加压，专打两个曾经的盲区
+
+```bash
+./axi_soak                 # 2000 轮字级压测 + 8 帧端到端
+./axi_soak 20000           # 加码
+./axi_soak 2000 --no-frame # 只压写通路，不启动帧
+./axi_soak 2000 --seed 7 --frames 32
+```
+
+阶段是刻意排序的（先只读、再单次写、再压测、最后端到端）：
+
+| 阶段 | 做什么 | 证明什么 |
+|---|---|---|
+| A | 快照 21 个可写配置寄存器（纯读） | 地址被译码、默认值对得上 `VR_DEFAULT_REF_PARAMS` |
+| B | **金丝雀：单次**配置寄存器写→读回 | 要挂就挂在这一行，失败点最清楚 |
+| C | 字级压测：随机地址/数据（按位宽掩码） | 写读回一致；确定性 PRNG + FNV 指纹，同 seed 两次跑结果完全一样 |
+| D | **字节/半字选通**：真的用 8/16 位访问打各字节通道 | WSTRB 修复有没有进这个位流 |
+| E | 复原 A 的快照并逐字复核 | 不然后面帧的比对会被污染 |
+| F | 端到端 N 帧（写 start → 等帧 → CRC） | 整条链 |
+| G | 存活确认 + 汇总 | 能打印到这行 = 整轮写没挂死 CPU |
+
+**为什么 D 必须上板**：仿真覆盖的是时序组合，而"真实主控的 WSTRB 到底长什么样"
+是**我们对主控的假设** —— Zynq GP 口对 8/16 位窄访问会产生什么样的字节选通，
+只有 CPU 自己知道。oracle 照 AXI-Lite 的字节使能定义在 C 里**独立**算
+（`merge_lanes()`），不复用 RTL 的 `wstrb_merge`。
+
+配置块（`0x044`，走"读旧值再合并"）与就地合并的 `SEQ/STAMP` 两条路径都要过。
+
+退出码：`0` 全过 / `2` 有失配 / `3` 地址没被译码。
+
+### `dbg_probe.c` —— 诊断：AXI 通路 + 视觉流水卡在哪一步
+
+```bash
+./dbg_probe
+```
+
+配置寄存器写读回、`ctrl`/`flen`、调试口（`sel=7` 的流水线内部状态、
+`sel=0/1/2` 的帧存抽样）。**会写寄存器**，见上面的警示表。
+
+### `fix_boot_stall.sh` —— 修"上电要干等 90 秒才进得去系统"
+
+```bash
+ssh -i data/fpga/board_ssh/board_key root@192.168.137.242 \
+    'bash -s' < core/board/tools/fix_boot_stall.sh
+```
+
+这个和 PL 无关，是板子 rootfs 的缺陷：厂商镜像里**没有 systemd-udevd**，
+于是 `dev-ttyPS0.device` 永远等不到"设备就绪"，干等 90 秒 JobTimeout，
+把 `Reached target Multi-User System` 一起卡住（`systemd-analyze` 实测 userspace
+1 分 30.8 秒）。屏蔽掉那个注定失败的重复 getty 后降到 5.7 秒。详见
+`core/fpga/docs/板上验证.md` §5。
+
+脚本幂等，且有一道安全闸：若发现提供串口登录的 `getty@ttyPS0.service` 不是
+enabled 就直接退出 —— 免得把唯一的登录口弄丢。
+
+---
+
+## 契约测试
+
+`core/board/tests/test_tools_contract.py` 守着这批工具，因为它们是"PS 侧独立维护
+的一份 PL 认知"，地址错一个字节不会报错、只会静默读写**别的寄存器**：
+
+- C 工具的 `OFF_*` ↔ `vision_axi.v` 的 `ADDR_*`；
+- `axi_soak.c` 的 `CFG[]` 表 ↔ `vision_top.v` 的 `CFG_*` 序号、
+  `reg [N:0] r_xxx` 位宽；
+- RTL 里每个可写 `CFG_*` 都要在表里（防"新加寄存器但板上压测没跟上"）；
+- 每个 `.c` 都要 `-std=c11 -Wall -Wextra -Werror` 零告警编过；
+- 每个 `.sh` 过 `bash -n`；禁止裸 `usleep`。
+
+**所以新增偏移量时要用具名常量，不要内联裸数字** —— 裸数字这个测试守不住
+（`dbg_probe.c` 原来就是裸数字，已被这条测试抓出来改成具名常量）。

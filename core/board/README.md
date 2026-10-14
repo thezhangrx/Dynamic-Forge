@@ -28,6 +28,7 @@
 | `main.cpp` | 板上 bring-up 程序：**取帧 → 解码 → 决策 → 打印速度指令** | ❌ 同上 |
 | `CMakeLists.txt` | 构建 | — |
 | `tests/` | 契约核对 + 驱动自测 + 解码对账 + 决策交叉验证 | ✅ |
+| `tools/` | **板上验证用的小工具**（读帧对账 / AXI 写通路加压 / 诊断 / rootfs 修复），单文件、在板子上直接 gcc 编。⚠ 其中三个会写 AXI，**旧位流上会把 CPU 挂死**，先读 `tools/README.md` | ✅（走 gcc，不经 CMake） |
 
 决策用的是 `core/cpu/cpp/gap_avoid.{hpp,cpp}`（`core/cpu/gap_avoid.py` 的 C++ 移植，
 验收口径 `tier` 逐位一致 + 浮点量 rel_err < 1e-9）。CMake 里以 `gap_avoid` 目标引入。
