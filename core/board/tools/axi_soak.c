@@ -94,6 +94,22 @@ static const struct { uint32_t off; int bits; const char *name; } CFG[] = {
 };
 #define NCFG ((int)(sizeof(CFG) / sizeof(CFG[0])))
 
+/* 复位默认值，顺序与 CFG[] 一一对应（= vision_top.v 复位块里的值，
+ * 也 = C 参考模型的 VR_DEFAULT_REF_PARAMS）。
+ *
+ * 为什么工具里要带这张表：Phase F 的 8 个期望 CRC 是**在默认配置下**由
+ * Vvision_selftest 跑出来的。如果配置不是默认值（比如上一次运行崩在复原之前），
+ * 帧内容本来就该不一样 —— 那时报"CRC 不符"是**误导性的失败**。
+ * 所以先用这张表判一下"配置是不是默认值"，不是的话明确说清楚。
+ *
+ * ⚠ 这是同一份知识的第三份拷贝，靠 core/board/tests/test_tools_contract.py
+ *   直接解析 vision_top.v 的复位块来守住（漂了会报错）。 */
+static const uint32_t DEF[NCFG] = {
+    40, 110, 60, 195, 45, 10, 90,            /* 8 位那批 */
+    5, 4, 5, 5, 25, 2, 12, 1, 8, 8,          /* 16 位那批 */
+    60, 1500, 45, 160,                       /* 32 位那批 */
+};
+
 static volatile uint8_t *M;
 static uint8_t *snap;                 /* A 阶段的快照 */
 static long g_checks = 0, g_fail = 0;
@@ -215,9 +231,21 @@ int main(int argc, char **argv)
     }
     printf("    ctrl=0x%08X flen=%u seq=0x%08X\n",
            r32(OFF_CTRL), r32(OFF_FLEN), r32(OFF_SEQ));
-    printf("    默认值抽查: WALL_RB=%u WALL_MIN_R=%u WALL_MIN_G=%u BRIGHT_MIN=%u\n",
-           r32(0x000) & 0xFF, r32(0x004) & 0xFF, r32(0x008) & 0xFF, r32(0x00C) & 0xFF);
-    printf("    （应为 40 / 110 / 60 / 195，与 VR_DEFAULT_REF_PARAMS 一致）\n");
+    /* Phase F 的期望 CRC 前提是"配置处于复位默认值"。刚加载完位流时必然成立，
+     * 但如果这一次不是（上一次跑崩在复原之前等），报"CRC 不符"就是误导。
+     * 所以这里明确判一次，Phase F 再据此给出提示。 */
+    int at_default = 1, ndiff = 0;
+    for (int i = 0; i < NCFG; i++) {
+        uint32_t v; memcpy(&v, snap + 4 * i, 4);
+        v &= mask_of(CFG[i].bits);
+        if (v != DEF[i]) {
+            at_default = 0;
+            if (++ndiff <= 6)
+                printf("    ⚠ %s = %u，复位默认值是 %u\n", CFG[i].name, v, DEF[i]);
+        }
+    }
+    printf("    配置%s复位默认值（不符 %d 项）%s\n", at_default ? "是" : "**不是**", ndiff,
+           at_default ? " —— Phase F 的期望 CRC 适用" : "");
 
     /* ---------------- B 金丝雀：单次写 ---------------- */
     printf("\n[B] 金丝雀：**单次**写 P_MIN_AREA 并读回（要挂就挂在这一步）\n");
@@ -318,6 +346,9 @@ int main(int argc, char **argv)
     /* ---------------- F 端到端帧 ---------------- */
     if (do_frame && nframes > 0) {
         printf("\n[F] 端到端 %d 帧：写 CTRL start → 等帧 → CRC 对账\n", nframes);
+        if (!at_default)
+            printf("  ⚠ 配置当前**不是**复位默认值 —— 下面报“不符”是预期的，\n"
+                   "    因为 8 个期望 CRC 是在默认配置下跑出来的\n");
         int hit[8] = {0}, ok = 0, bad = 0;
         uint8_t buf[FRAME_MAX];
         for (int f = 0; f < nframes; f++) {

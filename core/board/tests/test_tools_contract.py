@@ -125,6 +125,28 @@ def _soak_cfg_table() -> list[tuple[int, int, str]]:
         r'\{\s*(0x[0-9A-Fa-f]+)\s*,\s*(\d+)\s*,\s*"([A-Z_]+)"\s*\}', body)]
 
 
+def _soak_default_table() -> list[int]:
+    """axi_soak.c 的 DEF[] 表（复位默认值，顺序与 CFG[] 一致）。"""
+    src = (TOOLS / "axi_soak.c").read_text(encoding="utf-8")
+    m = re.search(r"static const uint32_t DEF\[NCFG\]\s*=\s*\{(.*?)\};", src, re.S)
+    assert m, "axi_soak.c 里找不到 DEF[NCFG] 表"
+    body = re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S)   # 去掉行内注释
+    return [int(x) for x in re.findall(r"\d+", body)]
+
+
+def _vision_top_reset_defaults() -> dict[str, int]:
+    """vision_top.v 配置寄存器复位块里的 ``r_xxx <= N'dV;``。
+
+    只取 ``配置寄存器`` 那个 always 块（到 ``end else if (cfg_we)`` 为止），
+    免得把别处的复位值也扫进来。
+    """
+    src = TOP.read_text(encoding="utf-8")
+    assert "配置寄存器" in src, "vision_top.v 里找不到配置寄存器复位块"
+    block = src.split("配置寄存器", 1)[1].split("end else if (cfg_we)", 1)[0]
+    return {n: int(v) for n, _w, v in re.findall(
+        r"(r_\w+)\s*<=\s*(\d+)'d(\d+)", block)}
+
+
 # ---------------------------------------------------------------------------
 # 1) 偏移量契约
 # ---------------------------------------------------------------------------
@@ -195,6 +217,33 @@ def test_soak_cfg_table_covers_every_writable_register() -> None:
     assert not missing, (
         f"vision_top.v 里这些配置寄存器没进 axi_soak.c 的 CFG[] 表：{missing}；"
         "它们永远不会被板上压测覆盖（CFG_STATUS 是只读的，可以不在表里）")
+
+
+def test_soak_default_table_matches_vision_top_reset_block() -> None:
+    """axi_soak.c 的 DEF[] 必须等于 vision_top.v 复位块里的值。
+
+    为什么重要：Phase F 的 8 个期望 CRC 是**在默认配置下**跑出来的。DEF[] 是
+    同一份知识的**第三份拷贝**（另两份是 RTL 复位块与 VR_DEFAULT_REF_PARAMS），
+    用来判断"当前配置是不是默认值" —— 它漂了，工具就会在配置其实正常时
+    错误地警告、或者在配置不正常时不警告，两种都会把失败归错因。
+    """
+    rst = _vision_top_reset_defaults()
+    assert rst, "vision_top.v 的复位块没解析出任何 r_xxx <= N'dV，正则该更新了"
+    table = _soak_cfg_table()
+    defs = _soak_default_table()
+    assert len(defs) == len(table), (
+        f"axi_soak.c 的 DEF[] 有 {len(defs)} 项，CFG[] 有 {len(table)} 项 —— 必须一一对应")
+
+    for (off, _bits, cname), got in zip(table, defs):
+        rtl_name = "CFG_" + cname
+        assert rtl_name in CFG_TO_REG, f"{rtl_name} 没在 CFG_TO_REG 里登记"
+        reg = CFG_TO_REG[rtl_name]
+        assert reg in rst, (
+            f"vision_top.v 的复位块里找不到 {reg}（{cname} 的目标寄存器）")
+        assert got == rst[reg], (
+            f"{cname} 的复位默认值漂了：axi_soak.c 的 DEF[] 写 {got}，"
+            f"而 vision_top.v 复位块里 {reg} <= {rst[reg]}。"
+            "Phase F 的期望 CRC 是以默认配置为前提的，漂了会把失败归错因")
 
 
 # ---------------------------------------------------------------------------
