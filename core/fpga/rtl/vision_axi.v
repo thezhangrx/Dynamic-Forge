@@ -145,13 +145,35 @@ module vision_axi #(
     );
 
     // =====================================================================
-    // 握手：读写串行化
+    // 握手：AW 与 W 必须能**分开**接收
+    //
+    // ⚠ 原实现把三个 ready 全绑在 `idle_all` 上，会**死锁**：
+    //     主控给出 AW → `s_awready = idle_all = 1` → `aw_v <= 1`
+    //     下一拍 `idle_all` 立刻变 0 → `s_wready` 跟着掉
+    //     → `w_v` **永远捕捉不到** → `wr_commit = aw_v && w_v && !b_v`
+    //       永不成立 → `bvalid` 永不返回 → **AXI 写总线挂死、CPU 卡住**
+    //
+    //   AXI 协议**允许**主控先给 AW、再给 W（合法且常见），所以这不是
+    //   "主控不规范"，是实现错了。
+    //
+    //   为什么协同仿真没抓到：`cosim/tb_axi.cpp` 的 `axi_write()` 恰好总是
+    //   **同一拍**把 AW 和 W 一起给出 —— 走不到这条路径，11490 项全绿也说明
+    //   不了问题。**这是把"主控行为"理想化造成的结构性盲区**，
+    //   已给 tb 加 `--w-delay`（默认 1 拍）覆盖，见 tb_axi.cpp。
+    //
+    //   2026-10-14 在真硅上暴露：读通路完全正常（vision_axi 的配置寄存器读出
+    //   默认值 40/110/60/195/45/10/90/5，逐项与 VR_DEFAULT_REF_PARAMS 一致），
+    //   **一写就挂**。见 core/fpga/docs/板上验证.md §4。
+    //
+    // 修法：AW/W 各自只看自己那一半；都不与读并发（保持原串行化意图）。
+    //   **没有循环依赖**：aw_v/w_v 只依赖自己的 ready，ar_v 依赖全部。
     // =====================================================================
-    wire idle_all = !aw_v && !w_v && !b_v && !ar_v && !r_v;
+    wire rd_idle = !ar_v && !r_v;
+    wire wr_idle = !b_v;
 
-    assign s_awready = idle_all;
-    assign s_wready  = idle_all;
-    assign s_arready = idle_all;
+    assign s_awready = !aw_v && wr_idle && rd_idle;
+    assign s_wready  = !w_v  && wr_idle && rd_idle;
+    assign s_arready = !ar_v && rd_idle && !aw_v && !w_v && !b_v;
     assign s_bvalid  = b_v;
     assign s_bresp   = 2'b00;
     assign s_rvalid  = r_v;

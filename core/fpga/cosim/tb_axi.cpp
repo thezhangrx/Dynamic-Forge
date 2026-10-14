@@ -58,6 +58,16 @@ static long g_checks = 0, g_fail = 0;
 static int  g_frames_done = 0;   // 真正跑完比对的帧数（假通过防线用）
 static int  g_stim_err    = 0;   // 激励读不出来 / 超限的次数
 static bool g_verbose = false;
+//: AW 之后隔几拍才给 W。
+//
+// ⚠ **默认 1，不是 0**：AXI 允许主控先给 AW、再给 W，而 `vision_axi` 原来把
+//   三个 ready 全绑在一个 `idle_all` 上，**AW 一被接收 wready 就掉**，于是
+//   W 永远进不来、bvalid 永不返回 —— 总线死锁。
+//   原测试台恰好总是**同拍**给出 AW 和 W，所以 11490 项全绿也抓不到这个 bug，
+//   最后是拿真硬件（2026-10-14）才暴露的。默认 1 拍之后，
+//   "AW/W 不同拍"这条路每次跑测试都会被走到。
+//   `--w-delay 0` 可以退回同拍的老行为（两个都要覆盖）。
+static int g_w_delay = 1;
 
 static void cmp_u32(const char *what, long long idx, uint32_t got, uint32_t want)
 {
@@ -82,17 +92,22 @@ static void axi_idle()
 static bool axi_write(uint32_t addr, uint32_t data)
 {
     top->s_awaddr  = addr;  top->s_awvalid = 1;
-    top->s_wdata   = data;  top->s_wstrb   = 0xF;  top->s_wvalid = 1;
+    top->s_wdata   = data;  top->s_wstrb   = 0xF;
+    // g_w_delay == 0 时与老行为一致（同拍给 W）；>0 时等几拍再给 —— 后者才
+    // 能覆盖"AW 已接收、W 还没来"那一段，正是原来死锁的地方。
+    top->s_wvalid  = (g_w_delay == 0) ? 1 : 0;
     top->s_bready  = 1;
     bool done = false;
+    int n = 0;
     for (int i = 0; i < 500 && !done; i++) {
         bool aw_fire = top->s_awvalid && top->s_awready;
         bool w_fire  = top->s_wvalid  && top->s_wready;
         bool b_fire  = top->s_bvalid  && top->s_bready;
-        step();
+        step(); n++;
         if (aw_fire) top->s_awvalid = 0;
         if (w_fire)  top->s_wvalid  = 0;
         if (b_fire)  done = true;
+        if (!top->s_wvalid && g_w_delay > 0 && n > g_w_delay) top->s_wvalid = 1;
     }
     axi_idle();
     return done;
@@ -151,7 +166,7 @@ int main(int argc, char **argv)
 {
     Verilated::commandArgs(argc, argv);
     if (argc < 3) {
-        fprintf(stderr, "用法: %s <stim_dir> <frames> [--verbose] [--bright N]\n", argv[0]);
+        fprintf(stderr, "用法: %s <stim_dir> <frames> [--verbose] [--bright N] [--w-delay N]\n", argv[0]);
         return 2;
     }
     std::string dir = argv[1];
@@ -161,6 +176,7 @@ int main(int argc, char **argv)
     uint32_t rtl_only_addr = 0xFFFFFFFFu, rtl_only_val = 0;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--verbose")) g_verbose = true;
+        else if (!strcmp(argv[i], "--w-delay") && i + 1 < argc) g_w_delay = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bright") && i + 1 < argc) params.bright_min = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bright-spread") && i + 1 < argc) params.bright_spread = atoi(argv[++i]);
         // 反面控制：只改 RTL 的寄存器、不改 C 的参数 → AXI 路径必须报不一致
