@@ -31,6 +31,10 @@ extern "C" {
 
 static const int MAX_W = 640;
 static const int MAX_H = 480;
+//: RTL 固定的画面尺寸（vision_top.v / vision_axi.v 的 WIDTH/HEIGHT 默认值）。
+//  激励尺寸必须与它**相等**，见下面的几何守卫。
+static const int RTL_W = 640;
+static const int RTL_H = 360;
 
 static Vvision_top *top = nullptr;
 static unsigned long long g_cycles = 0;  // 拍数（只为算“每帧多少拍”，不参与比对）
@@ -355,6 +359,16 @@ int main(int argc, char **argv)
         }
         if (w > MAX_W || h > MAX_H) {
             printf("帧 %dx%d 超过上限\n", w, h);
+            g_stim_err++;
+            break;
+        }
+        // RTL 的 WIDTH/HEIGHT 是**编译期常量**（vision_top.v 默认 640x360）。
+        // 尺寸不符时 RTL 既不报错也不截断，只是从第 HEIGHT 行起整帧对不上，
+        // 打出来满屏"不符"，看着像 RTL 回归 —— 实际是激励喂错了。
+        // 2026-10-14 被一个 640x480 的旧照片目录误伤过，所以这里显式挡死。
+        if (w != RTL_W || h != RTL_H) {
+            printf("!! 激励 %s 是 %dx%d，RTL 固定为 %dx%d —— 几何不符，判为失败\n",
+                   name, w, h, RTL_W, RTL_H);
             g_stim_err++;
             break;
         }

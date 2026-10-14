@@ -31,6 +31,12 @@ extern "C" {
 
 static const int MAX_W = 640;
 static const int MAX_H = 480;
+//: RTL 固定的画面尺寸（vision_axi.v 的 WIDTH/HEIGHT 默认值）。激励尺寸必须与
+//  它**相等**：RTL 既不会报错也不会截断，只会从第 HEIGHT 行起整帧对不上，
+//  打出来满屏"不符"，看着像 RTL 回归。2026-10-14 被 /tmp/stim_real 里一个
+//  640x480 的旧目录误伤过（262 项"不符"，全是几何不符造成的）。
+static const int RTL_W = 640;
+static const int RTL_H = 360;
 
 // ---- 地址映射（**必须与 rtl/vision_axi.v 一致**，契约测试会核对）---------
 enum {
@@ -89,10 +95,15 @@ static void axi_idle()
     top->eval();
 }
 
-static bool axi_write(uint32_t addr, uint32_t data)
+static bool axi_write(uint32_t addr, uint32_t data);
+
+//: 带字节选通的写。**老 tb 把 s_wstrb 恒定为 0xF**，于是 AXI-Lite 的另一条
+//  合法主控行为（只写部分字节）从没被走到过 —— 和 AW/W 同拍一样，属于
+//  "把主控行为理想化"造成的结构性盲区（见下方 1.5 节的自检）。
+static bool axi_write_s(uint32_t addr, uint32_t data, uint32_t strb)
 {
     top->s_awaddr  = addr;  top->s_awvalid = 1;
-    top->s_wdata   = data;  top->s_wstrb   = 0xF;
+    top->s_wdata   = data;  top->s_wstrb   = (uint8_t)strb;
     // g_w_delay == 0 时与老行为一致（同拍给 W）；>0 时等几拍再给 —— 后者才
     // 能覆盖"AW 已接收、W 还没来"那一段，正是原来死锁的地方。
     top->s_wvalid  = (g_w_delay == 0) ? 1 : 0;
@@ -111,6 +122,11 @@ static bool axi_write(uint32_t addr, uint32_t data)
     }
     axi_idle();
     return done;
+}
+
+static bool axi_write(uint32_t addr, uint32_t data)
+{
+    return axi_write_s(addr, data, 0xF);
 }
 
 static bool axi_read(uint32_t addr, uint32_t *out)
@@ -203,14 +219,73 @@ int main(int argc, char **argv)
     std::vector<uint16_t> rowc_g(MAX_H);
     std::vector<uint8_t> frame_g(8192);
 
-    // ---- 1) 配置寄存器：写进去再读回来 --------------------------------
+    // ---- 1.5) 字节选通自检（覆盖第二个"主控行为被理想化"的盲区）--------
+    //
+    // 配置寄存器块（0x000..0x07F）在 vision_top 里是**整字写**（cfg_addr 选中的
+    // 寄存器被 cfg_wdata 整体覆盖），所以从口必须自己把 strb 未选中的字节并回去。
+    // 原实现 `reg_wdata <= wstrb_merge(32'd0, w_d, w_s)` 会**把未选中的字节清零**
+    // —— 对 0x044 写 1 字节会把其余 3 字节写成 0；而同一个从口上 SEQ/STAMP 却是
+    // 就地 wstrb_merge，同一个从口两种字节语义。
+    // 下面的 oracle 直接照 AXI-Lite 的字节使能定义独立算一遍，不复用 RTL 的函数。
     uint32_t v = 0;
+    {
+        auto merge = [](uint32_t old, uint32_t data, uint32_t strb) {
+            uint32_t r = old;
+            for (int b = 0; b < 4; b++)
+                if (strb & (1u << b))
+                    r = (r & ~(0xFFu << (8 * b))) | (data & (0xFFu << (8 * b)));
+            return r;
+        };
+        const uint32_t LANE_DATA[6] = { 0x000000AAu, 0x0000BB00u, 0x00CC0000u,
+                                        0xDD000000u, 0x0000EEEEu, 0xFFFF0000u };
+        const uint32_t LANE_STRB[6] = { 0x1u, 0x2u, 0x4u, 0x8u, 0x3u, 0xCu };
+        const char    *LANE_NAME[6] = { "lane0 字节", "lane1 字节", "lane2 字节",
+                                        "lane3 字节", "低半字",   "高半字" };
+
+        uint32_t save_area = 0, save_seq = 0;
+        CHECK(axi_read(A_CFG_P_MIN_AREA, &save_area), "选通自检：预读 P_MIN_AREA 超时");
+        CHECK(axi_read(A_SEQ, &save_seq), "选通自检：预读 SEQ 超时");
+
+        // ① 32 位配置寄存器：逐字节 / 逐半字，四种 strb 掩码全覆盖
+        uint32_t acc = 0x11223344u;
+        CHECK(axi_write(A_CFG_P_MIN_AREA, acc), "选通自检：整字写超时");
+        CHECK(axi_read(A_CFG_P_MIN_AREA, &v) && v == acc, "选通自检：整字写读回不符");
+        for (int i = 0; i < 6; i++) {
+            char msg[80];
+            snprintf(msg, sizeof(msg), "选通自检：写 %s 超时", LANE_NAME[i]);
+            CHECK(axi_write_s(A_CFG_P_MIN_AREA, LANE_DATA[i], LANE_STRB[i]), msg);
+            acc = merge(acc, LANE_DATA[i], LANE_STRB[i]);
+            snprintf(msg, sizeof(msg), "选通自检：写 %s 后读回不符", LANE_NAME[i]);
+            CHECK(axi_read(A_CFG_P_MIN_AREA, &v) && v == acc, msg);
+        }
+
+        // ② SEQ(0x0C4) 走的是另一条就地合并路径，同样要过
+        acc = 0x11223344u;
+        CHECK(axi_write(A_SEQ, acc), "选通自检：SEQ 整字写超时");
+        CHECK(axi_write_s(A_SEQ, 0x0000BB00u, 0x2u), "选通自检：SEQ lane1 超时");
+        acc = merge(acc, 0x0000BB00u, 0x2u);
+        CHECK(axi_read(A_SEQ, &v) && v == acc, "选通自检：SEQ lane1 读回不符");
+
+        // ③ 复原，免得影响后面的参数写与帧比对
+        CHECK(axi_write(A_CFG_P_MIN_AREA, save_area), "选通自检：恢复 P_MIN_AREA 超时");
+        CHECK(axi_write(A_SEQ, save_seq), "选通自检：恢复 SEQ 超时");
+        CHECK(axi_read(A_CFG_P_MIN_AREA, &v) && v == save_area, "选通自检：恢复 P_MIN_AREA 不符");
+        CHECK(axi_read(A_SEQ, &v) && v == save_seq, "选通自检：恢复 SEQ 不符");
+    }
+
+    // ---- 1) 配置寄存器：写进去再读回来 --------------------------------
     for (int f = 0; f < frames; f++) {
         char name[64];
         snprintf(name, sizeof(name), "%06d.ppm", f);
         int w = 0, h = 0;
         if (!load_ppm(dir + "/" + name, &w, &h, rgb)) {
             printf("激励读取失败：%s\n", name);
+            g_stim_err++;
+            break;
+        }
+        if (w != RTL_W || h != RTL_H) {
+            printf("!! 激励 %s 是 %dx%d，RTL 固定为 %dx%d —— 几何不符，判为失败\n",
+                   name, w, h, RTL_W, RTL_H);
             g_stim_err++;
             break;
         }

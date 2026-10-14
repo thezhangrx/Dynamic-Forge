@@ -102,10 +102,12 @@ module vision_axi #(
     // ---- vision_top 的配置口 -------------------------------------------
     reg        reg_we;
     reg [5:0]  reg_addr;
-    reg [31:0] reg_wdata;
+    reg [31:0] reg_wdata;      // 原始 s_wdata（不做选通合并）
+    reg [3:0]  reg_strb;       // 随路锁存的 s_wstrb
     reg        start_pulse;
     wire [5:0] cfg_addr;
     wire [31:0] cfg_rdata;
+    wire [31:0] cfg_wdata;     // = wstrb_merge(cfg_rdata, reg_wdata, reg_strb)
 
     // ---- 调试口 / 帧头 --------------------------------------------------
     reg [3:0]   dbg_sel;
@@ -136,7 +138,7 @@ module vision_axi #(
         .frame_start(start_pulse),
         .cfg_seq(cfg_seq_r), .cfg_stamp_ns(cfg_stamp_r),
         .frame_done(frame_done), .busy(busy),
-        .cfg_we(reg_we), .cfg_addr(cfg_addr), .cfg_wdata(reg_wdata),
+        .cfg_we(reg_we), .cfg_addr(cfg_addr), .cfg_wdata(cfg_wdata),
         .cfg_rdata(cfg_rdata),
         .dout_vld(dout_vld), .dout_data(dout_data),
         .dout_last(dout_last), .dout_ready(1'b1),
@@ -203,6 +205,40 @@ module vision_axi #(
         end
     endfunction
 
+    // ---- 写数据的两条选通路径 -------------------------------------------
+    //
+    // ⚠ 这里修的是**第二个**"主控行为被理想化"的盲区（第一个是 AW/W 时序，见上）。
+    //   `wstrb_merge(32'd0, ...)` 会把**未被选通的字节变成 0**。配置寄存器块
+    //   （0x000..0x07F）在 vision_top 里是**整字写**（`cfg_addr` 选中的那个寄存器
+    //   整体被 `cfg_wdata` 覆盖），所以只要主控用字节/半字写配置寄存器，其余
+    //   三条字节就被静默清零 —— 例如对 0x000 写 1 字节，`r_wall_rb` 之外的
+    //   `r_wall_min_r/g` 会一起变 0。SEQ/STAMP 那三个寄存器是就地 `wstrb_merge`，
+    //   反而是对的，于是**同一个 AXI-Lite 从口上两种字节语义并存**。
+    //
+    //   修法：写提交时只锁存原始 `w_d`/`w_s`，下一拍（`reg_we=1` 那一拍）
+    //   先读该寄存器的**旧值**再合并：
+    //       cfg_wdata = wstrb_merge(cfg_rdata, reg_wdata, reg_strb)
+    //   没有循环依赖（cfg_rdata ← cfg_addr ← 寄存器；cfg_wdata 不被 cfg_rdata
+    //   之外的组合逻辑回头依赖），也没有时序竞争：仲裁保证读写**严格串行**
+    //   （s_arready 要求 !aw_v&&!w_v&&!b_v，s_awready/s_wready 要求 rd_idle），
+    //   所以 `reg_we=1` 那一拍不可能有读在飞，cfg_addr 必然等于 reg_addr、
+    //   cfg_rdata 必然是该寄存器的旧值。
+    //   整字写（strb=4'hF）下 `wstrb_merge` 恒等，行为与原来完全一致。
+    //
+    // DBG/CTRL 的写数据只用到低 26 位（sel[3:0] / idx[21:4] / sub[25:22]），
+    // 高 6 位保留。单独做一个 26 位宽的选通合并，免得 -Wall 的 UNUSEDSIGNAL
+    // 拿"w_masked[31:26] 没被读"报错。
+    function [25:0] wstrb_merge26(input [25:0] old, input [25:0] newd, input [3:0] strb);
+        begin
+            wstrb_merge26[7:0]   = strb[0] ? newd[7:0]   : old[7:0];
+            wstrb_merge26[15:8]  = strb[1] ? newd[15:8]  : old[15:8];
+            wstrb_merge26[23:16] = strb[2] ? newd[23:16] : old[23:16];
+            wstrb_merge26[25:24] = strb[3] ? newd[25:24] : old[25:24];
+        end
+    endfunction
+    wire [25:0] w_masked = wstrb_merge26(26'd0, w_d[25:0], w_s);
+    assign cfg_wdata = wstrb_merge(cfg_rdata, reg_wdata, reg_strb);
+
     // 几何帧窗口：一次给一个字（4 字节，小端）。
     // 下标直接用地址位段 a[FW_BITS+1:2] 减去窗口起始字号：正好 FW_BITS 位，
     // 既满足数组下标位宽，也不需要把 12 位地址整个塞进一个窄变量。
@@ -220,7 +256,7 @@ module vision_axi #(
         if (!aresetn) begin
             aw_v <= 0; w_v <= 0; b_v <= 0; aw_a <= 0; w_d <= 0; w_s <= 0;
             ar_v <= 0; r_v <= 0; ar_a <= 0; rdata_q <= 0;
-            reg_we <= 0; reg_addr <= 0; reg_wdata <= 0; start_pulse <= 0;
+            reg_we <= 0; reg_addr <= 0; reg_wdata <= 0; reg_strb <= 0; start_pulse <= 0;
             dbg_sel <= 0; dbg_idx <= 0; dbg_sub <= 0;
             cfg_seq_r <= 0; cfg_stamp_r <= 0;
             frame_wptr <= 0; frame_total <= 0; frame_len <= 0; frame_ovf <= 0;
@@ -235,17 +271,20 @@ module vision_axi #(
             if (wr_commit) begin
                 aw_v <= 1'b0; w_v <= 1'b0; b_v <= 1'b1;
                 if (aw_a < ADDR_CONFIG + 12'h080) begin
-                    // 0x000..0x07F：配置寄存器块 → 透给 vision_top
+                    // 0x000..0x07F：配置寄存器块 → 透给 vision_top。
+                    // 只锁存原始数据/选通，字节合并留给下一拍的 cfg_wdata
+                    // （见 w_masked/cfg_wdata 处的说明）。
                     reg_we    <= 1'b1;
                     reg_addr  <= {1'b0, aw_a[6:2]};
-                    reg_wdata <= wstrb_merge(32'd0, w_d, w_s);
+                    reg_wdata <= w_d;
+                    reg_strb  <= w_s;
                 end else case (aw_a)
                     ADDR_DBG: begin
-                        dbg_sel <= w_d[3:0];
-                        dbg_idx <= w_d[21:4];
-                        dbg_sub <= w_d[25:22];
+                        dbg_sel <= w_masked[3:0];
+                        dbg_idx <= w_masked[21:4];
+                        dbg_sub <= w_masked[25:22];
                     end
-                    ADDR_CTRL:   if (w_d[0]) start_pulse <= 1'b1;
+                    ADDR_CTRL:   if (w_masked[0]) start_pulse <= 1'b1;
                     ADDR_SEQ:    cfg_seq_r          <= wstrb_merge(cfg_seq_r, w_d, w_s);
                     ADDR_STAMP0: cfg_stamp_r[31:0]  <= wstrb_merge(cfg_stamp_r[31:0],  w_d, w_s);
                     ADDR_STAMP1: cfg_stamp_r[63:32] <= wstrb_merge(cfg_stamp_r[63:32], w_d, w_s);
