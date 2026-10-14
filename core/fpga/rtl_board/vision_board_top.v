@@ -218,16 +218,33 @@ module vision_board_top (
     // led[1]：八个图案全部逐位对上 = **常亮**；否则按帧率闪
     assign led[1] = (ok_mask == 8'hFF) ? 1'b1 : frame_tgl;
 
-    // ---- 观测手段 ----------------------------------------------------------
-    //   led[0] 闪               → 时钟 / MMCM / 逻辑活着
-    //   led[1] 常亮             → **八个自检图案的帧长与 CRC32 全部与协同仿真一致**
-    //   led[1] 约 1 Hz 闪       → 帧在跑，但字节还没全对上（或还没跑满 8 帧）
-    //   led[0] 闪、led[1] 不亮  → 时钟没问题，流水线卡住
-    //   led[0] 不闪             → 时钟/MMCM 没起来（与流水线无关）
+    // ---- 可选：片上探针（读回用，默认不编）--------------------------------
     //
-    // 这一版仍不放 ILA：非工程模式下 create_ip 生成的 IP 进不了 synth_design
-    // （实测 `Synth 8-439 module 'ila_0' not found`）。需要看中间过程时再改用
-    // 综合后插入的 create_debug_core + connect_debug_port。
+    // 两个 LED 只够回答"跑没跑完 / 字节对不对"，而且要**有人看着板子**。
+    // 远程操作时需要一个能从 JTAG 读回来的观测手段，所以留一个开关：
+    //
+    //   vivado ... synth_design -verilog_define VISION_BOARD_ILA -top vision_board_top
+    //
+    // 走**真项目 + create_ip**（见 synth/board_ila.tcl）—— 非工程模式下
+    // `create_ip` 生成的 IP 进不了 synth_design（`Synth 8-439 ila_0 not found`），
+    // 而综合后插 `create_debug_core` 那条路在 2018.3 上 `C_NUM_OF_PROBES`
+    // 不是合法属性（实测 `Vivado 12-4444`/`12-711`）。真项目这条是官方路。
+    //
+    //   probe0 frame_done(1)  probe1 ok_mask(8)  probe2 cur_frame_idx(16)
+    //   probe3 nb_now(16)     probe4 tl_now(32)
+    //
+    // 默认不定义这个宏，所以 `board.tcl` 那条正常构建**不需要**任何 IP。
+`ifdef VISION_BOARD_ILA
+    ila_0 u_ila (
+        .clk    (clk),
+        .probe0 (frame_done),
+        .probe1 (ok_mask),
+        .probe2 (cur_frame_idx),
+        .probe3 (nb_now),
+        .probe4 (tl_now)
+    );
+`endif
+
     wire _unused = &{1'b0, tpg_busy, tpg_done, busy, dout_data,
                      dout_last, dbg_data, cfg_rdata, cur_frame_idx};
 
