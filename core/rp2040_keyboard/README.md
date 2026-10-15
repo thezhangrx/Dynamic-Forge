@@ -38,6 +38,29 @@ python3 core/rp2040_keyboard/pc_key_driver.py --console /dev/ttyUSB0 --arm --key
 
 ---
 
+## 0.5 资料核对（`docs/resource/keyboard/`）
+
+那份资料里有：
+
+| 内容 | 文件 | 对这件事的用处 |
+|---|---|---|
+| **引脚图** | `原理图/RP2040-Zero脚位定义.jpg` | ✅ **直接回答"接哪两个脚"**（上面那张表就是照它写的） |
+| RP2040-Zero 原理图 / Pico 引脚图 / 两份 datasheet | `原理图/*.pdf` | 需要查电平、供电、USB 走线时用 |
+| **MicroPython 固件** | `micropyth固件/rp2-pico-20220618-v1.19.1.uf2` | ⚠ **v1.19.1 太老，做不了 HID 键盘**（见 §2 的表） |
+| 厂商例程 | `测试例程/{blink,hellow,WS2812}.py`、`例程/…WS2812例程/` | 与键盘无关，是"板子 + 工具链能不能跑"的冒烟测试。`RP2040-Zero.py` 用 GP16 驱 WS2812、`main.py` 读 GP24 —— 与引脚图一致 |
+
+**结论**：引脚那一半完全对得上（GP1/GND 可直接照做）；**固件那一半要换** ——
+不管走 CircuitPython 还是 MicroPython ≥1.23，都得重新刷一次固件。
+
+两条路都可用，按你们更顺手的选：
+* **CircuitPython**：`code.py` 已经写好，`usb_hid` + `adafruit_hid`，本目录的测试都在守它；
+* **MicroPython ≥1.23**：留在现有工具链里，用 `machine.USBDevice` +
+  [micropython-lib 的 `usb.device`](https://github.com/micropython/micropython-lib/tree/master/micropython/usb)（那里有 keyboard 示例）。
+  ⚠ 两个坑：① 运行时 USB 设备要配在 **`boot.py`** 里（它在 USB 子系统初始化之前执行）；
+  ② **软复位会清掉运行时 USB 设备**，所以在设备还活着的时候 `mpremote run` 会失败一次
+  —— 第二次就好了（官方文档明说）。要 `code.py` 的 MicroPython 版我可以照同一套协议写，
+  但**得在硬件上验过才算**（现在没有硬件）。
+
 ## 1. 接法 A：板子直接说（两根线）
 
 板子的控制台是 **`ttyPS0`（PS 的 UART0，MIO 50..51，115200）** —— 启动日志里
@@ -56,7 +79,20 @@ RP2040 **只听不说**，所以只要两根线：
 > ⚠ **不要把 RP2040 的 GP0（TX）接到板子的控制台 RX 上**。板子那颗 CP210x
 > 也在驱动同一条 RX，两条线一起推就是**总线争用**。我们只需要单向，所以不接。
 
-**板子这边具体接哪个脚**（仓库里没有原理图，所以按这个办法找）：
+**RP2040-Zero 这边具体接哪个脚**（依据 `docs/resource/keyboard/原理图/RP2040-Zero脚位定义.jpg`）：
+
+| RP2040-Zero 引脚 | 位置 | 接到 |
+|---|---|---|
+| **GP1**（= UART0 RX） | 右侧排针第 2 个 | 板子控制台 TX ✅ |
+| **GND** | 左侧排针第 2 个（5V 下面） | 板子 GND ✅ |
+| 3V3 | 左侧排针第 3 个 | 不用接（RP2040-Zero 由 USB-C 供电） |
+| GP0（= UART0 TX） | 右侧排针第 1 个 | **不要接**（见上面的总线争用） |
+
+引脚图右侧那列标的就是 `GP1 UART0 RX` —— 和我们用的脚**一致**。
+另外图上写明 **GP16 被板载 WS2812 灯占着**（`测试例程` 里也确实是这么用的），
+所以别拿 GP16 接串口。
+
+**板子这边具体接哪个脚**（仓库里没有主板的原理图，所以按这个办法找）：
 
 板子的控制台**已经接到板上那颗 CP210x**（我们一直用它读启动日志），
 所以要接的就是**同一条网络**，从这三处任选一处引：
@@ -122,8 +158,19 @@ python3 console_relay.py --console socket://192.168.1.5:5000 --rp2040 /dev/ttyAC
 
 | | USB HID（模拟键盘） |
 |---|---|
-| 官方 **MicroPython** rp2 端口 | ❌ 不带设备模式 HID，要自己改固件 |
-| **CircuitPython** | ✅ 原生 `usb_hid` + `adafruit_hid` |
+| **CircuitPython** | ✅ 原生 `usb_hid` + `adafruit_hid`（本目录 `code.py` 用的就是这条） |
+| **MicroPython ≥ 1.23**（2024-06 起） | ✅ `machine.USBDevice` + micropython-lib 的 `usb.device`（有 keyboard 示例） |
+| **MicroPython ≤ 1.22**（含资料里给的 v1.19.1） | ❌ **不带**设备模式 HID，必须换固件 |
+
+> ⚠ 这条原来写成"官方 MicroPython 的 rp2 端口不带设备模式 HID"，**按版本限定才对**：
+> MicroPython **v1.23.0** 的发布说明写着 *"MicroPython now has full support for
+> user-defined USB devices... a higher-level USB library in `micropython-lib`...
+> with examples for **keyboard**, mouse, MIDI and serial CDC. This feature is
+> currently available on **rp2** and samd ports"*。
+> 也就是说 rp2 从 1.23 起就能做键盘了，**不必**为了这个换到 CircuitPython。
+>
+> 唯一的前提是：**资料里那份固件 `rp2-pico-20220618-v1.19.1.uf2` 是 2022 年的
+> v1.19.1，做不了** —— 无论走哪条路都要重新刷固件。
 
 所以要刷 **CircuitPython 固件**，并把 `adafruit_hid` 库拷到 CIRCUITPY 盘的 `lib/` 下。
 
