@@ -158,8 +158,20 @@ PL 侧 `vision_pixfeed.v` 把字节流还原成像素时序喂给流水线，几
   省掉 150 个 BRAM，也不用把 ADDR_W 从 12 位撑到 20 位。
 * **溢出不会静默**：`PIXSTAT` 的 bit16 是粘滞溢出位，PS 推完读一次就知道。
 
-**三条路给出的几何帧必须逐字节相同** —— 这一点由协同仿真的 `tb_axi --fifo`
-直接证（同一批真照片，两条像素通路都跑一遍）。
+**三条路给出的几何帧必须逐字节相同** —— 这一点由两处证明：
+
+* 协同仿真：`tb_axi --fifo` 把同一批真照片从两条像素通路各跑一遍，逐字节比；
+* **真硅上**：`--verify-both` 让**同一张图**分别走 PL（推 FIFO）和 PS（黄金模型），
+  再逐字节比。这是"PL 吃真图"最直接的判据：
+
+```bash
+# 采一帧真摄像头，然后两条路都跑、逐字节对账
+ffmpeg -f v4l2 -input_format mjpeg -video_size 1280x720 -i /dev/video1 \
+       -frames:v 1 -vf scale=640:360 -pix_fmt rgb24 /root/cam.ppm
+./vision_board_devmem --ppm /root/cam.ppm --verify-both --frames 8 --echo-action
+```
+
+不一致时它会打出**第一个差异字节的位置和两边的内容**，便于直接定位到帧头哪个字段。
 
 三条可以任意组合：`--ppm FILE` 换掉帧来源，键盘那一段不变。
 决策/解码/键盘是**共用**的下游，所以"真图"和"PL 图"走的是同一条后处理。

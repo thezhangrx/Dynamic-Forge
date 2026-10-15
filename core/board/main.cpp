@@ -78,6 +78,10 @@ struct Args {
     //: `--via-pl`：PPM 的像素**推进 PL 的 FIFO**，几何帧由 PL 产出
     //: （而不是在 PS 上跑黄金模型）。真摄像头要走 FPGA 加速时用这个。
     bool via_pl = false;
+    //: `--verify-both`：同一张图**两条路都跑一遍**（PL 推像素 + PS 黄金模型），
+    //: 比对几何帧是否**逐字节相同**。这是"PL 吃真图"在真硅上的等价性判据
+    //: —— 协同仿真的 `tb_axi --fifo` 证的是同一件事。
+    bool verify_both = false;
 
     std::string keyboard_dev = "/dev/ttyPS0";
     double action_deadzone = kDefaultDeadzone;
@@ -106,6 +110,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--dt-default")   a.dt_default = std::atof(next());
         else if (k == "--ppm")          a.ppm_file = next();
         else if (k == "--via-pl")       a.via_pl = true;
+        else if (k == "--verify-both")  a.verify_both = true;
         else if (k == "--ppm-dir")      a.ppm_dir = next();
         else if (k == "--keyboard-dev") a.keyboard_dev = next();
         else if (k == "--no-keyboard")  a.keyboard_dev.clear();
@@ -134,7 +139,9 @@ Args parse_args(int argc, char** argv) {
                 "                       （与 data/fpga/stim_* 的命名一致）。\n"
                 "  --via-pl             配上 --ppm/--ppm-dir 时，把像素**推进 PL**、\n"
                 "                       几何帧由 PL 产出（真摄像头走 FPGA 加速就走这条）。\n"
-                "                       不加则是在 PS 上跑黄金模型。\n",
+                "                       不加则是在 PS 上跑黄金模型。\n"
+                "  --verify-both        同一张图两条路都跑，比对几何帧是否逐字节相同\n"
+                "                       （真硅上验「PL 吃真图」，与 tb_axi --fifo 同一性质）。\n",
                 argv[0], argv[0]);
             std::exit(0);
         } else {
@@ -376,7 +383,7 @@ int main(int argc, char** argv) {
 
     const bool have_ppm = !args.ppm_file.empty() || !args.ppm_dir.empty();
     // 走 PL 时**不**用 PS 参考模型：像素推给 PL，几何帧从 PL 读回来
-    const bool use_ref = have_ppm && !args.via_pl;
+    const bool use_ref = have_ppm && !args.via_pl && !args.verify_both;
 
     // ---- 打开 PL（只有走 PL 那条路才需要）--------------------------------
     RegIo* io = nullptr;
@@ -394,13 +401,17 @@ int main(int argc, char** argv) {
     }
     std::unique_ptr<VisionDriver> drv;
     std::unique_ptr<RefFrameSource> ref;
-    if (use_ref) {
+    if (use_ref || args.verify_both) {
         ref.reset(new RefFrameSource(args));
         std::printf("帧来源: PS 参考模型 (%s)\n",
                     args.ppm_dir.empty() ? args.ppm_file.c_str() : args.ppm_dir.c_str());
     } else {
         drv.reset(new VisionDriver(*io));
-        if (have_ppm) {
+        if (args.verify_both) {
+            std::printf("帧来源: **两条都跑**（PL 推像素 vs PS 黄金模型，逐字节比）\n");
+            drv->set_pixel_source(true);
+            drv->flush_pixels();
+        } else if (have_ppm) {
             std::printf("帧来源: PL（像素由 PS 推入 FIFO，帧取自 %s）\n",
                         args.ppm_dir.empty() ? args.ppm_file.c_str() : args.ppm_dir.c_str());
             drv->set_pixel_source(true);
@@ -429,6 +440,8 @@ int main(int argc, char** argv) {
     }
 
     // ---- 键盘桥：动作行发到板子控制台 TX（RP2040 就听这根线）--------------
+    long cmp_total = 0, cmp_ok = 0, cmp_bad = 0;   // --verify-both 的对账计数
+
     ActionEmitter kb(args.keyboard_dev);
     if (!args.keyboard_dev.empty()) {
         std::printf("键盘桥: %s（%s）\n", args.keyboard_dev.c_str(),
@@ -444,7 +457,56 @@ int main(int argc, char** argv) {
     uint64_t stamp_ns = 0;
     for (int i = 0; i < args.frames; ++i) {
         std::vector<uint8_t> bytes;
-        if (drv && have_ppm) {
+        std::vector<uint8_t> bytes_ref;      // --verify-both 时用来对账
+        if (args.verify_both) {
+            // 先跑 PS 黄金模型（纯计算，不动硬件），再让 PL 跑同一张图。
+            // 两张几何帧必须**逐字节相同** —— 不同就说明 PL 那条路有问题，
+            // 而且差异会直接指出是哪个字段（这里打前 32 字节）。
+            std::string path = args.ppm_dir.empty()
+                             ? args.ppm_file
+                             : (args.ppm_dir + "/" + [&] {
+                                   char n[32]; std::snprintf(n, sizeof(n), "%06d.ppm", i);
+                                   return std::string(n);
+                               }());
+            std::string rwhy;
+            if (!ref->next(i, static_cast<uint32_t>(i), stamp_ns, &bytes_ref, &rwhy)) {
+                std::fprintf(stderr, "第 %d 帧：参考模型失败：%s\n", i, rwhy.c_str());
+                ++bad; break;
+            }
+            std::vector<uint8_t> rgb;
+            int pw = 0, ph = 0;
+            std::string why2;
+            if (!vision_board::read_ppm_p6(path, &pw, &ph, &rgb, &why2)) {
+                std::fprintf(stderr, "第 %d 帧：%s\n", i, why2.c_str());
+                ++bad; break;
+            }
+            try {
+                bytes = drv->run_frame_push(rgb.data(), rgb.size(),
+                                            static_cast<uint32_t>(i), stamp_ns,
+                                            args.timeout_ms);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "第 %d 帧：PL 推像素失败：%s\n", i, e.what());
+                ++bad; continue;
+            }
+            ++cmp_total;
+            if (bytes.size() != bytes_ref.size()) {
+                ++cmp_bad;
+                std::printf("  ✗ 帧 %d 长度不一致：PL=%zu，参考=%zu\n",
+                            i, bytes.size(), bytes_ref.size());
+            } else if (bytes != bytes_ref) {
+                ++cmp_bad;
+                size_t k = 0;
+                while (k < bytes.size() && bytes[k] == bytes_ref[k]) ++k;
+                std::printf("  ✗ 帧 %d 内容不一致（第一个差异在字节 %zu）：\n", i, k);
+                std::printf("      PL  :"); for (size_t t = k; t < k + 16 && t < bytes.size(); ++t) std::printf(" %02X", bytes[t]);
+                std::printf("\n      参考:"); for (size_t t = k; t < k + 16 && t < bytes_ref.size(); ++t) std::printf(" %02X", bytes_ref[t]);
+                std::printf("\n");
+            } else {
+                ++cmp_ok;
+                std::printf("  ✓ 帧 %d：PL 与 PS 黄金模型**逐字节相同**（%zu 字节）\n",
+                            i, bytes.size());
+            }
+        } else if (drv && have_ppm) {
             // 真摄像头那条路：读 PPM → 推给 PL 的像素 FIFO → 从 PL 取几何帧。
             // PL 的流水线尺寸是编译期常量（WIDTH/HEIGHT），所以这里必须**恰好**
             // 是那个尺寸 —— 不符就直接说清楚，别喂进去得到一堆看不懂的错。
@@ -531,6 +593,11 @@ int main(int argc, char** argv) {
         std::printf("（%.1f 帧/秒）", 1000.0 * ok / static_cast<double>(ms));
     }
     std::printf("\n");
+    if (args.verify_both) {
+        std::printf("---- 等价性对账：%ld 帧，逐字节相同 %ld，不符 %ld ----\n",
+                    cmp_total, cmp_ok, cmp_bad);
+        if (cmp_bad) ++bad;
+    }
     if (!args.keyboard_dev.empty()) {
         std::printf("键盘桥: 发出 %ld 行，丢 %ld 行\n", kb.sent(), kb.dropped());
     }
