@@ -219,6 +219,27 @@ ssh root@板子 'cd /root/board_src/build && make -B -j4 vision_board_devmem'
 # 判定标准不是"make 成功"，而是 ① 二进制 md5 **变了** ② 新功能能自证（如 --help 里出现新开关）
 ```
 
+### 6.2.1 一条命令常驻闭环（推荐入口）
+
+```bash
+bash core/board/tools/run_loop.sh              # 一直跑，Ctrl-C 停
+bash core/board/tools/run_loop.sh --keys wasd  # 平台用 WASD
+bash core/board/tools/run_loop.sh --dry-run    # 只打印要按的键，不注入
+```
+
+链路：板子【摄像头 → PL 视觉 → 解码 → 推速度 → 决策】→ `@MOVE n` 到 stdout
+→ SSH → PC【按键注入 → 平台】。它替你处理了四件容易出错的事：
+
+| 事 | 为什么必须由脚本管 |
+|---|---|
+| **开跑前自检**（板子 / PL 是否 `operating` / 相机节点 / 注入器），并**报出当前焦点窗口** | 否则你会对着黑屏猜"是不是我没配好"；而合成按键打到**焦点窗口**，不报出来就是盲按 |
+| **5 秒倒计时**再开始按键 | 给你时间把平台窗口点成焦点（`--delay-s 0` 跳过） |
+| **断了自动重连**（2 秒，连续失败退避到 10 秒） | SSH 掉线/相机抽风时不会静默变成"什么都没发生" |
+| **收尾干净**：先松键（ALLUP）→ 停掉板子上的相机链路 → 断开 | 不松键会让角色一直朝前跑；不停 ffmpeg 会让摄像头卡在 `Device or resource busy` |
+
+全程 tee 到 `data/fpga/loop_logs/loop_<时间>.log`，事后能查。停板子上的相机用
+`pkill -INT -x ffmpeg`（按**进程名**精确匹配，不用 `-f`，也**绝不 -9**）。
+
 ### 6.2 三条已经跑通的路
 
 | 路 | 命令 | 帧来源 | 用途 |

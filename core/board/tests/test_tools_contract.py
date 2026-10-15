@@ -326,3 +326,22 @@ def test_capture_boot_warns_about_capture_before_power_on() -> None:
     assert "MobaXterm" in sh, "必须提醒先关掉别的串口程序（一个串口只能一个程序读）"
     # 结果要落到 data/ 下（gitignore 的目录），别塞进仓库
     assert "data/fpga/boot_logs" in sh, "日志应当写进 data/fpga/boot_logs/"
+
+
+def test_run_loop_is_safe_and_self_restarting() -> None:
+    """常驻闭环脚本的几条硬约束：默认一直跑、有停止钩子、停相机的方式必须安全。"""
+    sh = (TOOLS / "run_loop.sh").read_text(encoding="utf-8")
+    assert "FRAMES=0" in sh, "默认必须不限帧数（一条命令一直跑）"
+    assert "trap on_stop INT TERM" in sh, "必须有停止钩子：收尾要松键 + 停相机"
+    # 停相机：按进程名精确匹配（-x），不能用 -f（会连命令行含该串的 shell 一起杀，
+    # 这个坑在 WSL 上踩过一次）；ffmpeg 一律 -INT，绝不 -9（-9 会把 V4L2 设备卡住）。
+    assert "pkill -INT -x ffmpeg" in sh, "停 ffmpeg 要用 -INT -x"
+    # ⚠ 只查**非注释行**：脚本注释里正好在讲"不能用 pkill -f"这个教训（把坑写下来），
+    #   按字面断言会把这段说明本身判成违规 —— 断言要盯代码，不盯注释。
+    code = "\n".join(ln for ln in sh.splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert "pkill -f" not in code, "不能用 pkill -f（会误杀自己的 shell）"
+    assert "pkill -9" not in code and "kill -9" not in code, "ffmpeg 绝不 -9"
+    assert "--probe" in sh, "开跑前必须先自检注入器（否则按键可能全打空）"
+    assert "focus" in sh.lower() or "焦点" in sh, "必须提醒/报出焦点窗口"
+    assert "data/fpga/loop_logs" in sh, "全程日志要落到 data/ 下"
