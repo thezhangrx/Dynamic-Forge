@@ -325,3 +325,55 @@ def test_readme_documents_the_ssh_pipeline() -> None:
         text = (RP2040 / name).read_text(encoding="utf-8")
         assert "--keyboard-dev stdout" in text, f"{name} 少了发射端写法"
         assert "--stdin" in text, f"{name} 少了接收端写法"
+
+
+# ---------------------------------------------------------------------------
+# 5) 注入器问答的语义（不需要 Windows：拿一个假注入器当对端）
+# ---------------------------------------------------------------------------
+def test_ask_returns_remainder_and_wait_ready_accepts_empty() -> None:
+    """`_ask` 返回"去掉前缀后的剩余部分"，**成功也可能是空串**。
+
+    `PING` 的答复是 `PONG`，去掉前缀后是空串。`_wait_ready` 一开始用真假值判断，
+    于是"探活成功"被当成失败，一直等到超时（25 秒），probe 表现成"没回话"。
+    这里用一个假注入器把语义钉死，顺便不依赖 Windows。
+    """
+    fake = ("import sys\n"
+            "for line in sys.stdin:\n"
+            "    c = line.strip()\n"
+            "    if c == 'PING':\n"
+            "        print('PONG', flush=True)\n"
+            "    elif c == 'FOCUS':\n"
+            "        print('FOCUS 某个窗口', flush=True)\n"
+            "    elif c == 'QUIT':\n"
+            "        break\n")
+    p = subprocess.Popen([sys.executable, "-c", fake], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, bufsize=1, encoding="utf-8")
+    try:
+        t0 = time.monotonic()
+        assert drv._wait_ready(p, timeout=5.0) is True, "PONG 的剩余部分是空串，也必须算就绪"
+        assert time.monotonic() - t0 < 5.0, "不该把成功的探活耗到超时"
+        assert drv._ask(p, "FOCUS", "FOCUS ") == "某个窗口"
+        assert drv._ask(p, "FOCUS", "NOPE", timeout=0.3) is None, "对不上前缀应当超时返回 None"
+        p.stdin.write("QUIT\n")
+        p.stdin.flush()
+        p.wait(timeout=5)
+    finally:
+        if p.poll() is None:
+            p.kill()
+
+
+def test_injector_script_is_utf8_with_bom() -> None:
+    """`win_sendinput.ps1` **必须**是 UTF-8 with BOM。
+
+    Windows PowerShell 5.1 对没有 BOM 的脚本按系统 ANSI 代码页（中文机 GBK）解码，
+    里面的中文注释会被解坏、把语法拆掉 —— 症状是 `-File` 起来就报 ParserError，
+    而且只在中文注释恰好解出引号类字符时才发作（改一条注释就可能突然坏掉）。
+    """
+    raw = (RP2040 / "win_sendinput.ps1").read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf"), "少了 UTF-8 BOM"
+    text = raw.decode("utf-8-sig")
+    # 答复必须立刻出管道：Write-Output 在重定向时会缓冲，问焦点会读到旧答案
+    assert "[Console]::Out.Flush()" in text, "答复类输出要直写并 flush"
+    for needle in ("FOCUS", "-Once", "GetForegroundWindow"):
+        assert needle in text, f"缺少 {needle}（焦点查询的那套）"

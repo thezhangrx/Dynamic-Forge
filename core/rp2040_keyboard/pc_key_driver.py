@@ -127,24 +127,126 @@ def key_diff(held: tuple[int, ...], want: tuple[int, ...]) -> tuple[list[int], l
     return press, release
 
 
+def _win_path(path: pathlib.Path) -> str:
+    """WSL 路径 → Windows 路径（powershell.exe 只认后者）。"""
+    try:
+        return subprocess.run(["wslpath", "-w", str(path)],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    except Exception:
+        return str(path)
+
+
 def _spawn_injector(quiet: bool = True) -> subprocess.Popen:
     """起常驻的 PowerShell 注入器。
 
     每次按键都起一个进程要几十毫秒，30 fps 跟不上，所以起一次、逐行喂命令。
     从 WSL 调 Windows 的 powershell.exe（互操作），路径要转成 Windows 形式。
     """
-    ps1 = HERE / "win_sendinput.ps1"
-    try:
-        win_path = subprocess.run(["wslpath", "-w", str(ps1)],
-                                  capture_output=True, text=True, check=True).stdout.strip()
-    except Exception:
-        win_path = str(ps1)
     cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-           "-File", win_path]
+           "-File", _win_path(HERE / "win_sendinput.ps1")]
     if quiet:
         cmd.append("-Quiet")
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE, text=True, bufsize=1)
+    # stdout 要接着：FOCUS/PONG 的**答复**从这里回来（`-Quiet` 下不会有别的输出，
+    # 所以不用担心管道被回显灌满）。
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, bufsize=1,
+                            encoding="utf-8", errors="replace")
+
+
+def _ask(inj: subprocess.Popen, cmd: str, prefix: str, timeout: float = 5.0) -> str | None:
+    """给注入器发一条命令并等它的答复。
+
+    返回**去掉前缀后的剩余部分**（可能是空串！），超时返回 None。
+    ⚠ 判断成功必须用 `is not None`，**不能**用真假值：`PING` 的答复是 `PONG`，
+    去掉前缀后正好是空串 —— 用真假值判会把"探活成功"当成失败，然后一直等到
+    超时（这个坑已经踩过一次，`tests/test_pc_key_driver.py` 里钉住了）。
+    """
+    try:
+        inj.stdin.write(cmd + "\n")
+        inj.stdin.flush()
+    except Exception:
+        return None
+    end = time.monotonic() + timeout
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            return None
+        r, _, _ = select.select([inj.stdout], [], [], left)
+        if not r:
+            return None
+        line = inj.stdout.readline()
+        if not line:
+            return None
+        if line.startswith(prefix):
+            return line[len(prefix):].strip()
+
+
+def _wait_ready(inj: subprocess.Popen, timeout: float = 25.0) -> bool:
+    """等注入器把 `Add-Type` 编译完、能回话为止。
+
+    **不能靠 sleep 固定时长**：PowerShell 冷启动（首次编译 + JIT + 杀软扫描）
+    可能好几秒，撞运气的话就问了个寂寞。这里反复 PING 到有回话为止。
+    """
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if inj.poll() is not None:
+            return False
+        left = end - time.monotonic()
+        # `is not None` 而不是真假值：PONG 的剩余部分是空串，但它就是成功
+        if _ask(inj, "PING", "PONG", timeout=min(5.0, max(0.2, left))) is not None:
+            return True
+    return False
+
+
+def _injector_error(inj: subprocess.Popen) -> str:
+    try:
+        return (inj.stderr.read() if inj.stderr else "") or "(无输出)"
+    except Exception:
+        return "(读不到 stderr)"
+
+
+def _start_injector() -> subprocess.Popen:
+    """起注入器并等它就绪；起不来直接退出（不做无声的降级）。"""
+    try:
+        inj = _spawn_injector(quiet=True)
+    except FileNotFoundError:
+        sys.exit("找不到 powershell.exe —— 这个脚本要在 WSL 里跑（Windows 互操作）")
+    if not _wait_ready(inj):
+        sys.exit(f"注入器起不来或没回话：\n{_injector_error(inj)}")
+    return inj
+
+
+def focus_title(inj: subprocess.Popen | None = None) -> str | None:
+    """问"现在哪个窗口有焦点" —— 合成按键就是打到它身上。
+
+    ⚠ 这是**盲测变成明测**的关键：不知道焦点是谁的时候按 `--arm`，按键可能打进
+    编辑器/聊天框（方向键在 shell 里还会翻历史）。有注入器就用它的常驻连接问
+    （快），没有就起一次性的 `-Once`（约 0.5 秒，Add-Type 编译占大头）。
+    """
+    if inj is not None:
+        return _ask(inj, "FOCUS", "FOCUS ")
+    try:
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", _win_path(HERE / "win_sendinput.ps1"), "-Quiet", "-Once"],
+            capture_output=True, text=True, timeout=20,
+            encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    for ln in (r.stdout or "").splitlines():
+        if ln.startswith("FOCUS "):
+            return ln[6:].strip()
+    return None
+
+
+def _say_focus(inj: subprocess.Popen | None, when: str) -> None:
+    t = focus_title(inj)
+    if t is None:
+        print(f"  {when}焦点窗口：读不到（powershell 互操作可能被禁）", flush=True)
+    elif not t:
+        print(f"  {when}焦点窗口：（空标题 / 无焦点）", flush=True)
+    else:
+        print(f"  {when}焦点窗口：{t}", flush=True)
 
 
 def probe() -> int:
@@ -160,11 +262,11 @@ def probe() -> int:
     except FileNotFoundError:
         print("✗ 找不到 powershell.exe —— 要在 WSL 里跑（Windows 互操作）")
         return 1
-    time.sleep(1.0)                      # 等 Add-Type 编完
-    if inj.poll() is not None:
-        err = (inj.stderr.read() if inj.stderr else "") or "(无输出)"
-        print(f"✗ 注入器起不来（退出码 {inj.returncode}）：\n{err}")
+    if not _wait_ready(inj):
+        print(f"✗ 注入器起不来或没回话（退出码 {inj.poll()}）：\n{_injector_error(inj)}")
         return 1
+    print(f"  探活：{'PONG（注入器已就绪）' if _ask(inj, 'PING', 'PONG') is not None else '没回话'}")
+    _say_focus(inj, "当前")
     try:
         inj.stdin.write("ALLUP\nQUIT\n"); inj.stdin.flush()
         inj.wait(timeout=3)
@@ -195,16 +297,7 @@ def press_sequence(actions: list[int], keymap: str, delay_s: float, hold_ms: int
             return 2
         names.append(DISCRETE_ACTION_NAMES[a])
 
-    inj = None
-    if arm:
-        try:
-            inj = _spawn_injector(quiet=True)
-        except FileNotFoundError:
-            sys.exit("找不到 powershell.exe —— 这个脚本要在 WSL 里跑（Windows 互操作）")
-        time.sleep(1.0)                  # 等 Add-Type 编完
-        if inj.poll() is not None:
-            err = inj.stderr.read() if inj.stderr else ""
-            sys.exit(f"注入器起不来：\n{err}")
+    inj = _start_injector() if arm else None
 
     print(f"键位 {keymap}  依次按 {actions}（{', '.join(names)}）"
           f"  每个按住 {hold_ms} ms、间隔 {gap_ms} ms"
@@ -221,6 +314,7 @@ def press_sequence(actions: list[int], keymap: str, delay_s: float, hold_ms: int
         for k in release:
             inj.stdin.write(f"UP {k}\n"); inj.stdin.flush()
 
+    _say_focus(inj, "注入前 ")
     try:
         for idx, a in enumerate(actions, 1):
             want = keys_for_action(a, keymap)
@@ -306,20 +400,13 @@ def main() -> int:
     else:
         con = _open_serial(args.console, args.baud)
         src = f"控制台 {args.console}"
-    inj = None
-    if args.arm:
-        try:
-            inj = _spawn_injector(quiet=True)
-        except FileNotFoundError:
-            sys.exit("找不到 powershell.exe —— 这个脚本要在 WSL 里跑（Windows 互操作）")
-        time.sleep(1.0)                      # 等 Add-Type 编完
-        if inj.poll() is not None:
-            err = inj.stderr.read() if inj.stderr else ""
-            sys.exit(f"注入器起不来：\n{err}")
+    inj = _start_injector() if args.arm else None
 
     print(f"{src}  键位 {args.keys}  "
           f"{'**真注入**' if args.arm else '干跑（加 --arm 才真的按键）'}"
           f"   Ctrl-C 退出", flush=True)
+    if args.arm:
+        _say_focus(inj, "注入前 ")
 
     def read_chunk() -> bytes | None:
         """UDP / 串口 / 标准输入统一成一个"可能返回空"的读接口，看门狗才能插进来。
