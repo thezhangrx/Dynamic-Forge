@@ -65,7 +65,37 @@ if(VISION_BOARD_BUILD_TESTS)
 endif()
 
 # ---------------------------------------------------------------------------
-# 板上目标：需要 icraft SDK
+# 板上目标（**默认就编，不需要 icraft**）：直接 /dev/mem 访问 PL 的寄存器窗口
+#
+# 为什么这是板上 bring-up 的主路径：
+#   * 我们这块板子上 PL 的寄存器窗口（0x43C00000，见 vision_regs.hpp 的
+#     kRegBase）用 /dev/mem 就能读写 —— core/board/tools/ 已在真硅上验过；
+#   * icraft 的 defaultRegRegion() 是**另一个窗口**（0x400C0000，NPU 那边），
+#     而且链它还要交叉编译 + 解 deb 做 sysroot；
+#   * 板子自带 g++/cmake，所以"在板上直接编"最短，也少一个依赖。
+#
+# 本机（x86_64）也能编：/dev/mem 打不开是**运行期**的事，编译期无依赖。
+# ---------------------------------------------------------------------------
+# 离散动作量化：`core/bullet_sim/core/actions.py` 的 DISCRETE_*
+# 在 C++ 侧的镜像（见 action_codec.hpp）。板上 main 用它，本机差分测试也用它。
+add_library(action_codec STATIC action_codec.cpp)
+target_include_directories(action_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# -ffp-contract=off 与 gap_avoid **同一个理由，而且这里已经被实测抓到过**：
+# GCC 默认把 `dx*wx + dy*wy` 收缩成 FMA，改变最后一位舍入，于是在 45° 边界上
+# （相邻两个方向的点积本来就相等）C++ 与 Python 会**破不同的方向** ——
+# 实测 527 组速度里有 2 组分家（C++ 选对角线、Python 选轴向）。
+# 见 core/board/tests/test_action_codec_matches_python.py。
+target_compile_options(action_codec PRIVATE -ffp-contract=off)
+
+add_executable(vision_board_devmem
+    vision_driver_devmem.cpp
+    vision_driver_factory.cpp
+    main.cpp
+)
+target_link_libraries(vision_board_devmem PRIVATE vision_driver_core gap_avoid action_codec)
+
+# ---------------------------------------------------------------------------
+# 板上目标（可选）：需要 icraft SDK
 #
 # 只有开了 `VISION_BOARD_WITH_ICRAFT` 才编 —— PC 上没有 aarch64 的 icraft
 # 运行时，默认不编，保证 `cmake -S core/board -B build` 在任何机器上都能过。
@@ -88,11 +118,15 @@ if(VISION_BOARD_WITH_ICRAFT)
 
     add_executable(vision_board_app
         vision_driver_icraft.cpp
+        vision_driver_factory.cpp
         main.cpp
     )
+    # 让工厂把 icraft 分支编进来（同时 devmem 分支照样可用，按 URL 选）
+    target_compile_definitions(vision_board_app PRIVATE VISION_BOARD_HAVE_ICRAFT)
     target_link_libraries(vision_board_app PRIVATE
         vision_driver_core
         gap_avoid
+        action_codec
         Icraft::HostBackend
         Icraft::ZG330Backend
     )

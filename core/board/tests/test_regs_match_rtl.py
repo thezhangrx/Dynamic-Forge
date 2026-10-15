@@ -115,3 +115,57 @@ def test_frame_window_is_within_the_address_window() -> None:
     assert end <= 0x1000, (
         f"帧窗口 {off:#x}..{end:#x} 超出 4 KB 地址窗口（ADDR_W=12）；"
         "vision_axi.v 的地址是 12 位，超出的位会被截断")
+
+
+# ---------------------------------------------------------------------------
+# 基址：**跨三处**的契约
+#
+# 为什么必须有这一条：基址是 PS 侧**独立维护**的常量（`vision_regs.hpp` 的
+# kRegBase、`tools/*.c` 的 BASE），而块设计那边原来只靠 `assign_bd_address`
+# **自动分配**。自动分配的结果会随 BD 里元件的增减而变，一旦漂移，PS 侧会
+# **静默**读写到别的窗口 —— 不会报错，只会给错数。
+#
+# 2026-10-15 实测就抓到了：`vision_regs.hpp` 写的是 **0x400C0000**（那是 NPU 的
+# 窗口），而块设计把 `vision_0/s/reg0` 分配在 **0x43C00000** —— 板上工具用
+# 0x43C00000 读得通，说明 PS 侧那份契约是错的（写 0x400C0000 更糟：会碰 NPU）。
+# 所以块设计那边现在就**显式钉死**，并由这条测试把三处钉在一起。
+# ---------------------------------------------------------------------------
+BD_TCL = ROOT / "core" / "fpga" / "synth" / "bd_vision.tcl"
+TOOLS_DIR = ROOT / "core" / "board" / "tools"
+
+
+def _bd_pinned_base() -> int:
+    """块设计里显式钉死的基址（``set_property offset 0x… $_seg``）。"""
+    src = BD_TCL.read_text(encoding="utf-8")
+    m = re.search(r"set_property\s+offset\s+(0x[0-9A-Fa-f]+)\s+\$_seg", src)
+    assert m, (
+        "bd_vision.tcl 里找不到显式钉基址的 `set_property offset 0x… $_seg`。"
+        "只靠 assign_bd_address 自动分配是不行的 —— 基址是 PS 侧的契约，"
+        "自动分配会随元件增减而漂移")
+    return int(m.group(1), 16)
+
+
+def test_register_base_matches_block_design() -> None:
+    """vision_regs.hpp 的 kRegBase 必须等于块设计钉死的基址。"""
+    base = _bd_pinned_base()
+    m = re.search(r"kRegBase\s*=\s*0x([0-9A-Fa-f]+)u", REGS.read_text(encoding="utf-8"))
+    assert m, "vision_regs.hpp 里找不到 kRegBase"
+    got = int(m.group(1), 16)
+    assert got == base, (
+        f"基址漂移：vision_regs.hpp 的 kRegBase = {got:#010x}，"
+        f"而块设计钉死的是 {base:#010x}。PS 侧会静默读写到别的窗口，且不会报错。")
+
+
+def test_tools_base_matches_block_design() -> None:
+    """板上 C 工具的 BASE 也必须等于同一个基址。"""
+    base = _bd_pinned_base()
+    seen: dict[str, int] = {}
+    for c in sorted(TOOLS_DIR.glob("*.c")):
+        m = re.search(r"#define\s+BASE\s+(0x[0-9A-Fa-f]+)", c.read_text(encoding="utf-8"))
+        if m:
+            seen[c.name] = int(m.group(1), 16)
+    assert seen, "core/board/tools/*.c 里一个 BASE 都没解析到"
+    bad = {k: v for k, v in seen.items() if v != base}
+    assert not bad, (
+        f"这些工具的 BASE 和块设计钉死的基址 {base:#010x} 不一致："
+        + "，".join(f"{k}={v:#010x}" for k, v in bad.items()))

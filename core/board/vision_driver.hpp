@@ -66,10 +66,23 @@ private:
     std::vector<uint32_t> mem_;
 };
 
-//: 板上用的 icraft 后端。**只有它需要 icraft SDK**，所以单独一个 .cpp，
-//: 本机不编它也能跑测试。
-//: 声明放在这里，实现见 vision_driver_icraft.cpp。
+//: 板上用的 **icraft** 后端。只有它需要 icraft SDK，所以单独一个 .cpp，
+//: 本机不编它也能跑测试。实现见 vision_driver_icraft.cpp。
+//:
+//: ⚠ 注意 `defaultRegRegion()` 是**另一个窗口**（0x400C0000，NPU 那边），
+//:   不是我们这块 PL（0x43C00000）。板上跑我们的设计请用 devmem 后端。
 RegIo* icraft_reg_io(const std::string& device_url);
+
+//: 板上用的 **/dev/mem** 后端：直接 mmap 到 PL 的寄存器窗口。
+//:
+//: URL 形如 `devmem://0x43C00000`；写 `devmem` 则用契约里的 :const:`kRegBase`。
+//: 板子自带 g++，所以"直接 /dev/mem + 在板上编"是最短路径，不依赖 icraft SDK。
+//: 实现见 vision_driver_devmem.cpp。
+RegIo* devmem_reg_io(const std::string& device_url);
+
+//: 按 URL 选后端（见 vision_driver_factory.cpp）。`main.cpp` 只用这个，
+//: 不认识任何具体后端。
+RegIo* open_reg_io(const std::string& device_url);
 
 // ---------------------------------------------------------------------------
 // 21 个配置寄存器。字段顺序**必须**等于 ref_api.h 的 VrRefParams。

@@ -32,7 +32,7 @@ namespace vision_board {
 // 基址
 // ---------------------------------------------------------------------------
 //: AI_Mate 的 user_op 窗口起点。vendor 示例 adder_demo.cpp 用的也是这个。
-constexpr uint32_t kRegBase = 0x400C0000u;
+constexpr uint32_t kRegBase = 0x43C00000u;
 
 // ---------------------------------------------------------------------------
 // 配置寄存器：0x000 + 4*i，i 就是 vision_top 的 cfg_addr

@@ -138,17 +138,41 @@ foreach s {din_vld din_sof din_eol din_r din_g din_b} {
 # 它们是**专用引脚、由 PS7 自动约束**，DRC 自然通过。
 puts "@@@ 像素流已连（不引出任何额外 PL 端口）@@"
 
-# ---- 地址分配（自动）-------------------------------------------------------
+# ---- 地址分配：**显式钉死**，不靠自动分配 -----------------------------------
+#
+# ⚠ 基址是 **PS 侧的契约**：core/board/vision_regs.hpp 的 kRegBase、
+#   core/board/tools/*.c 的 BASE 都写死了它。自动分配（单靠 assign_bd_address）
+#   的结果会随 BD 里元件的增减而变 —— 将来往设计里加一个 AXI 从设备，
+#   基址就可能被挪走，于是 PS 侧**静默**读写到别的窗口（不会报错，只会给错数，
+#   0x400C0000 那个窗口还是 NPU 的，写进去更糟）。
+#   所以这里显式设定 offset/range，并回读确认。
 assign_bd_address
+set _seg [get_bd_addr_segs -quiet ps7_0/Data/SEG_vision_0_reg0]
+if {[llength $_seg] == 0} { set _seg [get_bd_addr_segs -quiet *SEG_vision_0_reg0] }
+if {[llength $_seg] == 0} {
+    puts "@@@ 地址分配失败：找不到 SEG_vision_0_reg0 @@"
+    exit 1
+}
+set_property offset 0x43C00000 $_seg
+set_property range  64K        $_seg
 set segs [get_bd_addr_segs]
 puts "@@@ 地址段 @@"
 foreach s $segs { puts "    $s  offset=[get_property offset $s]  range=[get_property range $s]" }
+#: 回读确认钉住了（这一行是 contract 测试解析的对象）
+set _off [get_property offset [get_bd_addr_segs -quiet ps7_0/Data/SEG_vision_0_reg0]]
+if {$_off ne "0x43C00000"} {
+    puts "@@@ 基址没钉住：读回 $_off != 0x43C00000 @@"
+    exit 1
+}
+puts "@@@ 基址已钉死 @@@ vision_0_reg0 offset=$_off range=64K
 # ⚠ `report_bd_address` 是更新版本才有的命令，2018.3 里没有
 #   （踩过：`invalid command name "report_bd_address"`，整个脚本在这里停住）。
 #   地址已经在上面用 get_property 逐段打出来了，写进日志就够了。
 #
-# 记下基地址：**vision_axi 的寄存器基址 = 0x43C00000，窗口 64 KB**。
-# PS 侧驱动（core/board/vision_driver）用的就是"基址 + 寄存器偏移"这套。
+# 基地址：**vision_axi 的寄存器基址 = 0x43C00000，窗口 64 KB**（上面已显式钉死）。
+# PS 侧驱动（core/board/vision_driver）与板上工具用的都是"基址 + 寄存器偏移"这套。
+# `core/board/tests/test_tools_contract.py` / `test_regs_match_rtl.py` 会核对
+# 三个地方的这个常量必须一致：本 tcl、vision_regs.hpp 的 kRegBase、tools/*.c 的 BASE。
 
 # ---- 包装与构建 ------------------------------------------------------------
 # ⚠ **PS 的 DDR / FIXED_IO 必须显式引到顶层**。

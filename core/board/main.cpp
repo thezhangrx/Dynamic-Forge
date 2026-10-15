@@ -19,6 +19,7 @@
 // `core/cpu/tests/test_cpp_gap_avoid.py`）。
 // ===========================================================================
 #include "gap_avoid.hpp"
+#include "action_codec.hpp"
 #include "geometry_frame.hpp"
 #include "vision_driver.hpp"
 #include "vision_regs.hpp"
@@ -29,6 +30,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
 #include <vector>
 
 using namespace vision_board;
@@ -36,7 +41,9 @@ using namespace vision_board;
 namespace {
 
 struct Args {
-    std::string device_url = "axi://zg330aiu?npu=0x40000000&dma=0x80000000";
+    // 板子上 PL 的寄存器窗口用 /dev/mem 直接访问（板上工具已验证）。
+    // icraft 的 defaultRegRegion 是**另一个窗口**，不是我们这块 PL。
+    std::string device_url = "devmem://0x43C00000";
     int frames = 8;
     int timeout_ms = 2000;
     bool verbose = false;
@@ -45,6 +52,12 @@ struct Args {
     double field_h = 480.0;         // 场高
     double player_speed = 200.0;    // 速度上限
     double dt_default = 1.0 / 30.0; // 首帧没有上一帧 stamp 时用
+    // 键盘桥：决策算出的速度 → 动作号 → "@MOVE <n>\n" → 板子控制台 TX。
+    // RP2040 的 GP1 就接在控制台 TX 上（见 core/rp2040_keyboard/README.md），
+    // 它从共享的控制台流里挑出带 @MOVE 前缀的行。空串 = 不发。
+    std::string keyboard_dev = "/dev/ttyPS0";
+    double action_deadzone = kDefaultDeadzone;
+    bool echo_action = false;       // 把动作号也打到 stdout（人看）
 };
 
 Args parse_args(int argc, char** argv) {
@@ -67,6 +80,10 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--field-h")      a.field_h = std::atof(next());
         else if (k == "--player-speed") a.player_speed = std::atof(next());
         else if (k == "--dt-default")   a.dt_default = std::atof(next());
+        else if (k == "--keyboard-dev") a.keyboard_dev = next();
+        else if (k == "--no-keyboard")  a.keyboard_dev.clear();
+        else if (k == "--action-deadzone") a.action_deadzone = std::atof(next());
+        else if (k == "--echo-action")  a.echo_action = true;
         else if (k == "-h" || k == "--help") {
             std::printf(
                 "用法: %s [--device-url URL] [--frames N] [--timeout-ms MS] [--verbose]\n"
@@ -75,7 +92,13 @@ Args parse_args(int argc, char** argv) {
                 "  --field-w/--field-h  场地尺寸（世界单位）。视觉帧**不携带**这两个量\n"
                 "                       （标准 §6），所以必须由调用方给。默认 640x480。\n"
                 "  --player-speed       玩家速度上限（世界单位/秒）。视觉帧里没有，默认 200。\n"
-                "  --dt-default         首帧没有上一帧 stamp 时用的 dt，默认 1/30 s。\n",
+                "  --dt-default         首帧没有上一帧 stamp 时用的 dt，默认 1/30 s。\n"
+                "  --keyboard-dev P     把动作号写成 \"@MOVE <n>\\n\" 发到这个串口\n"
+                "                       （默认 /dev/ttyPS0 = 板子控制台 TX；RP2040 的 GP1\n"
+                "                        就接在这根线上，从控制台流里挑 @MOVE 行）。\n"
+                "  --no-keyboard        不发动作（只看视觉+决策）。\n"
+                "  --action-deadzone D  速度小于 D 就当 stay，默认 1e-3。\n"
+                "  --echo-action        把动作号也打到 stdout。\n",
                 argv[0]);
             std::exit(0);
         } else {
@@ -126,7 +149,56 @@ int tier_bucket(const char* t) {
 const char* kTierNames[8] = {"HOLD", "TRIM", "ALIGN", "PANIC",
                              "SLOW", "STOP", "NO_GAP", "其它"};
 
-void decide(const GeometryFrame& f, const Args& args, DecisionState& st) {
+// ---------------------------------------------------------------------------
+// 动作发射：把动作号写成 "@MOVE <n>\n" 发到板子控制台 TX
+//
+// 为什么发到**控制台**而不是另开一个串口：RP2040 的 GP1 就接在控制台 TX 上
+// （见 core/rp2040_keyboard/README.md，只两根线：TX + GND）。它从共享的控制台
+// 流里挑出带 @MOVE 前缀的行、忽略内核日志与 shell 输出。
+//
+// O_NONBLOCK 是刻意的：串口拥塞时**宁可丢这一帧的动作**，也不能把决策循环堵住
+// —— 键盘桥那边有看门狗（松开所有键），漏一帧不会卡住角色，堵住决策循环会。
+// ---------------------------------------------------------------------------
+class ActionEmitter {
+public:
+    explicit ActionEmitter(const std::string& dev) {
+        if (dev.empty()) return;                 // 显式关掉
+        fd_ = ::open(dev.c_str(), O_WRONLY | O_NONBLOCK | O_NOCTTY);
+        if (fd_ < 0) {
+            std::fprintf(stderr, "⚠ 打不开键盘串口 %s：%s（这一轮不发动作）\n",
+                         dev.c_str(), std::strerror(errno));
+        }
+    }
+    ~ActionEmitter() { if (fd_ >= 0) ::close(fd_); }
+    bool ok() const { return fd_ >= 0; }
+
+    //: 返回写出去的字节数；<0 表示这一帧丢了（已打点）。
+    int emit(int action, bool noisy) {
+        if (fd_ < 0) return -1;
+        char buf[16];
+        const int n = vision_board::format_action_line(action, buf, sizeof(buf));
+        if (n <= 0) return -1;
+        const ssize_t w = ::write(fd_, buf, static_cast<size_t>(n));
+        if (w != n) {
+            ++dropped_;
+            if (noisy && dropped_ <= 3) {
+                std::fprintf(stderr, "⚠ 动作行没写完（%zd/%d，errno=%s）—— 丢掉这一帧\n",
+                             w, n, std::strerror(errno));
+            }
+            return -1;
+        }
+        ++sent_;
+        return n;
+    }
+    long sent() const { return sent_; }
+    long dropped() const { return dropped_; }
+
+private:
+    int fd_ = -1;
+    long sent_ = 0, dropped_ = 0;
+};
+
+gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& st) {
     // ---- dt：两帧 stamp 之差 ----
     double dt = args.dt_default;
     bool dt_is_default = true;
@@ -190,6 +262,7 @@ void decide(const GeometryFrame& f, const Args& args, DecisionState& st) {
     if (!f.player.present) std::printf("  [无角色，按场宽中线/半径 10 兜底]");
     if (dt_is_default) std::printf("  [dt=默认，无上一帧 stamp]");
     std::printf("\n");
+    return cmd;
 }
 
 }   // namespace
@@ -203,10 +276,12 @@ int main(int argc, char** argv) {
     // ---- 打开 PL ---------------------------------------------------------
     RegIo* io = nullptr;
     try {
-        io = icraft_reg_io(args.device_url);
+        io = open_reg_io(args.device_url);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "打开设备失败：%s\n"
-                             "  排查：位流烧了吗？user_op 窗口是 0x400C0000 吗？\n",
+                             "  排查：位流烧了吗？PL 的寄存器窗口是不是 0x43C00000？\n"
+                             "  （基址的契约：vision_regs.hpp 的 kRegBase 与\n"
+                             "    core/fpga/synth/bd_vision.tcl 里显式钉死的那一段）\n",
                      e.what());
         return 1;
     }
@@ -227,6 +302,15 @@ int main(int argc, char** argv) {
     VisionParams params;          // 默认值 = C 参考模型 / Python 真值
     drv.configure(params);
     std::printf("配置：已写入 %d 个寄存器（阈值用默认值）\n", (int)kCfgCount);
+
+    // ---- 键盘桥：动作行发到板子控制台 TX（RP2040 就听这根线）--------------
+    ActionEmitter kb(args.keyboard_dev);
+    if (!args.keyboard_dev.empty()) {
+        std::printf("键盘桥: %s（%s）\n", args.keyboard_dev.c_str(),
+                    kb.ok() ? "已打开，发 \"@MOVE <n>\" " : "**打不开**，本轮不发动作");
+    } else {
+        std::printf("键盘桥: 已关闭（--no-keyboard）\n");
+    }
 
     // ---- 逐帧 ------------------------------------------------------------
     DecisionState st;
@@ -253,7 +337,14 @@ int main(int argc, char** argv) {
                         h.img_w, h.img_h,
                         static_cast<unsigned long long>(h.stamp_ns),
                         h.flags & 1u ? "  [player_valid]" : "");
-            decide(frame, args, st);
+            const gap_avoid::Vec2 cmd = decide(frame, args, st);
+            const int action = vision_board::action_from_velocity(
+                cmd.x, cmd.y, args.action_deadzone);
+            if (args.echo_action) {
+                std::printf("        动作: %d (%s)\n", action,
+                            vision_board::action_name(action));
+            }
+            kb.emit(action, args.verbose);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "帧 %d 解码失败：%s\n", i, e.what());
             ++bad;
@@ -274,6 +365,9 @@ int main(int argc, char** argv) {
         std::printf("（%.1f 帧/秒）", 1000.0 * ok / static_cast<double>(ms));
     }
     std::printf("\n");
+    if (!args.keyboard_dev.empty()) {
+        std::printf("键盘桥: 发出 %ld 行，丢 %ld 行\n", kb.sent(), kb.dropped());
+    }
     if (st.n_decisions > 0) {
         std::printf("决策 %d 帧（失败 %d）: ", st.n_decisions, st.n_failed);
         for (int i = 0; i < 8; ++i) {
