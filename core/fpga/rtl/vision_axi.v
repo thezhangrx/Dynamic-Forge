@@ -87,7 +87,35 @@ module vision_axi #(
     localparam [11:0] ADDR_FRAME  = 12'h100;   // 几何帧窗口
     localparam [11:0] ADDR_FRAME_END = ADDR_FRAME + FRAME_BYTES[11:0];
     localparam [FB_BITS:0] FB_MAX    = FRAME_BYTES[FB_BITS:0];
-    localparam [FW_BITS-1:0] FRAME_W0 = ADDR_FRAME[FW_BITS+1:2];   // 0x100>>2 = 64
+
+    // ---- 字地址（地址 >> 2）-------------------------------------------------
+    // ⚠ 译码必须按**字地址**，不能拿完整字节地址去比字对齐的常量。
+    //
+    // AXI 允许窄传输的地址不对齐：主控对 0x0C5 做一次字节写，给的是
+    // `AWADDR=0x0C5, AWSIZE=0, WSTRB=0x2`（合法且常见 —— Zynq 的 GP 口对
+    // `*(volatile uint8_t*)` 就是这么发的）。原来 `case (aw_a)` 拿 0x0C5 去比
+    // `ADDR_SEQ=0x0C4`，比不中 → 落进 `default` → **整笔写被静默丢弃**。
+    // 读侧同样：读 0x0C5 会掉进 default 返回 0，而不是 CTRL 的值。
+    //
+    // 配置块（0x000..0x07F）反而一直是对的：它是**范围判断 + aw_a[6:2]**，
+    // 天然忽略了低 2 位。所以同一个从口上两种译码语义并存。
+    //
+    // 2026-10-15 上板第一次真跑才暴露（axi_soak 的 Phase D）：
+    //   配置块 0x044 逐字节/半字写 → 全对；
+    //   SEQ 0x0C4 / STAMP0 0x0C8 / STAMP1 0x0CC → 只有 lane0 写得进去。
+    wire [ADDR_W-3:0] aw_word = aw_a[ADDR_W-1:2];
+    wire [ADDR_W-3:0] ar_word = ar_a[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_DBG      = ADDR_DBG[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_DBGDAT   = ADDR_DBGDAT[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_CTRL     = ADDR_CTRL[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_SEQ      = ADDR_SEQ[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_STAMP0   = ADDR_STAMP0[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_STAMP1   = ADDR_STAMP1[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FLEN     = ADDR_FLEN[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRAME    = ADDR_FRAME[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRAME_END = ADDR_FRAME_END[ADDR_W-1:2];
+    // 配置块的窗口边界保持用**字节地址**判（ADDR_CONFIG+0x080 是字对齐的，
+    // 对任何窄地址都等价于"字地址 < 32"），这样 aw_a/ar_a 的低 2 位也有用途。
 
     // ---- AXI 侧寄存器 ---------------------------------------------------
     reg              aw_v, w_v, b_v;
@@ -190,7 +218,7 @@ module vision_axi #(
     // 把 cfg_addr 借过去，不另外在本地再数一份帧计数（两份计数迟早会漂）。
     wire rd_cycle  = (ar_v || r_v);
     wire rd_conf   = rd_cycle && (ar_a < ADDR_CONFIG + 12'h080);   // 0x000..0x07F
-    wire rd_status = rd_cycle && (ar_a == ADDR_CTRL);
+    wire rd_status = rd_cycle && (ar_word == W_CTRL);
     assign cfg_addr = rd_conf   ? {1'b0, ar_a[6:2]}
                     : rd_status ? 6'd31                  // CFG_STATUS
                     :             reg_addr;
@@ -242,9 +270,11 @@ module vision_axi #(
     // 几何帧窗口：一次给一个字（4 字节，小端）。
     // 下标直接用地址位段 a[FW_BITS+1:2] 减去窗口起始字号：正好 FW_BITS 位，
     // 既满足数组下标位宽，也不需要把 12 位地址整个塞进一个窄变量。
-    function [31:0] frame_word(input [FW_BITS+1:2] a_word);
+    // 参数是**帧内字号**（不是绝对字地址）：这样调用处写 `ar_word - W_FRAME`，
+    // 不必对一个 10 位的字地址做 [FW_BITS+1:2] 这种越界位选（-Wall 会报 SELRANGE）。
+    function [31:0] frame_word(input [FW_BITS-1:0] widx);
         begin
-            frame_word = frame_mem[a_word - FRAME_W0];
+            frame_word = frame_mem[widx];
         end
     endfunction
 
@@ -278,16 +308,16 @@ module vision_axi #(
                     reg_addr  <= {1'b0, aw_a[6:2]};
                     reg_wdata <= w_d;
                     reg_strb  <= w_s;
-                end else case (aw_a)
-                    ADDR_DBG: begin
+                end else case (aw_word)
+                    W_DBG: begin
                         dbg_sel <= w_masked[3:0];
                         dbg_idx <= w_masked[21:4];
                         dbg_sub <= w_masked[25:22];
                     end
-                    ADDR_CTRL:   if (w_masked[0]) start_pulse <= 1'b1;
-                    ADDR_SEQ:    cfg_seq_r          <= wstrb_merge(cfg_seq_r, w_d, w_s);
-                    ADDR_STAMP0: cfg_stamp_r[31:0]  <= wstrb_merge(cfg_stamp_r[31:0],  w_d, w_s);
-                    ADDR_STAMP1: cfg_stamp_r[63:32] <= wstrb_merge(cfg_stamp_r[63:32], w_d, w_s);
+                    W_CTRL:   if (w_masked[0]) start_pulse <= 1'b1;
+                    W_SEQ:    cfg_seq_r          <= wstrb_merge(cfg_seq_r, w_d, w_s);
+                    W_STAMP0: cfg_stamp_r[31:0]  <= wstrb_merge(cfg_stamp_r[31:0],  w_d, w_s);
+                    W_STAMP1: cfg_stamp_r[63:32] <= wstrb_merge(cfg_stamp_r[63:32], w_d, w_s);
                     default: ;                     // 未映射地址：忽略
                 endcase
             end else if (b_v && s_bready) begin
@@ -301,16 +331,17 @@ module vision_axi #(
             end else if (ar_commit) begin
                 ar_v <= 1'b0; r_v <= 1'b1;
                 if (ar_a < ADDR_CONFIG + 12'h080)   rdata_q <= cfg_rdata;
-                else case (ar_a)
-                    ADDR_DBGDAT: rdata_q <= dbg_data;
-                    ADDR_CTRL:   rdata_q <= ctrl_rd;
-                    ADDR_FLEN:   rdata_q <= {{(32-FB_BITS-1){1'b0}}, frame_len};
-                    ADDR_SEQ:    rdata_q <= cfg_seq_r;
-                    ADDR_STAMP0: rdata_q <= cfg_stamp_r[31:0];
-                    ADDR_STAMP1: rdata_q <= cfg_stamp_r[63:32];
-                    default:     rdata_q <= (ar_a >= ADDR_FRAME &&
-                                             ar_a <  ADDR_FRAME_END)
-                                            ? frame_word(ar_a[FW_BITS+1:2]) : 32'd0;
+                else case (ar_word)
+                    W_DBGDAT: rdata_q <= dbg_data;
+                    W_CTRL:   rdata_q <= ctrl_rd;
+                    W_FLEN:   rdata_q <= {{(32-FB_BITS-1){1'b0}}, frame_len};
+                    W_SEQ:    rdata_q <= cfg_seq_r;
+                    W_STAMP0: rdata_q <= cfg_stamp_r[31:0];
+                    W_STAMP1: rdata_q <= cfg_stamp_r[63:32];
+                    default:  rdata_q <= (ar_word >= W_FRAME &&
+                                          ar_word <  W_FRAME_END)
+                                         ? frame_word(ar_word[FW_BITS-1:0]
+                                                      - W_FRAME[FW_BITS-1:0]) : 32'd0;
                 endcase
             end else if (r_v && s_rready) begin
                 r_v <= 1'b0;

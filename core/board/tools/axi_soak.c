@@ -71,6 +71,8 @@
 #define FRAME_MAX  2048
 
 #define EXP_LEN 184
+/* 同 read_frame.c：这是帧**内嵌**的 CRC 字段（最后 4 字节小端），不是对整帧
+ * 再算的 CRC32。见 cosim/tb_tpg.cpp 里提取期望常数的写法。 */
 static const uint32_t EXP_CRC[8] = {
     0xA9670ED9u, 0x621801BEu, 0x1EEBDE91u, 0x0BC5C6CAu,
     0x76D2BFA9u, 0xC71A351Au, 0xA5440B40u, 0xAEC7F26Eu,
@@ -326,6 +328,25 @@ int main(int argc, char **argv)
         w32(OFF_STAMP1, 0x55667788u);
         *(volatile uint8_t *)(M + OFF_STAMP1 + 3) = 0xAA;
         expect("STAMP1 lane3 字节", r32(OFF_STAMP1), 0xAA667788u, OFF_STAMP1);
+
+        // ⚠ 窄**读**：地址不对齐时也必须命中同一个字。
+        //   2026-10-15 上板暴露：RTL 的读侧也是 `case (ar_a)` 拿**字节地址**比
+        //   字对齐常量，所以读 0x0C5 会掉进 default 返回 0，而不是 SEQ 的值。
+        //   写侧修了之后读侧同样要修 —— 这里就是那一半的判据。
+        //   （读本身不改状态，但它证明了"窄写测试里的读回"走的是同一条路。）
+        {
+            uint32_t seqv = 0x5A5A1234u, got = 0;
+            w32(OFF_SEQ, seqv);
+            for (int lane = 0; lane < 4; lane++) {
+                got = r32(OFF_SEQ + (uint32_t)lane);
+                char nm[64];
+                snprintf(nm, sizeof(nm), "窄读 SEQ +%d 字节", lane);
+                expect(nm, got, seqv, OFF_SEQ);
+            }
+            uint32_t st0 = 0x13572468u;
+            w32(OFF_STAMP0, st0);
+            expect("窄读 STAMP0 +3 字节", r32(OFF_STAMP0 + 3), st0, OFF_STAMP0);
+        }
     }
 
     /* ---------------- E 复原 ---------------- */
@@ -365,13 +386,17 @@ int main(int argc, char **argv)
             uint32_t len = r32(OFF_FLEN);
             if (len == 0 || len > FRAME_MAX) { printf("  帧 %d: flen=%u 异常\n", f, len); bad++; continue; }
             memcpy(buf, (const void *)(M + OFF_FRAME), len);
-            uint32_t crc = crc32(buf, len);
+            uint32_t emb = (uint32_t)buf[len - 4]
+                         | ((uint32_t)buf[len - 3] << 8)
+                         | ((uint32_t)buf[len - 2] << 16)
+                         | ((uint32_t)buf[len - 1] << 24);
+            uint32_t self_crc = crc32(buf, (size_t)(len - 4));
             int pat = -1;
             for (int i = 0; i < 8; i++)
-                if (len == EXP_LEN && crc == EXP_CRC[i]) { pat = i; break; }
+                if (len == EXP_LEN && emb == EXP_CRC[i]) { pat = i; break; }
             if (pat >= 0) { ok++; hit[pat]++; } else { bad++; }
-            printf("  帧 %2d: len=%4u crc=0x%08X %s\n", f, len, crc,
-                   pat >= 0 ? "✓" : "✗ **不符**");
+            printf("  帧 %2d: len=%4u 内嵌crc=0x%08X 自洽%s %s\n", f, len, emb,
+                   (self_crc == emb) ? "✓" : "✗", pat >= 0 ? "✓" : "✗ **不符**");
         }
         printf("  端到端：一致 %d/%d，不符 %d；图案分布", ok, nframes, bad);
         for (int i = 0; i < 8; i++) printf(" [%d]=%d", i, hit[i]);

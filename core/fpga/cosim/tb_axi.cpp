@@ -129,6 +129,23 @@ static bool axi_write(uint32_t addr, uint32_t data)
     return axi_write_s(addr, data, 0xF);
 }
 
+//: 模拟真实主控的**窄写**：地址**不对齐**（带上字节通道偏移），选通位随之落在
+//  对应通道上。这正是 Zynq GP 口对 `*(volatile uint8_t*)p` / `*(volatile
+//  uint16_t*)p` 的作法 —— AWADDR 就是那个字节地址，WSTRB 只有对应那几位。
+//
+//  ⚠ **这是第三个"测试台把主控理想化"的盲区**（前两个：AW/W 同拍、只发 0xF）。
+//    `axi_write_s(A_SEQ, 0x0000BB00, 0x2)` 发的是"**字对齐**地址 + 选通掩码"，
+//    那也是合法的 AXI 行为（稀疏写），RTL 处理得了；但真实主控对 0x0C5 做的
+//    字节写发的是 `AWADDR=0x0C5, WSTRB=0x2` —— 地址不对齐。
+//    旧 RTL 用 `case (aw_a)` 拿完整字节地址比字对齐常量，0x0C5 比不中就掉进
+//    `default` 被静默丢弃。**协同仿真全绿、真硅上却挂**，就是这么来的。
+//    两种合法行为都要覆盖，所以窄写和上面的稀疏写各测一遍。
+static bool axi_write_narrow(uint32_t byte_addr, uint32_t data, int nbytes)
+{
+    uint32_t strb = (((1u << nbytes) - 1u) << (byte_addr & 3u)) & 0xFu;
+    return axi_write_s(byte_addr, data, strb);
+}
+
 static bool axi_read(uint32_t addr, uint32_t *out)
 {
     top->s_araddr  = addr; top->s_arvalid = 1; top->s_rready = 1;
@@ -242,9 +259,14 @@ int main(int argc, char **argv)
         const char    *LANE_NAME[6] = { "lane0 字节", "lane1 字节", "lane2 字节",
                                         "lane3 字节", "低半字",   "高半字" };
 
-        uint32_t save_area = 0, save_seq = 0;
+        // ⚠ SEQ/STAMP0/STAMP1 **都会进帧头**（SEQ 在字节 8..11，stamp 在 24..31），
+        //   所以压完必须复原 —— 否则每帧会有 8 字节对不上，报一堆莫名其妙的"不符"。
+        //   （第一版就漏了 STAMP0，被帧比对当场抓出 256/2560 项不符。）
+        uint32_t save_area = 0, save_seq = 0, save_st0 = 0, save_st1 = 0;
         CHECK(axi_read(A_CFG_P_MIN_AREA, &save_area), "选通自检：预读 P_MIN_AREA 超时");
         CHECK(axi_read(A_SEQ, &save_seq), "选通自检：预读 SEQ 超时");
+        CHECK(axi_read(A_STAMP0, &save_st0), "选通自检：预读 STAMP0 超时");
+        CHECK(axi_read(A_STAMP1, &save_st1), "选通自检：预读 STAMP1 超时");
 
         // ① 32 位配置寄存器：逐字节 / 逐半字，四种 strb 掩码全覆盖
         uint32_t acc = 0x11223344u;
@@ -266,11 +288,66 @@ int main(int argc, char **argv)
         acc = merge(acc, 0x0000BB00u, 0x2u);
         CHECK(axi_read(A_SEQ, &v) && v == acc, "选通自检：SEQ lane1 读回不符");
 
+        // ③ 窄写（**地址不对齐**）：真实主控对 *(volatile uint8_t/uint16_t*) 的作法。
+        //    旧 RTL 只认 lane0（case(aw_a) 拿字节地址比对齐常量），这一步就是判据。
+        const uint32_t OFF[2] = { A_CFG_P_MIN_AREA, A_SEQ };
+        const char    *NM[2]  = { "P_MIN_AREA(配置块)", "SEQ(就地合并)" };
+        for (int k = 0; k < 2; k++) {
+            uint32_t off = OFF[k];
+            uint32_t acc2 = 0x11223344u;
+            CHECK(axi_write(off, acc2), "窄写基准整字写超时");
+            for (int lane = 0; lane < 4; lane++) {
+                uint32_t d = (uint32_t)(0xB0u + lane) << (8 * lane);
+                CHECK(axi_write_narrow(off + (uint32_t)lane, d, 1), "窄写(字节)超时");
+                acc2 = merge(acc2, d, 1u << lane);
+                char nm[64];
+                snprintf(nm, sizeof(nm), "窄写 %s +%d 字节读回不符", NM[k], lane);
+                CHECK(axi_read(off, &v) && v == acc2, nm);
+            }
+            {   // 低半字（地址对齐到 +0，WSTRB=0x3）
+                uint32_t d = 0x0000CAFEu;
+                CHECK(axi_write_narrow(off, d, 2), "窄写(低半字)超时");
+                acc2 = merge(acc2, d, 0x3u);
+                char nm[64]; snprintf(nm, sizeof(nm), "窄写 %s 低半字读回不符", NM[k]);
+                CHECK(axi_read(off, &v) && v == acc2, nm);
+            }
+            {   // 高半字（地址 +2，WSTRB=0xC）
+                uint32_t d = 0xFEED0000u;
+                CHECK(axi_write_narrow(off + 2, d, 2), "窄写(高半字)超时");
+                acc2 = merge(acc2, d, 0xCu);
+                char nm[64]; snprintf(nm, sizeof(nm), "窄写 %s 高半字读回不符", NM[k]);
+                CHECK(axi_read(off, &v) && v == acc2, nm);
+            }
+            uint32_t fin = 0; axi_read(off, &fin);
+            printf("    %-20s 窄写末值 0x%08X（期望 0x%08X）%s\n", NM[k], fin, acc2,
+                   fin == acc2 ? " ✓" : " ✗");
+        }
+
+        // ④ 窄**读**：地址不对齐时也必须命中同一个字。
+        //    旧 RTL 的读侧 `case (ar_a)` 同样拿字节地址比 —— 读 0x0C5 会掉进
+        //    default 返回 0，而不是 SEQ 的值。
+        {
+            uint32_t seqv = 0x5A5A1234u;
+            CHECK(axi_write(A_SEQ, seqv), "窄读基准写超时");
+            for (int lane = 0; lane < 4; lane++) {
+                char nm[64];
+                snprintf(nm, sizeof(nm), "窄读 SEQ +%d 字节", lane);
+                CHECK(axi_read(A_SEQ + (uint32_t)lane, &v) && v == seqv, nm);
+            }
+            uint32_t st0 = 0x13572468u;
+            CHECK(axi_write(A_STAMP0, st0), "窄读基准写 STAMP0 超时");
+            CHECK(axi_read(A_STAMP0 + 3, &v) && v == st0, "窄读 STAMP0 +3 字节");
+        }
+
         // ③ 复原，免得影响后面的参数写与帧比对
         CHECK(axi_write(A_CFG_P_MIN_AREA, save_area), "选通自检：恢复 P_MIN_AREA 超时");
         CHECK(axi_write(A_SEQ, save_seq), "选通自检：恢复 SEQ 超时");
+        CHECK(axi_write(A_STAMP0, save_st0), "选通自检：恢复 STAMP0 超时");
+        CHECK(axi_write(A_STAMP1, save_st1), "选通自检：恢复 STAMP1 超时");
         CHECK(axi_read(A_CFG_P_MIN_AREA, &v) && v == save_area, "选通自检：恢复 P_MIN_AREA 不符");
         CHECK(axi_read(A_SEQ, &v) && v == save_seq, "选通自检：恢复 SEQ 不符");
+        CHECK(axi_read(A_STAMP0, &v) && v == save_st0, "选通自检：恢复 STAMP0 不符");
+        CHECK(axi_read(A_STAMP1, &v) && v == save_st1, "选通自检：恢复 STAMP1 不符");
     }
 
     // ---- 1) 配置寄存器：写进去再读回来 --------------------------------
