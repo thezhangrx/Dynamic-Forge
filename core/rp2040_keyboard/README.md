@@ -48,11 +48,14 @@ UDP 换掉的是**线**，不是**键盘**。键盘这个角色要不要硬件�
 # ① 注入这条路通不通？（起一次 PowerShell 注入器，不按任何键）
 python3 core/rp2040_keyboard/pc_key_driver.py --probe
 
-# ② 平台收不收？跑起来后有 3 秒把平台窗口点成焦点，看角色动不动
-python3 core/rp2040_keyboard/pc_key_driver.py --press 3 --arm --delay-s 3 --hold-ms 300
+# ② 平台收不收？四个方向依次按一遍（跑起来后有 5 秒把平台窗口点成焦点）
+python3 core/rp2040_keyboard/pc_key_driver.py --press 1,2,3,4 --arm --delay-s 5
+#    平台用 WASD 就换成 --keys wasd；先去掉 --arm 干跑一遍看键位对不对
 ```
 
-②按一下就退出，不会把键卡住。**角色动了 = C 路可行，RP2040 不用买。**
+②跑完就退出，不会把键卡住。一次运行能同时回答两件事：
+**有方向动了 = 平台收合成按键（RP2040 不用买）**；动的方向和你按的不一样 =
+换一套键位（`--keys wasd` / `--keys arrows`）再试；完全不动 = 平台走原始输入。
 
 ### 跑闭环
 

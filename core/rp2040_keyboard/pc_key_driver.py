@@ -33,9 +33,10 @@
     # 2) 真注入（会往当前焦点窗口按键！先把平台窗口点出来）
     python3 pc_key_driver.py --console /dev/ttyUSB0 --arm
 
-    # 3) 平台到底收不收合成按键？单发一次，倒计时留出点窗口的时间：
-    #    跑起来后 3 秒内把平台窗口点成焦点，看角色动不动
-    python3 pc_key_driver.py --press 3 --arm --delay-s 3 --hold-ms 300
+    # 3) 平台到底收不收合成按键？四个方向依次按一遍，倒计时留出点窗口的时间：
+    #    跑起来后 5 秒内把平台窗口点成焦点，看角色动不动、动的是不是那个方向
+    python3 pc_key_driver.py --press 1,2,3,4 --arm --delay-s 5
+    # 平台用 WASD 就把 --keys wasd 加上；先去掉 --arm 干跑一遍确认键位
 
     # 4) 零接线：板子用 --keyboard-dev udp://<本机IP>:9999 直发，这里收 UDP
     python3 pc_key_driver.py --udp 9999 --arm
@@ -54,7 +55,8 @@
     python3 pc_key_driver.py --console /dev/ttyUSB0 --arm --keys wasd
 
 `--press` 是判定"平台收不收合成输入"的唯一可靠办法：**一次按键、你能亲眼看到**，
-比看日志猜强。它按一下就退出，不会把键卡住。
+比看日志猜强。给一串动作号（`--press 1,2,3,4`）它会把四个方向依次按一遍，
+一次运行就同时回答"收不收"和"键位对不对"。按完就退出，不会把键卡住。
 
 ⚠ **控制台同一时刻只能被一个程序读**：跑这个脚本时别再开着 MobaXterm 读 COM3。
 ⚠ `--arm` 会真的按键。先把平台窗口点成焦点，别让按键打进编辑器里。
@@ -169,58 +171,77 @@ def probe() -> int:
     except Exception:
         inj.kill()
     print("✓ PowerShell 注入器可用 —— 合成按键这条路是通的")
-    print("  下一步：平台窗口点出来，然后 --press 3 --arm --delay-s 3")
+    print("  下一步：平台窗口点出来，然后 --press 1,2,3,4 --arm --delay-s 5")
     return 0
 
 
-def press_once(action: int, keymap: str, delay_s: float, hold_ms: int,
-               arm: bool) -> int:
-    """单发一个动作（按住 → 松开），用来肉眼判定平台收不收合成按键。"""
-    if not 0 <= action < len(DISCRETE_ACTION_NAMES):
-        print(f"动作号 {action} 越界（协议只有 0..{len(DISCRETE_ACTION_NAMES) - 1}）")
-        return 2
-    want = keys_for_action(action, keymap)
-    if not want:
-        # 动作 0 是 stay —— 合法，但它本来就不按键，拿它测"平台收不收"没有意义
-        print(f"动作 {action}（{DISCRETE_ACTION_NAMES[action]}）不按任何键，"
-              f"换 1..{len(DISCRETE_ACTION_NAMES) - 1} 里的一个来测")
-        return 2
+def press_sequence(actions: list[int], keymap: str, delay_s: float, hold_ms: int,
+                   gap_ms: int, arm: bool) -> int:
+    """依次单发几个动作（按住 → 松开 → 间隔），用来肉眼判定平台收不收合成按键。
+
+    为什么要能"依次发几个"：一次运行就能回答两个问题 ——
+    ① 平台到底收不收合成按键（有一个方向动了就是收）；② 这套键位对不对
+    （四个方向都试，动的是不是你按的那个）。单发一个的话，得跑好几轮才知道。
+    """
+    names = []
+    for a in actions:
+        if not 0 <= a < len(DISCRETE_ACTION_NAMES):
+            print(f"动作号 {a} 越界（协议只有 0..{len(DISCRETE_ACTION_NAMES) - 1}）")
+            return 2
+        if not keys_for_action(a, keymap):
+            # 动作 0 是 stay —— 合法，但它本来就不按键，拿它测"平台收不收"没意义
+            print(f"动作 {a}（{DISCRETE_ACTION_NAMES[a]}）不按任何键，"
+                  f"换 1..{len(DISCRETE_ACTION_NAMES) - 1} 里的来测")
+            return 2
+        names.append(DISCRETE_ACTION_NAMES[a])
+
     inj = None
     if arm:
         try:
             inj = _spawn_injector(quiet=True)
         except FileNotFoundError:
             sys.exit("找不到 powershell.exe —— 这个脚本要在 WSL 里跑（Windows 互操作）")
-        time.sleep(1.0)
+        time.sleep(1.0)                  # 等 Add-Type 编完
         if inj.poll() is not None:
             err = inj.stderr.read() if inj.stderr else ""
             sys.exit(f"注入器起不来：\n{err}")
-    print(f"动作 {action}（{DISCRETE_ACTION_NAMES[action]}）→ 按住 {want} "
-          f"{hold_ms} ms，{delay_s:g} 秒后开始"
-          f"{'' if arm else '  [干跑，加 --arm 才真的按]'}")
+
+    print(f"键位 {keymap}  依次按 {actions}（{', '.join(names)}）"
+          f"  每个按住 {hold_ms} ms、间隔 {gap_ms} ms"
+          f"{'' if arm else '  [干跑，加 --arm 才真的按]'}", flush=True)
     if delay_s > 0:
-        print("  现在把平台窗口点成焦点 …", flush=True)
+        print(f"  {delay_s:g} 秒后开始，现在把平台窗口点成焦点 …", flush=True)
         time.sleep(delay_s)
+
+    def lines(press: list[int], release: list[int]) -> None:
+        if inj is None:
+            return
+        for k in press:
+            inj.stdin.write(f"DN {k}\n"); inj.stdin.flush()
+        for k in release:
+            inj.stdin.write(f"UP {k}\n"); inj.stdin.flush()
+
     try:
-        if inj:
-            for k in want:
-                inj.stdin.write(f"DN {k}\n"); inj.stdin.flush()
-        print("  ↓ 按住", flush=True)
-        time.sleep(max(0, hold_ms) / 1000.0)
-        if inj:
-            for k in want:
-                inj.stdin.write(f"UP {k}\n"); inj.stdin.flush()
-        print("  ↑ 松开", flush=True)
+        for idx, a in enumerate(actions, 1):
+            want = keys_for_action(a, keymap)
+            print(f"  [{idx}/{len(actions)}] 动作 {a}（{DISCRETE_ACTION_NAMES[a]}）"
+                  f" → 按住 {list(want)}", flush=True)
+            lines(list(want), [])
+            time.sleep(max(0, hold_ms) / 1000.0)
+            lines([], list(want))
+            if idx < len(actions) and gap_ms > 0:
+                time.sleep(gap_ms / 1000.0)
     finally:
-        if inj:
+        if inj is not None:
             try:
                 inj.stdin.write("ALLUP\nQUIT\n"); inj.stdin.flush()
                 inj.wait(timeout=3)
             except Exception:
                 inj.kill()
     if arm:
-        print("  看到了吗？角色动了 → 平台收合成按键，RP2040 不用买了。")
-        print("  没动 → 平台多半走原始输入，去走 RP2040 那条路（README 路径 A/B）。")
+        print("  逐个看：有方向动了 → 平台收合成按键，RP2040 不用买了；")
+        print("  动了但不是你按的那个方向 → 换一套键位（--keys wasd / --keys arrows）再试；")
+        print("  完全不动 → 平台多半走原始输入，回去做 RP2040（README 路径 A/B）。")
     return 0
 
 
@@ -243,18 +264,28 @@ def main() -> int:
                     help="断流多久就全松（默认 500ms，与 code.py 一致）")
     ap.add_argument("--probe", action="store_true",
                     help="只检查注入器能不能起来（不按键、不用板子），然后退出")
-    ap.add_argument("--press", type=int, metavar="ACTION",
-                    help="单发一个动作号后退出（配合 --delay-s 用来判定平台收不收合成按键）")
+    ap.add_argument("--press", metavar="ACTION[,ACTION...]",
+                    help="依次发这些动作号后退出（如 --press 1,2,3,4 四个方向都试一遍）；"
+                         "配合 --delay-s/--hold-ms/--gap-ms 用来判定平台收不收合成按键")
     ap.add_argument("--delay-s", type=float, default=3.0,
                     help="--press 前留多少秒给你点平台窗口（默认 3）")
     ap.add_argument("--hold-ms", type=int, default=300,
-                    help="--press 按住多久（默认 300ms）")
+                    help="--press 每个动作按住多久（默认 300ms）")
+    ap.add_argument("--gap-ms", type=int, default=400,
+                    help="--press 相邻两个动作之间隔多久（默认 400ms）")
     args = ap.parse_args()
 
     if args.probe:
         return probe()
     if args.press is not None:
-        return press_once(args.press, args.keys, args.delay_s, args.hold_ms, args.arm)
+        try:
+            acts = [int(t) for t in args.press.replace(",", " ").split()]
+        except ValueError:
+            ap.error(f"--press 只接受动作号（逗号或空格分隔），拿到 {args.press!r}")
+        if not acts:
+            ap.error("--press 后面要跟至少一个动作号")
+        return press_sequence(acts, args.keys, args.delay_s, args.hold_ms,
+                              args.gap_ms, args.arm)
     n_src = sum([bool(args.console), args.udp is not None, args.stdin])
     if n_src == 0:
         ap.error("要么给 --console / --udp / --stdin，要么用 --probe / --press 自检")

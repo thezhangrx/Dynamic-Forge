@@ -177,16 +177,34 @@ def test_source_is_required_and_exclusive() -> None:
 def test_press_rejects_out_of_range_and_stay() -> None:
     """`--press` 是判定"平台收不收合成按键"的手段，越界和 stay 都测不出东西。"""
     assert _run("--press", "99", "--delay-s", "0").returncode == 2
+    assert _run("--press", "1,99", "--delay-s", "0").returncode == 2, "序列里有一个越界就该整体拒绝"
     r = _run("--press", "0", "--delay-s", "0")
     assert r.returncode == 2 and "不按任何键" in r.stdout
+    assert _run("--press", "1,x", "--delay-s", "0").returncode == 2
+    assert _run("--press", "", "--delay-s", "0").returncode == 2
+    # 逗号和空格都认（命令行里手写更顺）
+    assert _run("--press", "1 2", "--delay-s", "0", "--hold-ms", "10").returncode == 0
 
 
-def test_press_dry_run_prints_both_edges() -> None:
-    """干跑也必须把"按住/松开"两个边都打出来，否则看不出会不会卡键。"""
+def test_press_dry_run_lists_every_action_and_defaults_to_dry_run() -> None:
+    """干跑要把每个动作和它要按的键列出来；默认绝不能真按键。"""
     r = _run("--press", "3", "--delay-s", "0", "--hold-ms", "50")
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "按住" in r.stdout and "松开" in r.stdout
+    assert "动作 3（up）" in r.stdout and "按住 [38]" in r.stdout, r.stdout
     assert "干跑" in r.stdout, "默认必须是干跑，不能真按键"
+
+
+def test_press_sequence_covers_four_directions() -> None:
+    """一次跑完四个方向：这样才能一次运行同时判定"收不收"和"键位对不对"。"""
+    r = _run("--press", "1,2,3,4", "--delay-s", "0", "--hold-ms", "10", "--gap-ms", "10")
+    assert r.returncode == 0, r.stdout + r.stderr
+    for i, name in enumerate(("left", "right", "up", "down"), 1):
+        assert f"[{i}/4] 动作 {i}（{name}）" in r.stdout, r.stdout
+    for vk in drv.VK["arrows"].values():
+        assert f"按住 [{vk}]" in r.stdout, f"缺了键码 {vk}：\n{r.stdout}"
+    # WASD 那套只是换键码，方向语义一样
+    r2 = _run("--press", "1", "--keys", "wasd", "--delay-s", "0", "--hold-ms", "10")
+    assert "按住 [65]" in r2.stdout, r2.stdout      # A = 左
 
 
 def test_udp_source_matches_console_source() -> None:
