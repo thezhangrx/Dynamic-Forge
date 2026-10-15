@@ -145,6 +145,23 @@ ssh root@192.168.137.242 'cd /root/board_src && cmake -S core/board -B build && 
 `main.cpp` 只调 `open_reg_io(url)`，不认识任何具体后端，默认 `devmem://0x43C00000`。
 （icraft 目标仍在，`-DVISION_BOARD_WITH_ICRAFT=ON` 才编。）
 
+### 6.1.1 看启动日志（板子卡住时唯一的手段）
+
+控制台是板载 **CP210x，插在 Windows 上（COM3）**。WSL 里要读它得先 `usbipd
+attach`（要管理员），而且 attach 之后 Windows 那边就读不到了 —— 偏偏要看启动
+日志的场合，通常正是 WSL 连不上的时候。所以在 Windows 侧读：
+
+```bash
+bash core/board/tools/capture_boot.sh 180      # 抓 180 秒，自动存到 data/fpga/boot_logs/
+```
+
+⚠ **UART 没有回放缓冲**：要抓启动日志，必须**先开始抓、再上电**（或按复位），
+顺序反了就什么也拿不到 —— 这一点排查时最容易白折腾一轮。
+⚠ 一个串口同一时刻只能被一个程序打开：先关掉 MobaXterm / 串口助手。
+⚠ `win_console.ps1` 里 DTR/RTS 默认**不动**（有些板子把它们接到复位/BOOT 上），
+需要时再加 `-Dtr`。两个 `.ps1` 都必须是 **UTF-8 with BOM**：Windows PowerShell 5.1
+对没有 BOM 的脚本按系统 ANSI 代码页解码，中文注释会被解坏、把语法拆掉。
+
 ### 6.2 三条已经跑通的路
 
 | 路 | 命令 | 帧来源 | 用途 |

@@ -293,3 +293,36 @@ def test_no_bare_usleep_in_tools() -> None:
             if re.search(r"(?<![\w.])usleep\s*\(", code):
                 bad.append(f"{c_path.name}:{i}")
     assert not bad, f"这些地方还在用 usleep，改用 sleep_ms()：{bad}"
+
+
+# ---------------------------------------------------------------------------
+# Windows 侧的两个 .ps1：编码和顺序都是"错了就白折腾一轮"的坑
+# ---------------------------------------------------------------------------
+def test_windows_ps1_files_are_utf8_with_bom() -> None:
+    """两个 `.ps1` 都必须是 **UTF-8 with BOM**。
+
+    Windows PowerShell 5.1 对没有 BOM 的脚本按系统 ANSI 代码页（中文机 GBK）解码：
+    中文注释被解坏会把语法拆掉，症状是 `-File` 起来就 ParserError，而且只在注释
+    恰好解出引号类字符时才发作 —— 改一条注释就可能突然坏掉，极难查。
+    """
+    # win_sendinput.ps1 住在 core/rp2040_keyboard/（它是键盘链路的），不在 tools/
+    for path in (TOOLS / "win_console.ps1",
+                 ROOT / "core" / "rp2040_keyboard" / "win_sendinput.ps1"):
+        raw = path.read_bytes()
+        assert raw.startswith(b"\xef\xbb\xbf"), \
+            f"{path.name} 少了 UTF-8 BOM（PowerShell 5.1 会按 GBK 解坏中文注释）"
+        raw.decode("utf-8-sig")          # 必须是合法 UTF-8
+
+
+def test_capture_boot_warns_about_capture_before_power_on() -> None:
+    """抓启动日志必须**先开始抓、再上电**：UART 没有回放缓冲。
+
+    顺序反了会一个字都拿不到，而排查时最容易白折腾的就是这一轮。
+    """
+    sh = (TOOLS / "capture_boot.sh").read_text(encoding="utf-8")
+    assert "win_console.ps1" in sh, "capture_boot.sh 应当复用 Windows 侧读串口的脚本"
+    assert "没有回放缓冲" in sh, "必须写明 UART 没有回放缓冲"
+    assert "断电再上电" in sh or "上电**之前**" in sh, "必须给出正确的操作顺序"
+    assert "MobaXterm" in sh, "必须提醒先关掉别的串口程序（一个串口只能一个程序读）"
+    # 结果要落到 data/ 下（gitignore 的目录），别塞进仓库
+    assert "data/fpga/boot_logs" in sh, "日志应当写进 data/fpga/boot_logs/"
