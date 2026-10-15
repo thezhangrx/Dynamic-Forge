@@ -46,6 +46,7 @@ PIPE_H=${PIPE_H:-360}
 SKIP=${SKIP:-10}                 # 丢弃的热身帧（自动曝光收敛）
 APP=${APP:-/root/board_src/build/vision_board_devmem}
 CAM_RESET=${CAM_RESET:-0}        # 1 = 先做一次 USB 层复位
+FPS_PRIORITY=${FPS_PRIORITY:-0}  # 1 = 关掉"为长曝光降帧率"（画面会偏暗，慎用）
 USB_DEV=${USB_DEV:-1-1.3}
 
 # ---- 0) 可选：USB 层复位（设备卡在 busy 时用）-----------------------------
@@ -101,9 +102,21 @@ if [ -w "$MAXP" ]; then
     fi
 fi
 
-# ---- 2) 关掉"为长曝光降帧率"（14.6 → 25.3 帧/秒）--------------------------
-v4l2-ctl -d "$DEV" -c exposure_auto_priority=0 >/dev/null 2>&1 \
-    || echo "[cam_live] 警告：设 exposure_auto_priority 失败（帧率可能只有 ~14）" >&2
+# ---- 2) 曝光：**默认不动它** -------------------------------------------------
+#
+# `exposure_auto_priority=1`（驱动默认）允许为长曝光拖长曝光时间 —— 这会让画面
+# 曝光正确，但在**暗场景**下会降帧率。实测（MJPG 640x480，暗色界面）：
+#     不动它（=1）→ 画面平均 59→101（正常），交付 **44.3 帧/秒**
+#     强设 =0      → 画面平均 4（几乎全黑），交付 48.4 帧/秒
+# 也就是**这一档配置下它不影响帧率**（之前看到的 14.6 帧/秒是 YUYV 特有的，
+# 未压缩格式吃 USB 带宽）。所以默认保留自动曝光，别为了帧率把画面弄黑 ——
+# 视觉阈值是绝对阈值，图黑了整个算法就失效。
+#
+# 只有在**确实**需要压帧率抖动时（比如暗场景下 YUYV）才 FPS_PRIORITY=1。
+if [ "${FPS_PRIORITY:-0}" = "1" ]; then
+    v4l2-ctl -d "$DEV" -c exposure_auto_priority=0 >/dev/null 2>&1 \
+        && echo "[cam_live] FPS_PRIORITY=1：已关掉「为长曝光降帧率」（画面可能偏暗）" >&2
+fi
 
 # ---- 3) 一次开设备、连续出帧、原始 RGB 走管道 → 板子程序 -------------------
 if [ "$CAM_MODE" = "mjpg" ]; then
