@@ -19,7 +19,11 @@ from __future__ import annotations
 
 import pathlib
 import re
+import signal
+import socket
+import subprocess
 import sys
+import time
 
 import pytest
 
@@ -122,3 +126,60 @@ def test_code_py_parse_rules_match_relay() -> None:
     for needle in ("startswith(PREFIX)", "int(line[len(PREFIX):])",
                    "except ValueError", "0 <= n <= 8", 'partition(b"\\n")'):
         assert needle in src, f"code.py 的解析少了 {needle!r}（与 console_relay 分家了）"
+
+
+# ---------------------------------------------------------------------------
+# 真串口路径的端到端冒烟测试
+#
+# 只测纯解析函数是不够的：脚本的"打开串口 → 循环读 → 写第二个串口"这段
+# 也得真的跑过一遍。本环境没有可用 PTY，所以用 pyserial 的 `socket://`
+# 起一个假控制台 —— 顺带也证明了 `socket://` 这个用法可用
+# （板子控制台在另一台机器上时就靠它）。
+# ---------------------------------------------------------------------------
+def _python_with_pyserial() -> str | None:
+    for exe in (sys.executable, "python3"):
+        r = subprocess.run([exe, "-c", "import serial"], capture_output=True)
+        if r.returncode == 0:
+            return exe
+    return None
+
+
+def test_relay_end_to_end_over_socket_serial() -> None:
+    exe = _python_with_pyserial()
+    if exe is None:
+        pytest.skip("没有带 pyserial 的解释器")
+
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    srv.settimeout(10)
+
+    p = subprocess.Popen(
+        [exe, str(RP2040 / "console_relay.py"),
+         "--console", f"socket://127.0.0.1:{port}", "--dry-run"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        conn, _ = srv.accept()
+        time.sleep(0.5)
+        conn.sendall(b"[    2.67] ttyPS0 - failed to request DMA\r\n")  # 噪声
+        conn.sendall(b"root@U:~# ls\r\n")                              # 噪声
+        conn.sendall(b"@MOVE ")                                        # 故意切断
+        time.sleep(0.3)
+        conn.sendall(b"1\r\n@MOVE 7\r\n@MOVE 99\r\n@MOVE 0\r\n")       # 含越界
+        time.sleep(1.0)
+        p.send_signal(signal.SIGINT)
+        out, _ = p.communicate(timeout=10)
+        conn.close()
+    finally:
+        srv.close()
+        if p.poll() is None:
+            p.kill()
+
+    assert "→ b'@MOVE 1\\n'" in out, f"被切断的行没拼回来：\n{out}"
+    assert "→ b'@MOVE 7\\n'" in out, f"没转发 7：\n{out}"
+    assert "→ b'@MOVE 0\\n'" in out, f"没转发 0：\n{out}"
+    assert "99" not in out, f"越界的 99 不该被转发：\n{out}"
+    assert "failed to request DMA" not in out, f"内核日志不该被转发：\n{out}"
+    assert "转发 3 行后退出" in out, f"应当恰好转发 3 行：\n{out}"

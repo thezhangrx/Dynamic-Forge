@@ -74,11 +74,18 @@ def parse_moves(data: bytes, buf: bytearray) -> list[int]:
 
 
 def _open_serial(port: str, baud: int):
+    """打开一个串口。
+
+    用 `serial_for_url` 而不是 `Serial`：这样除了设备名（`/dev/ttyUSB0`、`COM3`）
+    还能用 URL 形式，比如 `socket://192.168.1.5:5000`（板子控制台在另一台机器上时）
+    或 `loop://`。**也让这条转发逻辑可以脱机冒烟测试** —— 本环境没有可用 PTY，
+    就用 `socket://` 起一个假控制台来验真串口这条路（不只是验纯解析函数）。
+    """
     try:
         import serial                    # pyserial
     except ImportError:
         sys.exit("需要 pyserial：pip install pyserial")
-    return serial.Serial(port, baud, timeout=0.05)
+    return serial.serial_for_url(port, baud, timeout=0.05)
 
 
 def main() -> int:

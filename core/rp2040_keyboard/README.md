@@ -72,6 +72,13 @@ python3 core/rp2040_keyboard/console_relay.py \
 GP1，也听 **USB CDC（`sys.stdin`）**，两条输入共用同一个解析器。
 两条都不用时把对应的开关关掉，省得两份输入互相干扰。
 
+串口地址用的是 pyserial 的 URL 形式，所以除了设备名还能跨机：
+
+```bash
+# 板子控制台在另一台机器上时
+python3 console_relay.py --console socket://192.168.1.5:5000 --rp2040 /dev/ttyACM0
+```
+
 > 选哪条：A 更"干净"（PC 不在控制环里，符合"板子当大脑"的形态），但要动板子；
 > B 立刻能跑、零风险。**先用 B 把整条链演一遍，再决定要不要做 A。**
 
