@@ -119,11 +119,60 @@ cmake --build build/board -j$(nproc)
   `v_n` 会退化成"只算车自己的速度"。真正的修法是 PS 侧按 stamp 差分出速度再填；
 * **场宽/场高/速度上限来自命令行**（视觉帧不带），首帧 `dt` 用 `--dt-default`。
 
+### 6.1 ⚠ 板上编，不用交叉编译（也不需要 icraft）
+
+**在板子上直接编** —— 板子自带 cmake 3.16.3 / g++ 9.4：
+
+```bash
+scp -r core/board core/cpu/cpp core/fpga/ref/vision_ref.c core/fpga/ref/ref_api.h root@192.168.137.242:/root/board_src/
+ssh root@192.168.137.242 'cd /root/board_src && cmake -S core/board -B build && cmake --build build -j4'
+```
+
+为什么不去链 icraft：
+* 我们这块 PL 的寄存器窗口是 **`0x43C00000`**，用 **`/dev/mem`** 就能读写
+  （`tools/` 里的 read_frame / axi_soak 已在真硅上验过读写两侧）；
+* icraft 的 `defaultRegRegion()` 是**另一个窗口**（`0x400C0000`，NPU 那边）；
+* 链 icraft 还要交叉编译 + 解 deb 做 sysroot。
+`vision_driver_devmem.cpp` + `vision_driver_factory.cpp` 就是这条后端；
+`main.cpp` 只调 `open_reg_io(url)`，不认识任何具体后端，默认 `devmem://0x43C00000`。
+（icraft 目标仍在，`-DVISION_BOARD_WITH_ICRAFT=ON` 才编。）
+
+### 6.2 三条已经跑通的路
+
+| 路 | 命令 | 帧来源 | 用途 |
+|---|---|---|---|
+| **PL** | `./vision_board_devmem --frames 8` | `tpg_source` → PL 流水 → AXI 窗口 | 项目目标路径；验 PL 加速 |
+| **PS 参照** | `--ppm-dir DIR` / `--ppm FILE` | PS 上跑 C 参考模型（黄金模型） | 真图；也是 PL 出问题时的参照 |
+| **键盘** | 默认就发（`--keyboard-dev /dev/ttyPS0`） | 决策 → 动作号 → `@MOVE <n>\n` | 给 RP2040 键盘桥 |
+
+三条可以任意组合：`--ppm FILE` 换掉帧来源，键盘那一段不变。
+决策/解码/键盘是**共用**的下游，所以"真图"和"PL 图"走的是同一条后处理。
+
+**真摄像头**（板子上已有 `v4l2-ctl` 与 `ffmpeg`，不用新写代码）：
+
+```bash
+# 1) 采一帧（USB UVC 摄像头插上后 /dev/video0 就是它）
+ffmpeg -f v4l2 -i /dev/video0 -frames:v 1 -pix_fmt rgb24 /root/cam.ppm
+# 2) 跑完整条：C 参考模型 → 几何帧 → 解码 → 决策 → 发动作
+./vision_board_devmem --ppm /root/cam.ppm --echo-action
+```
+
+> ⚠ `/dev/video0` 在**没插摄像头**时是 **Linlon 的 M2M 视频编解码器**
+> （`platform:mvx`，H.264/HEVC/VP8/VP9/JPEG，≤8192×8192），**不是相机输入** ——
+> 别把它当摄像头。`v4l2-ctl --list-devices` 能看出到底是哪个。
+
+键盘那两根线（RP2040 的 GP1 ← 板子控制台 TX、GND ← GND）见
+`core/rp2040_keyboard/README.md`。串口线上是**共享的控制台**，所以动作行带
+`@MOVE ` 前缀、RP2040 只挑带前缀的行。跑之前 `dmesg -n 1` 把内核日志压下去，
+线上会干净很多。
+
 ## 7. 还差什么
 
 | # | 缺的东西 | 说明 |
 |---|---|---|
-| 1 | ~~C++ 决策~~ | ✅ 已完成：`core/cpu/cpp/`，10 条交叉验证用例，见 `core/cpu/cpp/README.md` |
-| 2 | **像素从哪来** | 现在 `vision_axi` 的像素输入要外部喂。bring-up 可先用 `vision_tpg`（自检图案），真实相机要再加一层采集 |
-| 3 | **移动墙的速度** | 线协议不带速度，PS 侧要按 `stamp` 差分出来再填进 `Rect.vx/vy` |
-| 4 | **上板实测** | 本机只验到"驱动逻辑对 + 寄存器契约对 + 决策与 Python 逐位一致"；**基址、AXI 握手、真实时序都要上板才知道** |
+| 1 | ~~C++ 决策~~ | ✅ 已完成：`core/cpu/cpp/`，10 条交叉验证用例 |
+| 2 | ~~像素从哪来~~ | ✅ PL 侧用 `tpg_source` 已跑通；真图走 PS 参考模型也已跑通（`--ppm`） |
+| 3 | **PL 也吃真图** | 现在真图是 **PS 上跑黄金模型**。要让 PL 加速也吃真图，需要一条 PS→PL 像素通路：板子已有 `S_AXI_HP0..3`，可走 DDR + PL 侧 AXI master 读帧（或先把一帧写进 PL 的 BRAM）。**这是下一步的 RTL 工作** |
+| 4 | **移动墙的速度** | 线协议不带速度，PS 侧要按 `stamp` 差分出来再填进 `Rect.vx/vy` |
+| 5 | ~~上板实测~~ | ✅ 已完成（2026-10-15）：自检通过、8 帧全解码、决策 8 帧、**72～77 帧/秒**；键盘行串口实收。见 `core/fpga/docs/板上验证.md` §4/§6 |
+| 6 | **RP2040 那一端** | 板子侧已验（串口实收 `@MOVE n`）；RP2040 要刷 CircuitPython + 拷 `adafruit_hid` + 接两根线。见 `core/rp2040_keyboard/README.md` |
