@@ -162,9 +162,15 @@ bash core/board/tools/capture_boot.sh 180      # 抓 180 秒，自动存到 data
 需要时再加 `-Dtr`。两个 `.ps1` 都必须是 **UTF-8 with BOM**：Windows PowerShell 5.1
 对没有 BOM 的脚本按系统 ANSI 代码页解码，中文注释会被解坏、把语法拆掉。
 
-#### 板子卡住时：现状与接着查的步骤（交接笔记）
+#### 板子"卡住"时怎么查（结论：这次是假警报）
 
-**暂停时的现象**（板子掉电后一直没起来）：
+> **2026-10-16 已恢复，板子本身没坏。** 启动日志（`data/fpga/boot_logs/boot_20261016_070211.log`）
+> 显示：FSBL 4.51 → `BootMode Register 0x00000145`（**SD Boot Mode**）→ `Running on A53-0`
+> → 内核 → systemd → **8.8 秒**进多用户 → `U login:`；`PL: operating`、`pl-autoload: active`。
+> 之前"串口全静默 + 网络不通"只是因为**抓取没在上电那一刻开始**（UART 没有回放缓冲），
+> 空日志被误读成"板子什么都没打印"。**板子掉电后要先抓、再上电**，这条比什么都重要。
+
+**现象（掉电后未及时抓取时看到的）**：
 
 | 查什么 | 结果 | 说明 |
 |---|---|---|
@@ -173,7 +179,7 @@ bash core/board/tools/capture_boot.sh 180      # 抓 180 秒，自动存到 data
 | ARP `192.168.137.242` | **FAILED** | 系统没应答 |
 | 控制台 COM3 | 10 秒无输出 + 回车无响应 | 卡在控制台起来**之前** |
 
-**接着查就两步**（要人在机器前，远程做不了）：
+**查法就两步**（要人在机器前，远程做不了）：
 
 1. `bash core/board/tools/capture_boot.sh 600` —— **先**开始抓；
 2. 给板子**断电 3~5 秒再上电**（或按复位）。
@@ -197,6 +203,21 @@ bash core/board/tools/capture_boot.sh 180      # 抓 180 秒，自动存到 data
    （下一次抓取打不开端口，而报错又可能被缓冲住）。`capture_boot.sh` 现在有 `trap ... EXIT` 清它；
 4. **查进程时别把自己算进去**：过滤命令行含 `win_console` 的进程时，查询命令自身就匹配，
    要排除 `$PID`。
+
+#### ⚠ 同步代码后必须防"时钟偏移"骗过 make
+
+板子的时钟可能比文件 mtime 慢好几个月（这块板子实测慢 7 个月）。`tar`/`scp` 过来的
+源码带着"现在"的 mtime，而目标文件与旧可执行文件的 mtime 在**未来** —— make 于是认为
+"都是最新的"，**连链接都不做**，只打一句 `Clock skew detected. Your build may be incomplete`。
+症状极隐蔽：源码 md5 明明对上了，**二进制 md5 却和上一版一模一样**（我们真踩过一次，
+差点把没生效的改动当成"上板验证通过"）。
+
+```bash
+# 安全做法：先把板子时钟对齐 PC，再强制重建
+ssh root@板子 "date -s '$(date -u '+%Y-%m-%d %H:%M:%S')'"
+ssh root@板子 'cd /root/board_src/build && make -B -j4 vision_board_devmem'
+# 判定标准不是"make 成功"，而是 ① 二进制 md5 **变了** ② 新功能能自证（如 --help 里出现新开关）
+```
 
 ### 6.2 三条已经跑通的路
 
@@ -302,7 +323,11 @@ ffmpeg -f v4l2 -i /dev/video0 -frames:v 1 -pix_fmt rgb24 /root/cam.ppm
 | 1 | ~~C++ 决策~~ | ✅ 已完成：`core/cpu/cpp/`，10 条交叉验证用例 |
 | 2 | ~~像素从哪来~~ | ✅ PL 侧用 `tpg_source` 已跑通；真图走 PS 参考模型也已跑通（`--ppm`） |
 | 3 | ~~PL 也吃真图~~ | ✅ 已完成：PS 推像素 FIFO（`rtl/vision_pixfeed.v`）+ `--via-pl`；`tb_axi --fifo` 逐字节验过 |
-| 4 | ~~移动墙的速度~~ | ✅ 已完成：`core/cpu/cpp/motion.{hpp,cpp}`（`core/vision/motion.py` 的移植，逐帧对账）+ `decide()` 里填进 `player[P_VX/P_VY]` 与 `Rect.vx/vy`。真实素材实测（`run4/screen.mp4` 前 60 帧 @30fps）：加守卫前墙 max\|v\| 90% 位 50.6 / 最大 **67.3** → 加守卫后 15.3 / **15.9**（那段素材的真实运动就是 ~14.1，从原始位置量出来的）。⚠ **手持**录像（`run3/Camera.mp4`）同一算法给出中位 33.6 / 90% 57.2 —— 抖动主导，所以最终部署要固定机位。`--track-log FILE` 可落盘原始矩形+轨迹，用来分辨"真在动"和"框在抖" |
+| 4 | ~~移动墙的速度~~ | ✅ 已完成：`core/cpu/cpp/motion.{hpp,cpp}`（`core/vision/motion.py` 的移植，逐帧对账）+ `decide()` 里填进 `player[P_VX/P_VY]` 与 `Rect.vx/vy`。真实素材实测（`run4/screen.mp4` 前 60 帧 @30fps）：加守卫前墙 max\|v\| 90% 位 50.6 / 最大 **67.3** → 加守卫后 15.3 / **15.9**（那段素材的真实运动就是 ~14.1，从原始位置量出来的）。⚠ **手持**录像（`run3/Camera.mp4`）同一算法给出中位 33.6 / 90% 57.2 —— 抖动主导，所以最终部署要固定机位。
+
+**上板逐帧对账（2026-10-16，60 帧真实录屏）**：PC 参考模型、板子参考模型、板子**真 PL 通路**
+三者给出的坐标与速度 **228/228 个矩形逐位相同**（角色也相同），墙 max\|v\| 三侧同为
+中位 14.0 / 90% 15.3 / 最大 15.9。摄像头闭环 **19.4 帧/秒**（40 帧、0 失败，`@MOVE` 行实收）。`--track-log FILE` 可落盘原始矩形+轨迹，用来分辨"真在动"和"框在抖" |
 | 5 | ~~上板实测~~ | ✅ 已完成（2026-10-15）：自检通过、8 帧全解码、决策 8 帧、**72～77 帧/秒**；键盘行串口实收。见 `core/fpga/docs/板上验证.md` §4/§6 |
 | 6 | **RP2040 那一端** | 板子侧已验（串口实收 `@MOVE n`）；RP2040 要刷 CircuitPython + 拷 `adafruit_hid` + 接两根线。见 `core/rp2040_keyboard/README.md` |
 | 7 | ~~动作怎么送到 PC（零接线）~~ | ✅ 已完成：`--keyboard-dev stdout` + SSH 管道 + `pc_key_driver.py --stdin`，真机验过 |

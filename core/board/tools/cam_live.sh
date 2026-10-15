@@ -143,6 +143,19 @@ ffmpeg -hide_banner -loglevel error \
        -f v4l2 -input_format "$IN_FMT" -video_size "${CAM_W}x${CAM_H}" -i "$DEV" \
        -vf "$VF" -pix_fmt rgb24 -f rawvideo - \
   | "$APP" --stdin-rgb --skip-frames "$SKIP" "$@"
-rc=$?
-echo "[cam_live] 退出码 $rc（$([ $rc -eq 0 ] && echo 正常 || echo 失败/被打断)）"
-exit $rc
+# ⚠ 两个退出码要**分开看**：脚本上面开了 `set -o pipefail`，于是 ffmpeg 的
+#   "broken pipe" 会把整条管道判成失败 —— 但那恰恰是**正常收尾**：程序处理够
+#   `--frames N` 就不再读 stdin，ffmpeg 写不进去只好退出。以前这会报
+#   "退出码 1（失败/被打断）"，把正常跑完说成失败（很容易把人带偏）。
+# ⚠ 先把 PIPESTATUS 拷出来再取值：脚本上面有 `set -u`，直接写 `${PIPESTATUS[1]}`
+#   在某些 bash 上会判成"未绑定变量"而当场退出 —— 表现是"这行修复根本没打印"，
+#   因为错误信息通常被 2>/dev/null 吃掉了（这就是它第一次没生效的原因）。
+st=("${PIPESTATUS[@]}")
+rc_ff=${st[0]:-1}
+rc_app=${st[1]:-1}
+if [ "$rc_app" -eq 0 ]; then
+    echo "[cam_live] 程序正常结束（帧处理完毕）$([ "$rc_ff" -ne 0 ] && echo "；ffmpeg 因管道关闭退出，正常")"
+else
+    echo "[cam_live] 程序退出码 $rc_app（ffmpeg 退出码 $rc_ff）"
+fi
+exit "$rc_app"
