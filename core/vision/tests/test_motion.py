@@ -137,3 +137,148 @@ def test_default_gains_come_from_bytetrack_measurement():
     """默认增益不是拍脑袋：ByteTrack 实测 Kalman 增益与框高无关，可退化成常数。"""
     assert 0.5 < DEFAULT_ALPHA < 0.8
     assert 0.0 < DEFAULT_BETA < 0.2
+
+
+# --------------------------------------------------------------------------
+# 速度要能**贴回调用方自己的对象**上（矩形/检测框），不能只留在轨迹里
+#
+# 板子上的用处就是这件事：线协议带障碍的几何（id/x/y/半宽/半高/转角），
+# 但**不带速度**；PS 必须把推出来的速度填回这一帧的那些矩形上，决策才看得见。
+# 而轨迹 id 是跟踪器自己发的，和帧里的 id 不是一回事（帧里的 id 是当帧序号，
+# 见 vision_top.v 的 `seg_id[seg_k] <= n_obs + 1`），所以只能靠 det→track 的对应表。
+# --------------------------------------------------------------------------
+def test_last_assignment_aligns_with_returned_tracks():
+    frames, stamps = _uniform(0.30, -0.10)
+    tr = Tracker()
+    for pts, ts in zip(frames, stamps):
+        tracks = tr.update(pts, ts)
+        asg = tr.last_assignment
+        assert len(asg) == len(tracks), "对应表必须与返回的轨迹等长同序"
+        assert all(j == 0 for j in asg), "只有一条轨迹，它就应该对应唯一的检测"
+
+
+def test_last_assignment_is_none_for_extrapolated_track():
+    """目标丢了一帧：那条轨迹靠惯性外推 → 对应关系是 None（不是乱指一个检测）。"""
+    tr = Tracker()
+    tr.update([(0.0, 0.0)], 0.0)
+    tr.update([(0.1, 0.0)], 1.0 / 30)
+    tr.update([], 2.0 / 30)                       # 这一帧什么都没有
+    assert tr.last_assignment == [None], tr.last_assignment
+
+
+def test_velocity_lands_on_the_right_object():
+    """速度必须贴到**正确的那个矩形**上，而且是"匹配到它的那条轨迹"的速度。
+
+    这是这套接口存在的理由：贴错了不会报错，只会让决策以为"那面墙在朝我压过来"。
+    帧里的 id 是当帧序号（顺序会变），所以这里每帧把两个检测的顺序翻转，
+    逼着关联必须靠位置。
+    """
+    dt = 1.0 / 30
+    tr = Tracker()
+    n = 60
+    last = None
+    for k in range(n):
+        t = k * dt
+        left = (0.30 * t, 0.0)
+        right = (10.0 - 0.20 * t, 0.0)
+        dets = [left, right] if k % 2 == 0 else [right, left]   # 顺序每帧翻转
+        tracks = tr.update(dets, t)
+        asg = tr.last_assignment
+        assert len(asg) == len(tracks)
+
+        # ① 贴的是不是"匹配到它的那条轨迹"的值（逐帧精确对账，与收敛无关）
+        attached: list[float | None] = [None] * len(dets)
+        for trk, j in zip(tracks, asg):
+            if j is not None:
+                assert attached[j] is None, "一个检测不该被两条轨迹匹配"
+                attached[j] = trk.vx
+        for j, v in enumerate(attached):
+            if k == 0:
+                continue                    # 首帧没有历史 → 速度按设计为 0
+            assert v is not None, f"第 {k} 帧第 {j} 个检测没被任何轨迹认领"
+
+        # ② 符号从第 2 帧起就该对（关联错的话符号会立刻反）
+        if k >= 2:
+            for j, det in enumerate(dets):
+                want_sign = 1.0 if det is left else -1.0
+                assert attached[j] * want_sign > 0.0, (
+                    f"第 {k} 帧第 {j} 个检测的速度符号错了：{attached[j]}")
+        last = (dets, attached)
+
+    # ③ 跑到收敛：α-β 需要几十帧（≈1 秒），末帧速度要接近真值
+    dets, attached = last
+    for j, det in enumerate(dets):
+        want = 0.30 if det is left else -0.20
+        assert attached[j] == pytest.approx(want, abs=0.02), (
+            f"末帧第 {j} 个检测速度应为 {want}，得到 {attached[j]}")
+
+
+# --------------------------------------------------------------------------
+# 位置跳变不能变成速度（真实素材上量出来的那个坑）
+#
+# 实测（data/vision/run4/screen.mp4 前 60 帧，30fps）：带合并一变，段的**中心**
+# 单帧横移 24 px。那是"段变宽了"，不是"墙在横着飞"。关联门限 24 恰好放它进来，
+# 于是推出来的速度瞬间 -66 px/s，还要十几帧才衰减 —— 真实运动只有 15~30 px/s。
+# --------------------------------------------------------------------------
+def test_position_jump_does_not_become_velocity():
+    tr = Tracker()
+    # 前几帧静止（把速度收敛到 ~0）
+    for k in range(6):
+        tr.update([(100.0, 50.0)], k / 30.0)
+    assert tr.tracks[0].vx == pytest.approx(0.0, abs=1e-9)
+
+    # 第 7 帧：中心突然横移 24（=带合并），这是**门限之内**的
+    tracks = tr.update([(76.0, 50.0)], 6 / 30.0)
+    assert tracks[0].vx == 0.0, f"跳变不该变成速度，得到 vx={tracks[0].vx}"
+    assert tracks[0].x == pytest.approx(76.0), "位置还是要跟上（否则轨迹会越飘越远）"
+    assert tr.n_relocalized == 1
+
+    # 之后几帧仍在 76：速度继续保持 0，不会"复活"
+    for k in range(7, 12):
+        tracks = tr.update([(76.0, 50.0)], k / 30.0)
+    assert tracks[0].vx == 0.0
+    assert tr.n_relocalized == 1, "只有那一帧是跳变"
+
+
+def test_realistic_fast_motion_is_still_tracked():
+    """守卫不能把**真运动**也当成跳变：残差对匀速目标是小的（预测已吃掉速度）。"""
+    tr = Tracker()
+    for k in range(40):                      # 2 单位/帧 = 60 单位/s，比实测真实运动快
+        tr.update([(2.0 * k, 0.0)], k / 30.0)
+    last = tr.tracks[0]
+    assert last.vx == pytest.approx(60.0, abs=2.0), f"真运动被挡了：vx={last.vx}"
+    assert tr.n_relocalized == 0, "整段匀速不该触发守卫"
+
+
+def test_residual_threshold_sits_between_real_and_fake():
+    """8 这个取值要有依据：真实步长（~2/帧）远小于它，假跳变（24）远大于它。"""
+    assert Tracker().max_residual == 8.0
+
+
+def test_fast_target_still_acquires_velocity_after_confirm():
+    """步长**大于** ``max_residual`` 的真运动：连续可疑 → 改判 → 拿到速度。
+
+    这条是既有测试（``test_pipeline.py`` 的 10 单位/帧轨迹）逼出来的：
+    只写"残差超阈值就不更新速度"会让这种目标**永远**是 0 —— 位置看着还对，
+    速度静默错。所以必须有"连续可疑就改判"的计数器。
+    """
+    tr = Tracker(gate=100.0)
+    tracks = []
+    for k in range(20):
+        tracks = tr.update([(10.0 * k, 0.0)], k * 0.05)
+    assert tracks[0].speed > 0, f"10 单位/帧 的真运动不该永远拿不到速度：{tracks[0].speed}"
+    assert tr.n_relocalized >= 1, "第一帧应当先被判成可疑（然后改判）"
+
+
+def test_jump_does_not_corrupt_an_established_velocity():
+    """已经建立了速度之后遇到单帧跳变：位置落位，**速度保持**（不清零、不被改写）。"""
+    tr = Tracker(gate=100.0)
+    for k in range(20):
+        tr.update([(2.0 * k, 0.0)], k * 0.05)
+    v_before = tr.tracks[0].vx
+    assert v_before > 0, "先要有一个正经速度"
+
+    tracks = tr.update([(2.0 * 20 + 24.0, 0.0)], 20 * 0.05)     # 单帧横移 24
+    assert tracks[0].x == pytest.approx(2.0 * 20 + 24.0), "位置要落位"
+    assert tracks[0].vx == pytest.approx(v_before), \
+        f"单帧跳变不该改写已有速度：{v_before} → {tracks[0].vx}"

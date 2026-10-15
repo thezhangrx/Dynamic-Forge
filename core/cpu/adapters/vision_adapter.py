@@ -58,10 +58,15 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Optional, Sequence
 
 from cpu.gap_avoid import AlgoConfig, Decision, GapMemory, Rect, WorldView, plan
+
+#: 速度跟踪的参考实现住在 `core/vision/motion.py`（"任务二：从视频取速度"）。
+#: 它是**纯数学**（只 import math/dataclasses，不碰 cv2），所以这条依赖是安全的 ——
+#: 板子上跑的是它的 C++ 移植 `core/cpu/cpp/motion.cpp`，两者逐帧对账。
+from vision.motion import Tracker as _VelocityTracker
 
 #: 帧里的世界坐标系名。与 ``core/standard`` 的 ``DEFAULT_FRAME_ID`` 保持一致。
 DEFAULT_FRAME_ID = "field"
@@ -127,6 +132,15 @@ class VisionWorldConfig:
     #: 首帧没有上一帧可比，用这个 ``dt``（秒）。
     dt_default: float = 1.0 / 120.0
 
+    #: 用**跨帧跟踪**推出来的速度覆盖帧里的 ``vx/vy``（默认开）。
+    #:
+    #: 为什么默认开：真机上几何帧线协议里根本没有速度字段，而决策要用它算
+    #: "墙是不是在逼近"（``v_n = (v_wall - v_player)·n̂``）。不开的话真机上所有
+    #: 障碍都被当成静止的，与训练环境判据不一致。
+    #:
+    #: ⚠ 如果帧里**本来就带真速度**（比如从仿真直接拿观测），把它关掉 ——
+    #: 那才是真值，没必要再推一遍。
+
     #: ``player.speed`` 是"运动学速度上限"，视觉侧常常不知道 → 用这个兜底。
     #: 平台 ``ScenarioSpec.player_speed`` 默认 200.0。
     default_speed: float = 200.0
@@ -141,6 +155,8 @@ class VisionWorldConfig:
     #: ``calibration.H_field_from_image`` → 抛错（像素不是世界坐标）。
     #: 早期联调（世界单位就是像素）可显式关掉，但**要在日志里说明**。
     require_calibration: bool = True
+
+    track_velocity: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +426,35 @@ class VisionWorldStream:
     prev_frame: Any = None
     last_meta: Optional[VisionMeta] = None
     frames: int = 0
+    #: 速度跟踪器（线协议不带速度，只能自己推）：角色一个、障碍一个。
+    #: 与板子侧 `core/cpu/cpp/motion.cpp` 是同一份算法（交叉验证见
+    #: `core/cpu/tests/test_cpp_motion.py`）。
+    player_tracker: _VelocityTracker = field(default_factory=_VelocityTracker)
+    obstacle_tracker: _VelocityTracker = field(default_factory=_VelocityTracker)
+
+    def _attach_velocities(self, view: WorldView, frame: Any) -> WorldView:
+        """把跟踪推出来的速度贴到 ``player`` 与 ``rects`` 上（``Rect`` 是 frozen，重建）。
+
+        ``stamp`` 一律用**帧里那个采集时刻**，不用"本函数被调用的时刻"：
+        后者会把处理耗时算进 dt，速度就系统性偏小（``to_standard.py`` 里同一条纪律）。
+        """
+        stamp = float(_get(frame, "stamp", 0.0) or 0.0)
+
+        player = list(view.player)
+        if len(player) >= 4:
+            tracks = self.player_tracker.update([(player[0], player[1])], stamp)
+            if tracks:
+                player[2], player[3] = tracks[0].vx, tracks[0].vy
+
+        dets = [(r.x, r.y) for r in view.rects]
+        tracks = self.obstacle_tracker.update(dets, stamp)
+        vx = [0.0] * len(dets)
+        vy = [0.0] * len(dets)
+        for t, j in zip(tracks, self.obstacle_tracker.last_assignment):
+            if j is not None:
+                vx[j], vy[j] = t.vx, t.vy
+        rects = [replace(r, vx=vx[i], vy=vy[i]) for i, r in enumerate(view.rects)]
+        return replace(view, player=player, rects=rects)
 
     def step(self, frame: Any, *,
              cfg: Optional[AlgoConfig] = None,
@@ -417,6 +462,8 @@ class VisionWorldStream:
         """喂一帧，返回 ``(这一帧的 WorldView, 决策)``。"""
         view, meta = frame_to_worldview(frame, self.world_cfg,
                                         prev_frame=self.prev_frame)
+        if self.world_cfg.track_velocity:
+            view = self._attach_velocities(view, frame)
         dec = plan(view, self.memory, cfg or AlgoConfig(),
                    horizon_remaining=horizon_remaining)
         self.prev_frame = frame
@@ -425,8 +472,10 @@ class VisionWorldStream:
         return view, dec
 
     def reset(self) -> None:
-        """新一局/新一段视频时调用：记忆和上一帧都要清。"""
+        """新一局/新一段视频时调用：记忆、上一帧、速度跟踪都要清。"""
         self.memory = GapMemory()
         self.prev_frame = None
         self.last_meta = None
         self.frames = 0
+        self.player_tracker.reset()
+        self.obstacle_tracker.reset()

@@ -51,6 +51,14 @@ target_include_directories(gap_avoid PUBLIC "${GAP_AVOID_DIR}")
 # 于是 tier 会在判据边界上与 Python 分家。见 core/cpu/cpp/README.md。
 target_compile_options(gap_avoid PRIVATE -ffp-contract=off)
 
+# 速度跟踪：`core/vision/motion.py` 的 C++ 移植。
+# 几何帧线协议**不带速度**，决策又要用它算"墙是不是在逼近"，所以 PS 必须自己
+# 从相邻帧 stamp 之差推（见 core/cpu/cpp/motion.hpp 顶部）。
+add_library(motion STATIC "${GAP_AVOID_DIR}/motion.cpp")
+target_include_directories(motion PUBLIC "${GAP_AVOID_DIR}")
+# 同样必须关掉 FMA 收缩：α-β 更新里有 `v += (beta/dt) * r` 这种乘加。
+target_compile_options(motion PRIVATE -ffp-contract=off)
+
 option(VISION_BOARD_BUILD_TESTS "构建本机自测" ON)
 if(VISION_BOARD_BUILD_TESTS)
     enable_testing()
@@ -105,7 +113,7 @@ add_executable(vision_board_devmem
     main.cpp
 )
 target_link_libraries(vision_board_devmem PRIVATE
-    vision_driver_core gap_avoid action_codec vision_ref Threads::Threads)
+    vision_driver_core gap_avoid motion action_codec vision_ref Threads::Threads)
 
 # ---------------------------------------------------------------------------
 # 板上目标（可选）：需要 icraft SDK
@@ -139,6 +147,7 @@ if(VISION_BOARD_WITH_ICRAFT)
     target_link_libraries(vision_board_app PRIVATE
         vision_driver_core
         gap_avoid
+        motion
         action_codec
         Icraft::HostBackend
         Icraft::ZG330Backend

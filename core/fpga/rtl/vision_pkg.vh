@@ -18,7 +18,9 @@
 //
 // **没有速度字段**：PL 不知道 `speed`（速度上限，配置量），若编进去，
 // PS 侧解出的 PlayerState 会因 speed_measured > speed 而自校验失败。
-// 速度由 PS 从相邻帧 stamp 之差推。理由见移植规划 §3 与 vision_frame.py 顶部。
+// 速度由 PS 从相邻帧 stamp 之差推（已实现：core/cpu/cpp/motion.cpp，
+// 参考实现 core/vision/motion.py，交叉对账 core/cpu/tests/test_cpp_motion.py）。
+// 理由见移植规划 §3 与 vision_frame.py 顶部。
 // ===========================================================================
 
 `ifndef VISION_PKG_VH

@@ -1,5 +1,10 @@
 """任务二：从视频取速度。
 
+**谁在用**：部署路径 `core/cpu/adapters/vision_adapter.py` 的 `VisionWorldStream`
+拿它把速度贴回 `Rect.vx/vy` 与角色向量（几何帧线协议不带速度）；板子上跑的是它的
+C++ 移植 `core/cpu/cpp/motion.cpp`，两者逐帧对账
+（`core/cpu/tests/test_cpp_motion.py`）。
+
 链条
 ----
 ``检测(世界坐标) → 跨帧关联 → α-β 滤波 → 速度``
@@ -69,6 +74,8 @@ class Track:
     hits: int = 1
     misses: int = 0
     age: int = 1
+    #: 连续「可疑」（残差超阈值）的帧数；一旦某帧正常就清零。
+    suspect: int = 0
 
     @property
     def speed(self) -> float:
@@ -112,9 +119,37 @@ class Tracker:
     max_misses: int = 5
     #: 两帧间隔超过它就**不做预测**（速度置零重来），避免跨大间隔乱推。
     max_dt: float = 0.5
+    #: 残差（预测落点与检测点的距离）超过它就算「可疑帧」：**位置照跟，但这一次
+    #: 的残差不进速度**（要不要改判见 ``confirm_frames``）。
+    #:
+    #: 为什么需要：关联门限（``gate``）回答的是"是不是同一个目标"，**不能**顺便
+    #: 当成"这个位移可信吗"。实测（``data/vision/run4/screen.mp4`` 前 60 帧，30fps）
+    #: 里带合并一变，段的**中心**会单帧横移 24 px —— 那是"段变宽了"，不是"墙在
+    #: 横着飞"。门限 24 恰好放它进来，于是推出来的速度瞬间到 -66 px/s（真实运动
+    #: 只有 15~30 px/s 的纵向平移），还要十几帧才衰减掉，足以让决策误判"墙在远离"。
+    #:
+    #: 取值依据：本平台 **30fps** 下墙的最快步长在 2 个单位/帧量级（间隙扫描
+    #: ~30-60 px/s），8 已经是它的 4 倍；而那个假跳变是 24。
+    max_residual: float = 8.0
+    #: 连续多少帧可疑才**改判**成"真运动"（然后照常做 α-β 更新）。
+    #:
+    #: ⚠ 这一条是**必须**的，不能只看单帧残差：跑得快的目标在速度还没建立起来时
+    #: 残差本来就大（≈ 每帧步长）。只用"残差 > 阈值就丢"会让**任何**步长大于阈值
+    #: 的目标永远拿不到速度（速度恒 0，而位置看着还对 —— 又是"静默错"）。
+    #: 有了计数器：单帧跳变被挡住，持续偏离则改判为真运动。
+    confirm_frames: int = 2
     _tracks: list[Track] = field(default_factory=list)
     _next_id: int = 1
+    #: 累计触发过多少次"只落位、不更新速度"（诊断用：真实素材上该有多少次）。
+    _n_relocalized: int = 0
     _last_stamp: float | None = None
+    #: 上一次 ``update()`` 里**每条返回轨迹**对应哪一个检测（下标）；
+    #: 靠惯性外推的（本轮没被匹配上）是 ``None``。
+    #:
+    #: 为什么需要它：轨迹的 ``id`` 是跟踪器自己发的，而调用方手里通常有自己的
+    #: 对象（矩形/带半宽半高的检测框），需要把速度**贴回自己的对象**上。
+    #: 没有这份对应关系就只能靠比位置去猜 —— 那是另一种 bug 来源。
+    _last_assignment: list[int | None] = field(default_factory=list)
 
     # ------------------------------------------------------------------
     def update(self, detections: Sequence[Point], stamp: float) -> list[Track]:
@@ -156,6 +191,7 @@ class Tracker:
 
         # -- 3. 滤波：α-β 更新 ------------------------------------------
         survivors: list[Track] = []
+        assignment: list[int | None] = []        # 与 survivors 一一对应
         for ti, t in enumerate(self._tracks):
             if ti not in matched:
                 t.misses += 1
@@ -166,6 +202,7 @@ class Tracker:
                         t.x, t.y = predicted[ti]      # 惯性外推
                     t.age += 1
                     survivors.append(t)
+                    assignment.append(None)      # 外推：本轮没有对应的检测
                 continue
 
             zx, zy = detections[matched[ti]]
@@ -176,15 +213,27 @@ class Tracker:
             else:
                 px, py = predicted[ti]
                 rx, ry = zx - px, zy - py
-                t.x = px + self.alpha * rx
-                t.y = py + self.alpha * ry
-                t.vx += (self.beta / dt) * rx
-                t.vy += (self.beta / dt) * ry
+                if (math.hypot(rx, ry) > self.max_residual
+                        and t.suspect + 1 < self.confirm_frames):
+                    # 可疑帧（形变/换目标/遮挡后重现）：**位置照跟，速度这一帧不认**
+                    # —— 保留上一次的估计，而不是清零（清零等于"当它静止"，
+                    # 那正是我们要修的老行为）。
+                    t.suspect += 1
+                    t.x, t.y = zx, zy
+                    self._n_relocalized += 1
+                else:
+                    # 正常帧，或者**连续可疑**（说明那真是持续运动）：照常 α-β
+                    t.suspect = 0
+                    t.x = px + self.alpha * rx
+                    t.y = py + self.alpha * ry
+                    t.vx += (self.beta / dt) * rx
+                    t.vy += (self.beta / dt) * ry
             t.stamp = float(stamp)
             t.hits += 1
             t.misses = 0
             t.age += 1
             survivors.append(t)
+            assignment.append(matched[ti])
 
         # -- 4. 新目标：未被任何轨迹认领的检测 ----------------------------
         for j, (zx, zy) in enumerate(detections):
@@ -192,9 +241,11 @@ class Tracker:
                 continue
             survivors.append(Track(id=self._next_id, x=zx, y=zy,
                                    stamp=float(stamp)))
+            assignment.append(j)                 # 新目标：对应的就是它自己
             self._next_id += 1
 
         self._tracks = survivors
+        self._last_assignment = assignment
         return list(survivors)
 
     # ------------------------------------------------------------------
@@ -202,10 +253,30 @@ class Tracker:
     def tracks(self) -> list[Track]:
         return list(self._tracks)
 
+    @property
+    def last_assignment(self) -> list[int | None]:
+        """上一次 ``update()`` 的返回值里，每条轨迹对应的检测下标（``None`` = 外推）。
+
+        与 ``tracks`` 等长、同序。用法::
+
+            tracks = tr.update(dets, stamp)
+            for t, j in zip(tracks, tr.last_assignment):
+                if j is not None:
+                    my_rects[j].vx, my_rects[j].vy = t.vx, t.vy
+        """
+        return list(self._last_assignment)
+
+    @property
+    def n_relocalized(self) -> int:
+        """累计触发过多少次"只落位、不更新速度"（诊断用）。"""
+        return self._n_relocalized
+
     def reset(self) -> None:
         self._tracks.clear()
+        self._last_assignment.clear()
         self._last_stamp = None
         self._next_id = 1
+        self._n_relocalized = 0
 
     def speeds(self) -> list[float]:
         return [t.speed for t in self._tracks]

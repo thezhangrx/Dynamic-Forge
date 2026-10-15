@@ -19,6 +19,7 @@
 // `core/cpu/tests/test_cpp_gap_avoid.py`）。
 // ===========================================================================
 #include "gap_avoid.hpp"
+#include "motion.hpp"
 #include "action_codec.hpp"
 #include "ppm_reader.hpp"
 #include "rgb_source.hpp"
@@ -78,6 +79,11 @@ struct Args {
     // 也是 PL 拿不到时的参照实现。
     std::string ppm_file;           // 单张图（每帧重复用它）
     std::string ppm_dir;            // 目录（%06d.ppm，与协同仿真的激励同命名）
+    std::string track_log_path;     // --track-log 的路径（main 里开成 FILE*）
+    //: 逐帧轨迹日志（`--track-log FILE`）：原始矩形 + 跟踪器状态。
+    //: 只为**验证速度估计**用：光看"推出来的速度"没法区分"东西真在动"和
+    //: "检测框在抖" —— 必须把原始位置一起落盘才能离线算差分。
+    std::FILE* track_log = nullptr;
     //: `--via-pl`：PPM 的像素**推进 PL 的 FIFO**，几何帧由 PL 产出
     //: （而不是在 PS 上跑黄金模型）。真摄像头要走 FPGA 加速时用这个。
     bool via_pl = false;
@@ -128,6 +134,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--skip-frames")  a.skip_frames = std::atoi(next());
         else if (k == "--verify-both")  a.verify_both = true;
         else if (k == "--ppm-dir")      a.ppm_dir = next();
+        else if (k == "--track-log")    a.track_log_path = next();
         else if (k == "--keyboard-dev") a.keyboard_dev = next();
         else if (k == "--no-keyboard")  a.keyboard_dev.clear();
         else if (k == "--action-deadzone") a.action_deadzone = std::atof(next());
@@ -152,6 +159,8 @@ Args parse_args(int argc, char** argv) {
                 "  --no-keyboard        不发动作（只看视觉+决策）。\n"
                 "  --action-deadzone D  速度小于 D 就当 stay，默认 1e-3。\n"
                 "  --echo-action        把动作号也打到 stdout。\n"
+                "  --track-log FILE     逐帧把原始矩形与跟踪器状态写成文本（验证速度估计用：\n"
+                "                       只有原始位置落盘，才分得清「真在动」和「框在抖」）。\n"
                 "  --ppm FILE           几何帧改由 PS 上跑 C 参考模型产出（单张图，重复用）。\n"
                 "                       **真摄像头就走这条**：\n"
                 "                         ffmpeg -f v4l2 -i /dev/video0 -frames:v 1 o.ppm\n"
@@ -191,6 +200,11 @@ Args parse_args(int argc, char** argv) {
 struct DecisionState {
     gap_avoid::GapMemory mem;
     gap_avoid::AlgoConfig cfg;
+    //: 线协议**不带速度**，所以 PS 侧自己推（见 `core/cpu/cpp/motion.hpp`）。
+    //: 角色与障碍各一个跟踪器：关联是"最近邻 + 门限"，两类目标的运动模型
+    //: 完全无关，混在一起只会互相抢检测。
+    motion::Tracker player_motion;
+    motion::Tracker obstacle_motion;
     uint64_t prev_stamp_ns = 0;
     bool have_prev_stamp = false;
     int n_decisions = 0;
@@ -420,11 +434,27 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
     st.prev_stamp_ns = f.header.stamp_ns;
     st.have_prev_stamp = true;
 
-    // ---- 角色：几何帧里没有速度，恒 0 ----
+    // ---- 速度：线协议不带，PS 侧用相邻帧 stamp 差推 --------------------------
+    // `vision_pkg.vh` 里写着"速度由 PS 从相邻帧 stamp 之差推"；决策要它来算
+    // "墙是不是在逼近"（`v_n = vn_wall - player_v·n̂`）。没有它，真机上所有障碍
+    // 都被当成静止的 —— 而训练环境里它们是有速度的，两边判据就不是一回事了。
+    const double t_now = static_cast<double>(f.header.stamp_ns) * 1e-9;
+    double pvx = 0.0, pvy = 0.0;
+    if (f.player.present) {
+        const motion::Point pp{f.player.x, f.player.y};
+        if (!motion::track_one(st.player_motion, pp, t_now, &pvx, &pvy)) {
+            // 时间戳坏了（倒流/NaN）：重起时基，这一帧速度为 0。
+            // Python 侧此时会抛异常；板子上是实时环，不能崩（见 motion.hpp 顶部）。
+            st.player_motion.reset();
+            pvx = pvy = 0.0;
+        }
+    }
+
+    // ---- 角色 ----
     const double player[7] = {
         f.player.present ? f.player.x : args.field_w * 0.5,
         f.player.present ? f.player.y : 0.0,
-        0.0, 0.0,
+        pvx, pvy,
         f.player.present ? f.player.radius : 10.0,
         args.player_speed,
         1.0,
@@ -436,16 +466,37 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
     for (const GeometryObstacle& o : f.obstacles) {
         if (!o.is_rect()) continue;
         gap_avoid::Rect r;
+        // ⚠ `o.id` 是**当帧序号**（RTL: `seg_id <= n_obs + 1`），跨帧不稳定，
+        //   所以这里只当标签用；跨帧配速度靠跟踪器的位置关联（见 motion.hpp）。
         r.ent_id = o.id;
         r.x = o.x;
         r.y = o.y;
-        r.vx = 0.0;              // 见上面的说明：线协议不带速度
+        r.vx = 0.0;              // 下面由跟踪器填
         r.vy = 0.0;
         r.half_w = o.half_w;
         r.half_h = o.half_h;
         r.rotation = o.rotation;
-        r.angular_velocity = 0.0;
+        r.angular_velocity = 0.0;   // 决策不看自转（gap_avoid 里没用这个字段）
         rects.push_back(r);
+    }
+
+    if (!rects.empty()) {
+        std::vector<motion::Point> dets;
+        dets.reserve(rects.size());
+        for (const gap_avoid::Rect& r : rects) dets.push_back(motion::Point{r.x, r.y});
+        std::vector<double> ovx(rects.size(), 0.0), ovy(rects.size(), 0.0);
+        if (st.obstacle_motion.update(dets.data(), static_cast<int>(dets.size()), t_now)) {
+            motion::attach_velocities(st.obstacle_motion.tracks(),
+                                      st.obstacle_motion.assignment(),
+                                      static_cast<int>(dets.size()),
+                                      ovx.data(), ovy.data());
+        } else {
+            st.obstacle_motion.reset();     // 时间戳坏了：重起时基，这一帧速度为 0
+        }
+        for (size_t i = 0; i < rects.size(); ++i) {
+            rects[i].vx = ovx[i];
+            rects[i].vy = ovy[i];
+        }
     }
 
     gap_avoid::WorldView world;
@@ -469,6 +520,37 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
                 std::isfinite(d.gap) ? d.gap : -1.0,
                 std::isfinite(d.usable_half) ? d.usable_half : -1.0,
                 d.n_rects);
+    // 推出来的速度也打出来：线协议不带它，"到底推没推、推得对不对"只能看这一行。
+    // 墙速取**最大**的那个（有多面墙时逐个打会把日志淹掉）。
+    double wall_v = 0.0;
+    for (const gap_avoid::Rect& r : rects) {
+        const double sp = std::hypot(r.vx, r.vy);
+        if (sp > wall_v) wall_v = sp;
+    }
+    std::printf("  速度: 角色=(%+.1f,%+.1f)|v|=%.1f  墙max|v|=%.1f",
+                pvx, pvy, std::hypot(pvx, pvy), wall_v);
+    if (args.track_log != nullptr) {
+        std::fprintf(args.track_log, "F %u %llu %zu %zu %d\n",
+                     f.header.seq, static_cast<unsigned long long>(f.header.stamp_ns),
+                     rects.size(), st.obstacle_motion.tracks().size(),
+                     st.obstacle_motion.n_relocalized());
+        for (const gap_avoid::Rect& r : rects) {
+            std::fprintf(args.track_log, "R %d %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                         r.ent_id, r.x, r.y, r.vx, r.vy, r.half_w, r.half_h, r.rotation);
+        }
+        const std::vector<motion::Track>& ts = st.obstacle_motion.tracks();
+        const std::vector<int>& asg = st.obstacle_motion.assignment();
+        for (size_t i = 0; i < ts.size(); ++i) {
+            std::fprintf(args.track_log, "T %d %.6f %.6f %.6f %.6f %d %d %d %d\n",
+                         ts[i].id, ts[i].x, ts[i].y, ts[i].vx, ts[i].vy,
+                         ts[i].hits, ts[i].misses, ts[i].age,
+                         i < asg.size() ? asg[i] : -1);
+        }
+        std::fprintf(args.track_log, "P %.6f %.6f %.6f %.6f\n",
+                     f.player.present ? f.player.x : 0.0,
+                     f.player.present ? f.player.y : 0.0, pvx, pvy);
+        std::fflush(args.track_log);
+    }
     if (rects.empty()) std::printf("  [无矩形障碍]");
     if (!f.player.present) std::printf("  [无角色，按场宽中线/半径 10 兜底]");
     if (dt_is_default) std::printf("  [dt=默认，无上一帧 stamp]");
@@ -479,11 +561,21 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
 }   // namespace
 
 int main(int argc, char** argv) {
-    const Args args = parse_args(argc, argv);
+    Args args = parse_args(argc, argv);      // 非 const：下面要挂上轨迹日志的文件
 
     std::printf("=== vision board bring-up ===\n");
     std::printf("设备: %s\n", args.device_url.c_str());
 
+    // `--track-log` 的文件在这里开（解析期只存路径，不碰 IO）
+    if (!args.track_log_path.empty()) {
+        args.track_log = std::fopen(args.track_log_path.c_str(), "w");
+        if (args.track_log == nullptr) {
+            std::fprintf(stderr, "⚠ 打不开轨迹日志 %s：%s\n",
+                         args.track_log_path.c_str(), std::strerror(errno));
+        } else {
+            std::printf("轨迹日志: %s\n", args.track_log_path.c_str());
+        }
+    }
     const bool have_ppm = !args.ppm_file.empty() || !args.ppm_dir.empty();
     const bool have_src = have_ppm || args.stdin_rgb;
     // 走 PL 时**不**用 PS 参考模型：像素推给 PL，几何帧从 PL 读回来

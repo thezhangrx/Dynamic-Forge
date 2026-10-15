@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -41,6 +42,11 @@ def rect(oid, cx, half_w, *, cy=WALL_Y, half_h=WALL_HH, rot=0.0, **kw):
 def two_segment_wall(vy=0.0):
     """两段共线矩形 + 中间 160 宽的缺口（和平台 wall_with_gap 的几何一致）。"""
     return [rect(1, 120.0, 120.0, vy=vy), rect(2, 520.0, 120.0, vy=vy)]
+
+
+def two_segment_wall_at(cy):
+    """两段共线矩形 + 中间 160 宽的缺口，**墙在指定的 y**（用来做移动墙）。"""
+    return [rect(1, 120.0, 120.0, cy=cy), rect(2, 520.0, 120.0, cy=cy)]
 
 
 def frame(seq=0, stamp=0.0, *, player=(100.0, 50.0, 10.0, 200.0),
@@ -271,3 +277,109 @@ def test_stream_reset_clears_memory_and_prev_frame():
     stream.reset()
     assert stream.frames == 0 and stream.prev_frame is None
     assert stream.memory.step_index == -1
+
+
+# ---------------------------------------------------------------------------
+# 速度：线协议不带，部署路径自己推（与板子侧 motion.cpp 同一份算法）
+#
+# 真机上几何帧里 vx/vy 恒为 0，而决策要用它算"墙是不是在逼近"。不推的话
+# 真机上所有障碍都被当成静止的 —— 与训练环境判据不一致。
+# ---------------------------------------------------------------------------
+def test_stream_fills_velocities_by_tracking():
+    """两段墙整体横移：速度要**填进 rects**（不是只留在跟踪器里）。"""
+    stream = VisionWorldStream(CFG)
+    vx = 60.0                                  # 世界单位/秒
+    last = None
+    for k in range(40):
+        t = k / 30.0
+        wall = [rect(1, 120.0 + vx * t, 120.0), rect(2, 520.0 + vx * t, 120.0)]
+        last, _ = stream.step(frame(seq=k, stamp=t, obstacles=wall))
+    got = sorted(r.vx for r in last.rects)
+    assert got == pytest.approx([vx, vx], abs=3.0), f"墙的速度没推对：{got}"
+    assert all(r.vy == pytest.approx(0.0, abs=1.0) for r in last.rects)
+
+
+def test_stream_fills_player_velocity():
+    stream = VisionWorldStream(CFG)
+    last = None
+    for k in range(40):
+        t = k / 30.0
+        last, _ = stream.step(frame(seq=k, stamp=t,
+                                    player=(100.0 + 45.0 * t, 50.0, 10.0, 200.0),
+                                    obstacles=two_segment_wall()))
+    assert last.player[2] == pytest.approx(45.0, abs=2.0), f"角色速度：{last.player[2]}"
+    assert last.player[3] == pytest.approx(0.0, abs=1.0)
+
+
+def test_stream_can_turn_tracking_off():
+    """帧里本来就带真速度时（仿真）应当能关掉 —— 那才是真值，别推一遍盖掉。"""
+    stream = VisionWorldStream(replace(CFG, track_velocity=False))
+    for k in range(5):
+        t = k / 30.0
+        wall = [rect(1, 120.0 + 60.0 * t, 120.0), rect(2, 520.0 + 60.0 * t, 120.0)]
+        view, _ = stream.step(frame(seq=k, stamp=t, obstacles=wall))
+    assert all(r.vx == 0.0 and r.vy == 0.0 for r in view.rects), \
+        "关掉跟踪后不该动帧里给的 vx/vy"
+
+
+def test_stream_band_merge_jump_does_not_become_velocity():
+    """真实素材里量到的那个坑：段中心单帧跳 24 → 不能变成速度。"""
+    stream = VisionWorldStream(CFG)
+    for k in range(6):
+        stream.step(frame(seq=k, stamp=k / 30.0,
+                          obstacles=[rect(1, 164.5, 100.0), rect(2, 378.5, 100.0)]))
+    view, _ = stream.step(frame(seq=6, stamp=6 / 30.0,
+                                obstacles=[rect(1, 140.5, 124.0), rect(2, 402.5, 124.0)]))
+    assert all(r.vx == 0.0 for r in view.rects), \
+        f"跳变帧不该给出速度：{[r.vx for r in view.rects]}"
+    assert sorted(r.x for r in view.rects) == pytest.approx([140.5, 402.5]), \
+        "位置还是要落位"
+
+
+def test_stream_reset_clears_trackers_too():
+    """新一局要连速度一起清：否则第一帧就会带着上一局的速度。"""
+    stream = VisionWorldStream(CFG)
+    for k in range(10):
+        stream.step(frame(seq=k, stamp=k / 30.0,
+                          obstacles=[rect(1, 120.0 + 2.0 * k, 120.0)]))
+    assert stream.obstacle_tracker.n_relocalized == 0
+    stream.reset()
+    view, _ = stream.step(frame(seq=0, stamp=0.0,
+                                obstacles=[rect(1, 500.0, 120.0)]))
+    assert view.rects[0].vx == 0.0 and view.player[2] == 0.0, \
+        "reset 之后第一帧的速度必须是 0"
+
+
+def test_closing_wall_gets_finite_time_to_arrival_only_when_tracked():
+    """**这条是整件事的目的**：不推速度 → 决策对逼近的墙完全无感。
+
+    ``t_arr = 相对距离 / v_n``，而 ``v_n = vn_wall − 玩家速度·n̂``。真机上帧里没有
+    速度，``vn_wall`` 恒为 0 —— 只要角色自己没在动，``v_n`` 就是 0，``t_arr`` 恒为
+    ``inf``：**一面正在压过来的墙和一个静止的墙，在决策眼里一模一样**。而训练环境里
+    障碍是有速度的。推出来之后就恢复成"有限且随距离单调的接近时间"。
+    """
+    acfg = AlgoConfig(forward=(0.0, 1.0))          # 项目约定：+y 是前方
+
+    def run(*, wall_vy: float, start_y: float, track: bool):
+        stream = VisionWorldStream(replace(CFG, track_velocity=track))
+        dec = view = None
+        for k in range(30):
+            t = k / 30.0
+            wy = start_y + wall_vy * t
+            dec, view = None, view
+            view, dec = stream.step(
+                frame(seq=k, stamp=t, obstacles=two_segment_wall_at(wy)), cfg=acfg)
+        return dec, view
+
+    closing, view_c = run(wall_vy=-60.0, start_y=300.0, track=True)
+    assert view_c.rects[0].vy == pytest.approx(-58.0, abs=3.0), "墙的速度要推出来"
+    assert math.isfinite(closing.t_arr), \
+        "推了速度之后，逼近的墙必须有有限的到达时间"
+
+    blind, _ = run(wall_vy=-60.0, start_y=300.0, track=False)
+    assert blind.t_arr == math.inf, \
+        "不推速度时决策对逼近的墙无感（这正是要修的部署/训练不一致）"
+
+    # 越近，到达时间越小（推出来的速度真的进了判据，不是摆设）
+    near, _ = run(wall_vy=-60.0, start_y=200.0, track=True)
+    assert near.t_arr < closing.t_arr, f"{near.t_arr} 应当小于 {closing.t_arr}"

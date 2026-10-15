@@ -266,7 +266,7 @@ ffmpeg -f v4l2 -i /dev/video0 -frames:v 1 -pix_fmt rgb24 /root/cam.ppm
 | 1 | ~~C++ 决策~~ | ✅ 已完成：`core/cpu/cpp/`，10 条交叉验证用例 |
 | 2 | ~~像素从哪来~~ | ✅ PL 侧用 `tpg_source` 已跑通；真图走 PS 参考模型也已跑通（`--ppm`） |
 | 3 | ~~PL 也吃真图~~ | ✅ 已完成：PS 推像素 FIFO（`rtl/vision_pixfeed.v`）+ `--via-pl`；`tb_axi --fifo` 逐字节验过 |
-| 4 | **移动墙的速度** | 线协议不带速度，PS 侧要按 `stamp` 差分出来再填进 `Rect.vx/vy` |
+| 4 | ~~移动墙的速度~~ | ✅ 已完成：`core/cpu/cpp/motion.{hpp,cpp}`（`core/vision/motion.py` 的移植，逐帧对账）+ `decide()` 里填进 `player[P_VX/P_VY]` 与 `Rect.vx/vy`。真实素材实测（`run4/screen.mp4` 前 60 帧 @30fps）：加守卫前墙 max\|v\| 90% 位 50.6 / 最大 **67.3** → 加守卫后 15.3 / **15.9**（那段素材的真实运动就是 ~14.1，从原始位置量出来的）。⚠ **手持**录像（`run3/Camera.mp4`）同一算法给出中位 33.6 / 90% 57.2 —— 抖动主导，所以最终部署要固定机位。`--track-log FILE` 可落盘原始矩形+轨迹，用来分辨"真在动"和"框在抖" |
 | 5 | ~~上板实测~~ | ✅ 已完成（2026-10-15）：自检通过、8 帧全解码、决策 8 帧、**72～77 帧/秒**；键盘行串口实收。见 `core/fpga/docs/板上验证.md` §4/§6 |
 | 6 | **RP2040 那一端** | 板子侧已验（串口实收 `@MOVE n`）；RP2040 要刷 CircuitPython + 拷 `adafruit_hid` + 接两根线。见 `core/rp2040_keyboard/README.md` |
 | 7 | ~~动作怎么送到 PC（零接线）~~ | ✅ 已完成：`--keyboard-dev stdout` + SSH 管道 + `pc_key_driver.py --stdin`，真机验过 |
