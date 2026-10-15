@@ -213,13 +213,28 @@ module vision_axi #(
     wire wr_commit = (aw_v && w_v && !b_v);
     wire ar_commit = (ar_v && !r_v);
 
-    // 配置口地址：读数据那一拍用读地址；否则用写提交的地址。两者不并发。
+    // 配置口地址：写提交那一拍**写地址优先**；读数据那一拍用读地址。
+    //
+    // ⚠ 第四个"测试台把主控理想化"的盲区（前三个：AW/W 同拍、WSTRB 恒 0xF、
+    //   地址恒字对齐）。tb 一次只发一笔事务，所以从没走到**读写同拍**这条路。
+    //   AXI **允许**主控在同一拍同时给出 AWVALID 和 ARVALID（从口可以节流，
+    //   但**不能写错寄存器**）。而 s_awready/s_arready 只看**已寄存的** aw_v/ar_v，
+    //   所以两者同拍时都会被接收。后果（`reg_we=1` 那一拍 rd_cycle 仍为真）：
+    //     · 写配置寄存器 A + 同时读配置寄存器 B(≠A) → cfg_addr 被读地址抢走
+    //       → **写静默落进了 B**（上板/仿真都测得到）；
+    //     · 写配置寄存器 + 同时读 CTRL → cfg_addr=31(CFG_STATUS) → **写被丢弃**；
+    //     · 窄写时 cfg_wdata 的 WSTRB 合并还会读到**错寄存器的旧值**。
+    //   注意写**非配置块**寄存器（SEQ/STAMP/CTRL…）不会拉高 cfg_we，
+    //   所以那种组合本来就无害 —— 这一点是反向验证时确认的。
+    //   修法：reg_we 那一拍无条件用写地址。读数据是在 ar_commit 那一拍采的，
+    //   那时 reg_we 还是 0（reg_we 比 commit 晚一拍），所以读不受影响。
     // CTRL(0x0C0) 的状态位住在 vision_top 的 CFG_STATUS(31) 里，读它的时候
     // 把 cfg_addr 借过去，不另外在本地再数一份帧计数（两份计数迟早会漂）。
     wire rd_cycle  = (ar_v || r_v);
     wire rd_conf   = rd_cycle && (ar_a < ADDR_CONFIG + 12'h080);   // 0x000..0x07F
     wire rd_status = rd_cycle && (ar_word == W_CTRL);
-    assign cfg_addr = rd_conf   ? {1'b0, ar_a[6:2]}
+    assign cfg_addr = reg_we    ? reg_addr               // 写提交那一拍：写优先
+                    : rd_conf   ? {1'b0, ar_a[6:2]}
                     : rd_status ? 6'd31                  // CFG_STATUS
                     :             reg_addr;
 

@@ -46,6 +46,7 @@ enum {
     A_CFG_BRIGHT_SPRD  = 0x010,   // 4*4
     A_CFG_MIN_GAP      = 0x040,   // 4*16
     A_CFG_P_MIN_AREA   = 0x044,   // 4*17
+    A_CFG_P_MAX_AREA   = 0x048,   // 4*18
     A_DBG_SEL        = 0x080,
     A_DBG_DATA       = 0x084,
     A_CTRL           = 0x0C0,
@@ -144,6 +145,33 @@ static bool axi_write_narrow(uint32_t byte_addr, uint32_t data, int nbytes)
 {
     uint32_t strb = (((1u << nbytes) - 1u) << (byte_addr & 3u)) & 0xFu;
     return axi_write_s(byte_addr, data, strb);
+}
+
+//: 读写**同一拍**发出：AWVALID+WVALID+ARVALID 一起给。
+//  AXI **允许**主控这么做（从口可以节流，但**不能写错寄存器**）。tb 原来一次
+//  只发一笔事务，所以从没走到这条路 —— 这是第四个"把主控理想化"的盲区。
+static bool axi_write_read_same_cycle(uint32_t waddr, uint32_t wdata,
+                                      uint32_t raddr, uint32_t *rout)
+{
+    top->s_awaddr  = waddr; top->s_awvalid = 1;
+    top->s_wdata   = wdata; top->s_wstrb   = 0xF; top->s_wvalid = 1;
+    top->s_araddr  = raddr; top->s_arvalid = 1;
+    top->s_bready  = 1;     top->s_rready  = 1;
+    bool wdone = false, rdone = false;
+    for (int i = 0; i < 500 && !(wdone && rdone); i++) {
+        bool aw_fire = top->s_awvalid && top->s_awready;
+        bool w_fire  = top->s_wvalid  && top->s_wready;
+        bool ar_fire = top->s_arvalid && top->s_arready;
+        bool b_fire  = top->s_bvalid  && top->s_bready;
+        if (top->s_rvalid && top->s_rready) { *rout = (uint32_t)top->s_rdata; rdone = true; }
+        step();
+        if (aw_fire) top->s_awvalid = 0;
+        if (w_fire)  top->s_wvalid  = 0;
+        if (ar_fire) top->s_arvalid = 0;
+        if (b_fire)  wdone = true;
+    }
+    axi_idle();
+    return wdone && rdone;
 }
 
 static bool axi_read(uint32_t addr, uint32_t *out)
@@ -337,6 +365,48 @@ int main(int argc, char **argv)
             uint32_t st0 = 0x13572468u;
             CHECK(axi_write(A_STAMP0, st0), "窄读基准写 STAMP0 超时");
             CHECK(axi_read(A_STAMP0 + 3, &v) && v == st0, "窄读 STAMP0 +3 字节");
+        }
+
+        // ⑤ 读写**同拍**：写的那笔必须落到**写地址**上，读的那笔必须读到**读地址**。
+        //    旧 RTL 在 reg_we=1 那一拍仍让读地址抢占 cfg_addr，于是：
+        //      · 写 SEQ + 读配置寄存器 → 写落进了被读的那个配置寄存器；
+        //      · 写配置寄存器 + 读 CTRL → cfg_addr=31(CFG_STATUS) → 写被丢弃。
+        {
+            uint32_t rv = 0;
+            // (a) 写配置块寄存器 A、同时读配置块寄存器 B(≠A)
+            //     ---- 最有害的一种：写会**静默落到被读的那个寄存器**上。
+            //     （写非配置块寄存器（如 SEQ）不会拉高 cfg_we，那种组合本来就
+            //       无害 —— 这一点是反向验证时确认的。）
+            CHECK(axi_write(A_CFG_P_MIN_AREA, 0x11111111u), "同拍: 置 P_MIN_AREA 超时");
+            CHECK(axi_write(A_CFG_P_MAX_AREA, 0x99999999u), "同拍: 置 P_MAX_AREA 超时");
+            CHECK(axi_write_read_same_cycle(A_CFG_P_MIN_AREA, 0x22222222u,
+                                            A_CFG_P_MAX_AREA, &rv),
+                  "同拍: 写 P_MIN_AREA + 读 P_MAX_AREA 超时");
+            CHECK(rv == 0x99999999u, "同拍: 读回的不是 P_MAX_AREA 的原值");
+            CHECK(axi_read(A_CFG_P_MIN_AREA, &v) && v == 0x22222222u,
+                  "同拍: 写 P_MIN_AREA 没生效");
+            CHECK(axi_read(A_CFG_P_MAX_AREA, &v) && v == 0x99999999u,
+                  "同拍: 写 P_MIN_AREA 时**落进了被读的那个配置寄存器**");
+
+            // (b) 写 P_MIN_AREA、读 P_MIN_AREA 自己
+            CHECK(axi_write(A_CFG_P_MIN_AREA, 0x33333333u), "同拍: 重置 P_MIN_AREA 超时");
+            CHECK(axi_write_read_same_cycle(A_CFG_P_MIN_AREA, 0x44444444u,
+                                            A_CFG_P_MIN_AREA, &rv),
+                  "同拍: 写读同一寄存器超时");
+            CHECK(axi_read(A_CFG_P_MIN_AREA, &v) && v == 0x44444444u,
+                  "同拍: 写配置寄存器没生效（被读地址抢了 cfg_addr）");
+
+            // (c) 写配置寄存器、读 CTRL（读侧是借 CFG_STATUS 那条路）
+            CHECK(axi_write_read_same_cycle(A_CFG_P_MIN_AREA, 0x55555555u,
+                                            A_CTRL, &rv),
+                  "同拍: 写配置寄存器 + 读 CTRL 超时");
+            CHECK(axi_read(A_CFG_P_MIN_AREA, &v) && v == 0x55555555u,
+                  "同拍: 读 CTRL 时写被丢弃（cfg_addr 被借去 CFG_STATUS）");
+
+            // (d) 写 STAMP0、读 SEQ（两者都不在配置块里，走向量寄存器那条路）
+            CHECK(axi_write_read_same_cycle(A_STAMP0, 0x0BADF00Du, A_SEQ, &rv),
+                  "同拍: 写 STAMP0 + 读 SEQ 超时");
+            CHECK(axi_read(A_STAMP0, &v) && v == 0x0BADF00Du, "同拍: 写 STAMP0 没生效");
         }
 
         // ③ 复原，免得影响后面的参数写与帧比对
