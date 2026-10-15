@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import select
 import signal
 import socket
 import subprocess
@@ -180,6 +181,102 @@ def test_relay_end_to_end_over_socket_serial() -> None:
     assert "→ b'@MOVE 1\\n'" in out, f"被切断的行没拼回来：\n{out}"
     assert "→ b'@MOVE 7\\n'" in out, f"没转发 7：\n{out}"
     assert "→ b'@MOVE 0\\n'" in out, f"没转发 0：\n{out}"
-    assert "99" not in out, f"越界的 99 不该被转发：\n{out}"
+    assert "@MOVE 99" not in out, f"越界的 99 不该被转发：\n{out}"
     assert "failed to request DMA" not in out, f"内核日志不该被转发：\n{out}"
     assert "转发 3 行后退出" in out, f"应当恰好转发 3 行：\n{out}"
+
+
+# ---------------------------------------------------------------------------
+# UDP 源 → RP2040 的端到端（零接线方案 D）
+#
+# 板子用 `--keyboard-dev udp://<PC>:9999` 直发，PC 上 `--udp 9999` 收下来再喂给
+# RP2040 的 USB 串口。这条路**完全不需要板子引脚**，也不和控制台日志抢串口
+# （控制台是 CP210x，只有长连接一个程序能读的时候才有意义）。
+# 假 RP2040 同样用 `socket://` 起，原因见上。
+# ---------------------------------------------------------------------------
+def _wait_for_line(p: subprocess.Popen, needle: str, timeout: float) -> str | None:
+    """等子进程打印出某行（它 flush 了才算数）。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        r, _, _ = select.select([p.stdout], [], [], left)
+        if not r:
+            return None
+        line = p.stdout.readline()
+        if not line:
+            return None
+        if needle in line:
+            return line
+
+
+def test_relay_udp_to_rp2040_end_to_end() -> None:
+    exe = _python_with_pyserial()
+    if exe is None:
+        pytest.skip("没有带 pyserial 的解释器")
+
+    # 假 RP2040：TCP 服务端，relay 会以 `socket://` 连上来
+    rp_srv = socket.socket()
+    rp_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    rp_srv.bind(("127.0.0.1", 0))
+    rp_srv.listen(1)
+    rp_srv.settimeout(10)
+    rp_port = rp_srv.getsockname()[1]
+
+    # 挑一个空闲的 UDP 端口
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.bind(("127.0.0.1", 0))
+    udp_port = probe.getsockname()[1]
+    probe.close()
+
+    p = subprocess.Popen(
+        [exe, str(RP2040 / "console_relay.py"),
+         "--udp", str(udp_port), "--rp2040", f"socket://127.0.0.1:{rp_port}"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    conn = None
+    try:
+        # 必须先等 relay **bind 完**再发第一个包：它先连 RP2040 串口、后 bind UDP，
+        # 抢在 bind 之前的报文会被内核直接丢掉（不是 relay 的 bug，是 UDP 的语义）。
+        # 之前这里靠 sleep 撞运气，约 1/6 概率丢掉第一批，测试就偶发失败。
+        assert _wait_for_line(p, "UDP :", 10.0), "relay 没在 10s 内就绪"
+        conn, _ = rp_srv.accept()
+        conn.settimeout(10)
+
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # 噪声整行 + 两条合法 + 一条越界。解析器要求**行首**就是前缀，
+        # 所以噪声自带换行；把 `@MOVE 1` 接在噪声尾巴上整行会被丢掉。
+        tx.sendto(b"kernel noise\r\n@MOVE 1\n@MOVE 7\n@MOVE 99\n", ("127.0.0.1", udp_port))
+        time.sleep(0.2)
+        tx.sendto(b"@MOVE 0\n", ("127.0.0.1", udp_port))                        # 单个包
+        tx.sendto(b"@MO", ("127.0.0.1", udp_port))                               # 故意切断
+        time.sleep(0.2)
+        tx.sendto(b"VE 3\n@MOVE 8\n", ("127.0.0.1", udp_port))
+        tx.close()
+        time.sleep(1.0)
+
+        got = b""
+        conn.settimeout(1.0)
+        try:
+            while True:
+                d = conn.recv(256)
+                if not d:
+                    break
+                got += d
+        except socket.timeout:
+            pass
+
+        p.send_signal(signal.SIGINT)
+        out, _ = p.communicate(timeout=10)
+    finally:
+        rp_srv.close()
+        if conn is not None:
+            conn.close()
+        if p.poll() is None:
+            p.kill()
+
+    # 顺序必须保持（这是"按键实时"的前提），且恰好 4 条
+    assert got == b"@MOVE 1\n@MOVE 7\n@MOVE 0\n@MOVE 3\n@MOVE 8\n", (
+        f"UDP→RP2040 的字节流不对：{got!r}\nrelay 输出：\n{out}")
+    assert "@MOVE 99" not in out, f"越界的 99 不该被转发：\n{out}"
+    assert "转发 5 行后退出" in out, f"应当恰好转发 5 行：\n{out}"

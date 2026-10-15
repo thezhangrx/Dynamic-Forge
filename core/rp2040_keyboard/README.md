@@ -5,36 +5,92 @@
 
 ---
 
-## 0. 三条路（第 0 条**不需要 RP2040**）
+## 0. 先分清两个角色：**传输** vs **执行**
 
-板子算完决策都会把动作号打到控制台（`@MOVE n`）。**怎么把它变成按键**有三条路：
+这两件事经常被混在一起，混了就白买硬件：
+
+* **传输**（板子 → 主机）：板子算完决策把 `@MOVE n` 送出来。走控制台串口，
+  或者走 **UDP**（`--keyboard-dev udp://<PC-IP>:9999`，零接线、也不跟控制台日志抢串口）。
+* **执行**（决策 → 平台）：把动作号变成平台认的输入。软件注入（`pc_key_driver.py`）
+  或真 USB HID 键盘（RP2040）。
+
+UDP 换掉的是**线**，不是**键盘**。键盘这个角色要不要硬件，只取决于一件事：
+**平台吃不吃合成按键**。
 
 | # | 做法 | 额外硬件 | 普通窗口程序 | DirectInput/原始输入的游戏 |
 |---|---|---|---|---|
 | **C** | **PC 上软件注入**（`pc_key_driver.py`） | **无** | ✅ | ❌ 会被忽略 |
 | A | RP2040 接板子控制台（两根线，`USE_UART_INPUT`） | RP2040 + 2 线 | ✅ | ✅ 真 HID |
-| B | RP2040 插 PC，PC 转发（`console_relay.py`，`USE_USB_INPUT`） | RP2040 | ✅ | ✅ 真 HID |
+| B | RP2040 插 PC，PC 转发（`console_relay.py --console`） | RP2040 | ✅ | ✅ 真 HID |
+| D | RP2040 插 PC，板子 UDP 直发（`console_relay.py --udp`） | RP2040 | ✅ | ✅ 真 HID |
 
-**先用 C 把闭环跑起来**（零硬件、零风险），顺带就知道了平台到底吃不吃合成输入：
+### C 路的动作怎么从板子传到 PC（三种，选一种）
+
+| 传法 | 命令 | 要不要额外条件 |
+|---|---|---|
+| **SSH 管道**（推荐） | `ssh 板子 '… --keyboard-dev stdout' \| pc_key_driver.py --stdin` | **只要 SSH 通**（已在用） |
+| 控制台串口 | `pc_key_driver.py --console /dev/ttyUSB0` | CP210x 要先 `usbipd attach` 到 WSL |
+| UDP | `pc_key_driver.py --udp 9999` | ⚠ 见下 |
+
+**推荐 SSH 管道**：它复用已经在用的 SSH 通道，不用接引脚、不用 `usbipd` 挂串口、
+也不用改 Windows 防火墙。管道里混着的日志（`帧 3: …`）会被前缀规则自动丢掉。
+
+> ⚠ **UDP 那条在本机当前这套网络下是走不通的**（实测）：板子 ARP 能解析
+> `192.168.137.1`，但 ICMP 100% 丢包、UDP 报文也到不了 WSL；而 `9999` 并不在
+> Windows 的保留端口段（只有 50000–50059）里，所以原因是 WSL 的 **mirrored
+> 网络模式 + Hyper-V 防火墙挡了 LAN→WSL 的入站**（改它要管理员权限）。
+> 板子 → Windows 主机方向同理：在 Windows 上 bind 同一端口会 `WSAEACCES`。
+> 所以 `--udp` 代码留着（本机自测是通的），但**别把它当成默认路**。
+
+### 先花一分钟判定平台收不收合成按键（不用板子、不用 RP2040）
+
+```bash
+# ① 注入这条路通不通？（起一次 PowerShell 注入器，不按任何键）
+python3 core/rp2040_keyboard/pc_key_driver.py --probe
+
+# ② 平台收不收？跑起来后有 3 秒把平台窗口点成焦点，看角色动不动
+python3 core/rp2040_keyboard/pc_key_driver.py --press 3 --arm --delay-s 3 --hold-ms 300
+```
+
+②按一下就退出，不会把键卡住。**角色动了 = C 路可行，RP2040 不用买。**
+
+### 跑闭环
 
 ```bash
 # 干跑（默认，只打印要按的键，不注入）
 python3 core/rp2040_keyboard/pc_key_driver.py --console /dev/ttyUSB0
 # 真注入（先把平台窗口点成焦点！）
 python3 core/rp2040_keyboard/pc_key_driver.py --console /dev/ttyUSB0 --arm
+# 零接线：板子直发 UDP，这里收（板子侧 --keyboard-dev udp://<本机IP>:9999）
+python3 core/rp2040_keyboard/pc_key_driver.py --udp 9999 --arm
 # 平台用 WASD
 python3 core/rp2040_keyboard/pc_key_driver.py --console /dev/ttyUSB0 --arm --keys wasd
 # 板子那边同时跑
 ./vision_board_devmem --frames 500 --echo-action
 ```
 
+**一条命令的完整闭环（SSH 管道，推荐）**——板子在 PL 上跑视觉+决策，动作经
+stdout 走 SSH 回来直接注入，PC 上不需要挂任何串口、也不用动防火墙：
+
+```bash
+ssh -i data/fpga/board_ssh/board_key root@192.168.137.242 \
+    'cd /root/board_src/build && ./vision_board_devmem --via-pl --frames 0 --keyboard-dev stdout' \
+  | python3 core/rp2040_keyboard/pc_key_driver.py --stdin --arm
+# 平台用 WASD 就再加 --keys wasd；先去掉 --arm 干跑一遍确认键位对不对
+```
+
+> ⚠ `--keyboard-dev stdout` 与 `--stdin` 是**成对**的（同一个协议的两端）。
+> 板子侧写 stdout 必须 `fflush`，否则动作会卡在用户态缓冲区里、等进程退出才吐出来
+> ——那就不是实时控制了。这点在 `tests/test_pc_key_driver.py` 里钉住了。
+
 **如果 C 能让角色动** → 闭环已经通了，RP2040 可以当成"更真实的 HID"再补。
 **如果 C 完全没反应**（角色不动，但 `pc_key_driver` 明明打印了按键）→
-平台用的是原始输入，软件注入进不去，那就必须走 **A 或 B**（真 HID 设备）。
+平台用的是原始输入，软件注入进不去，那就必须走 **A / B / D**（真 HID 设备）。
 
 > ⚠ C 会真的往**当前焦点窗口**按键。跑之前先把平台窗口点出来，别让按键打进
 > 编辑器。所以脚本默认干跑，`--arm` 才注入。
 > ⚠ 控制台同一时刻只能被一个程序读 —— 跑 C 的时候别开着 MobaXterm 读 COM3。
+> 这也是 `--udp` 存在的意义：板子直发 UDP 时不碰控制台，日志照看。
 
 ---
 
@@ -148,8 +204,23 @@ GP1，也听 **USB CDC（`sys.stdin`）**，两条输入共用同一个解析器
 python3 console_relay.py --console socket://192.168.1.5:5000 --rp2040 /dev/ttyACM0
 ```
 
+**接法 D：同一个转发，但源改成 UDP**（板子直发，PC 不再去读控制台）：
+
+```bash
+# PC 上：收 UDP，转给 RP2040
+python3 core/rp2040_keyboard/console_relay.py --udp 9999 --rp2040 /dev/ttyACM0
+# 板子上：决策直发 UDP（板子已知 PC 的 IP；WSL 里是 eth3 的 192.168.137.1）
+./vision_board_devmem --frames 200 --keyboard-dev udp://192.168.137.1:9999 --echo-action
+```
+
+比 B 好在两点：**不占控制台**（MobaXterm 可以继续看日志），以及**不需要
+PC 去认哪个 /dev/ttyUSB 是板子**。代价是要通网络（板子 192.168.137.242 ↔ WSL
+eth3 192.168.137.1，ICS 已经通了，`ping` 一下即可）。
+`--udp` 和 `--console` 二选一，其余行为（解析、看门狗、前缀）完全一致。
+
 > 选哪条：A 更"干净"（PC 不在控制环里，符合"板子当大脑"的形态），但要动板子；
-> B 立刻能跑、零风险。**先用 B 把整条链演一遍，再决定要不要做 A。**
+> B/D 立刻能跑、零风险。**先用 B 或 D 把整条链演一遍，再决定要不要做 A。**
+> **但只要平台吃合成按键，C 就够用了 —— A/B/D 全部不必做。**
 
 ## 2. ⚠️ 是 **CircuitPython**，不是 MicroPython
 

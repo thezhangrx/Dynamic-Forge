@@ -42,6 +42,8 @@ extern "C" {
 
 #include <cerrno>
 #include <fcntl.h>
+#include <netdb.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
 
@@ -139,7 +141,12 @@ Args parse_args(int argc, char** argv) {
                 "                       （标准 §6），所以必须由调用方给。默认 640x480。\n"
                 "  --player-speed       玩家速度上限（世界单位/秒）。视觉帧里没有，默认 200。\n"
                 "  --dt-default         首帧没有上一帧 stamp 时用的 dt，默认 1/30 s。\n"
-                "  --keyboard-dev P     把动作号写成 \"@MOVE <n>\\n\" 发到这个串口\n"
+                "  --keyboard-dev T     动作号发到哪儿。三种写法：\n"
+                "                         /dev/ttyPS0        （串口，RP2040 的 GP1 听这根线）\n"
+                "                         udp://192.168.137.1:9999 （**走网口**，不用接任何线）\n"
+                "                         stdout             （打到标准输出，配 SSH 管道：\n"
+                "                                             ssh 板子 '... --keyboard-dev stdout'\n"
+                "                                               | pc_key_driver.py --stdin）\n"
                 "                       （默认 /dev/ttyPS0 = 板子控制台 TX；RP2040 的 GP1\n"
                 "                        就接在这根线上，从控制台流里挑 @MOVE 行）。\n"
                 "  --no-keyboard        不发动作（只看视觉+决策）。\n"
@@ -301,23 +308,62 @@ private:
 // ---------------------------------------------------------------------------
 class ActionEmitter {
 public:
-    explicit ActionEmitter(const std::string& dev) {
-        if (dev.empty()) return;                 // 显式关掉
-        fd_ = ::open(dev.c_str(), O_WRONLY | O_NONBLOCK | O_NOCTTY);
+    //: 目标有三种写法：
+    //:   `/dev/ttyPS0`        板子控制台串口（RP2040 的 GP1 就听这根线）
+    //:   `udp://192.168.137.1:9999`  **走网口**发给 PC —— 不需要接任何线，
+    //:                        也不和控制台日志抢那一条串口
+    //:   `stdout`（或 `-`）   把 `@MOVE n` 打到标准输出。配 SSH 管道用：
+    //:                        `ssh 板子 '... --keyboard-dev stdout' | pc_key_driver.py --stdin`
+    //:                        —— 复用**已经在用**的 SSH 通道，既不用接引脚，
+    //:                        也不用动 Windows 防火墙/usbipd
+    explicit ActionEmitter(const std::string& target) {
+        if (target.empty()) return;              // 显式关掉
+        if (target == "stdout" || target == "-") { stdout_ = true; return; }
+        if (target.rfind("udp://", 0) == 0) { open_udp(target.substr(6)); return; }
+        fd_ = ::open(target.c_str(), O_WRONLY | O_NONBLOCK | O_NOCTTY);
         if (fd_ < 0) {
             std::fprintf(stderr, "⚠ 打不开键盘串口 %s：%s（这一轮不发动作）\n",
-                         dev.c_str(), std::strerror(errno));
+                         target.c_str(), std::strerror(errno));
         }
     }
-    ~ActionEmitter() { if (fd_ >= 0) ::close(fd_); }
-    bool ok() const { return fd_ >= 0; }
+    ~ActionEmitter() {
+        if (fd_ >= 0) ::close(fd_);
+        if (udp_ >= 0) ::close(udp_);
+    }
+    bool ok() const { return fd_ >= 0 || udp_ >= 0 || stdout_; }
+    //: 给启动时打一句用（说清楚发到哪儿）。
+    const char* kind() const {
+        if (stdout_)   return "标准输出";
+        if (udp_ >= 0) return "UDP";
+        if (fd_ >= 0)  return "串口";
+        return "未打开";
+    }
 
     //: 返回写出去的字节数；<0 表示这一帧丢了（已打点）。
     int emit(int action, bool noisy) {
-        if (fd_ < 0) return -1;
+        if (fd_ < 0 && udp_ < 0 && !stdout_) return -1;
         char buf[16];
         const int n = vision_board::format_action_line(action, buf, sizeof(buf));
         if (n <= 0) return -1;
+        if (stdout_) {
+            // ⚠ 必须 fflush：stdout 接管道时是**块缓冲**，不刷的话整串动作会卡在
+            // 用户态缓冲区里，直到进程退出才吐出来 —— 那就完全不是实时控制了。
+            const size_t w = std::fwrite(buf, 1, static_cast<size_t>(n), stdout);
+            std::fflush(stdout);
+            if (w != static_cast<size_t>(n)) { ++dropped_; return -1; }
+            ++sent_;
+            return n;
+        }
+        if (udp_ >= 0) {
+            // UDP：**丢了也无所谓**（键盘桥有看门狗），所以不做重传/确认，
+            // 也就绝不会把决策循环堵在这里。
+            const ssize_t w = ::sendto(udp_, buf, static_cast<size_t>(n), 0,
+                                       reinterpret_cast<const sockaddr*>(&dst_),
+                                       sizeof(dst_));
+            if (w != n) { ++dropped_; return -1; }
+            ++sent_;
+            return n;
+        }
         const ssize_t w = ::write(fd_, buf, static_cast<size_t>(n));
         if (w != n) {
             ++dropped_;
@@ -334,7 +380,32 @@ public:
     long dropped() const { return dropped_; }
 
 private:
+    void open_udp(const std::string& hostport) {
+        const size_t c = hostport.rfind(':');
+        if (c == std::string::npos) {
+            std::fprintf(stderr, "⚠ --keyboard-dev 的 udp:// 要写成 udp://主机:端口\n");
+            return;
+        }
+        const std::string host = hostport.substr(0, c);
+        const std::string port = hostport.substr(c + 1);
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        addrinfo* res = nullptr;
+        if (::getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) {
+            std::fprintf(stderr, "⚠ 解析不了 udp://%s（这一轮不发动作）\n", hostport.c_str());
+            return;
+        }
+        udp_ = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (udp_ < 0) { ::freeaddrinfo(res); return; }
+        std::memcpy(&dst_, res->ai_addr, res->ai_addrlen);
+        ::freeaddrinfo(res);
+    }
+
+    bool stdout_ = false;
     int fd_ = -1;
+    int udp_ = -1;
+    sockaddr_in dst_{};
     long sent_ = 0, dropped_ = 0;
 };
 
@@ -496,8 +567,8 @@ int main(int argc, char** argv) {
 
     ActionEmitter kb(args.keyboard_dev);
     if (!args.keyboard_dev.empty()) {
-        std::printf("键盘桥: %s（%s）\n", args.keyboard_dev.c_str(),
-                    kb.ok() ? "已打开，发 \"@MOVE <n>\" " : "**打不开**，本轮不发动作");
+        std::printf("键盘桥: %s → %s（%s）\n", args.keyboard_dev.c_str(), kb.kind(),
+                    kb.ok() ? "已打开，发 \"@MOVE <n>\"" : "**打不开**，本轮不发动作");
     } else {
         std::printf("键盘桥: 已关闭（--no-keyboard）\n");
     }
@@ -511,7 +582,7 @@ int main(int argc, char** argv) {
     long n_timed = 0;
     // `--frames 0` = 不限帧数，一直跑到输入结束（实时采集用）
     const long want_frames = args.frames > 0 ? args.frames : 1000000000L;
-    for (long i = 0; i < want_frames; ++i) {
+    for (int i = 0; i < want_frames; ++i) {
         // ---- 取这一帧的像素（统一入口：PPM 或 stdin）------------------
         // 两条下游（PL 推像素 / PS 参考模型）**吃同一份 rgb** ——
         // 否则 --verify-both 比的就不是"两条像素通路"而是"两张图"。
@@ -624,7 +695,7 @@ int main(int argc, char** argv) {
             const GeometryFrame frame = parse_geometry_frame(bytes);
             const FrameHeader& h = frame.header;
             ++ok;
-            std::printf("帧 %4ld: seq=%u  长度=%zu B  障碍=%u  缺口=%u  "
+            std::printf("帧 %4d: seq=%u  长度=%zu B  障碍=%u  缺口=%u  "
                         "尺寸=%ux%u  stamp=%llu ns%s\n",
                         i, h.seq, bytes.size(), h.n_obs, h.n_gaps,
                         h.img_w, h.img_h,

@@ -230,6 +230,18 @@ ffmpeg -f v4l2 -i /dev/video0 -frames:v 1 -pix_fmt rgb24 /root/cam.ppm
 `@MOVE ` 前缀、RP2040 只挑带前缀的行。跑之前 `dmesg -n 1` 把内核日志压下去，
 线上会干净很多。
 
+**动作行还能发到哪儿**（`--keyboard-dev`，三种写法，同一份 `@MOVE n\n` 协议）：
+
+| 目标 | 用途 | 状态 |
+|---|---|---|
+| `/dev/ttyPS0`（默认） | 控制台串口 ↔ RP2040 的 GP1 | ✅ 真机串口实收 |
+| `stdout` | **SSH 管道**：`ssh 板子 '… --keyboard-dev stdout' \| pc_key_driver.py --stdin` | ✅ 真机验过（`--via-pl` + SSH + 驱动按键差集） |
+| `udp://IP:PORT` | 走网口直发 PC | ⚠ 本机网络下板子→WSL 不通（WSL mirrored 模式 + Hyper-V 防火墙），见 `core/rp2040_keyboard/README.md` |
+
+> `stdout` 那条**最省事**：复用已经在用的 SSH 通道，不用接引脚、不用 `usbipd`
+> 挂串口、不用改防火墙。注意写 stdout 必须 `fflush`（管道是块缓冲，不刷就等
+> 进程退出才吐，等于没有实时性），这点在 `core/board/tests/test_pc_key_driver.py` 钉住了。
+
 ## 7. 还差什么
 
 | # | 缺的东西 | 说明 |
@@ -240,3 +252,5 @@ ffmpeg -f v4l2 -i /dev/video0 -frames:v 1 -pix_fmt rgb24 /root/cam.ppm
 | 4 | **移动墙的速度** | 线协议不带速度，PS 侧要按 `stamp` 差分出来再填进 `Rect.vx/vy` |
 | 5 | ~~上板实测~~ | ✅ 已完成（2026-10-15）：自检通过、8 帧全解码、决策 8 帧、**72～77 帧/秒**；键盘行串口实收。见 `core/fpga/docs/板上验证.md` §4/§6 |
 | 6 | **RP2040 那一端** | 板子侧已验（串口实收 `@MOVE n`）；RP2040 要刷 CircuitPython + 拷 `adafruit_hid` + 接两根线。见 `core/rp2040_keyboard/README.md` |
+| 7 | ~~动作怎么送到 PC（零接线）~~ | ✅ 已完成：`--keyboard-dev stdout` + SSH 管道 + `pc_key_driver.py --stdin`，真机验过 |
+| 8 | **平台收不收合成按键** | 唯一还没验的一环，只能人眼判：`pc_key_driver.py --press 3 --arm --delay-s 3`（先把平台窗口点成焦点），角色动了就说明 C 路成立、RP2040 不用买 |

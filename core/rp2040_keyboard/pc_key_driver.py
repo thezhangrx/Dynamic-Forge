@@ -24,14 +24,37 @@
 
 ## 用法
 
+    # 0) 先问"注入这条路通不通"（不按键、不用板子，1 秒出结果）
+    python3 pc_key_driver.py --probe
+
     # 1) 干跑：只打印它要按的键，不注入（**默认就是干跑**，防误触）
     python3 pc_key_driver.py --console /dev/ttyUSB0
 
     # 2) 真注入（会往当前焦点窗口按键！先把平台窗口点出来）
     python3 pc_key_driver.py --console /dev/ttyUSB0 --arm
 
+    # 3) 平台到底收不收合成按键？单发一次，倒计时留出点窗口的时间：
+    #    跑起来后 3 秒内把平台窗口点成焦点，看角色动不动
+    python3 pc_key_driver.py --press 3 --arm --delay-s 3 --hold-ms 300
+
+    # 4) 零接线：板子用 --keyboard-dev udp://<本机IP>:9999 直发，这里收 UDP
+    python3 pc_key_driver.py --udp 9999 --arm
+
+    # 5) **最省事的一条**：走已有的 SSH 通道，板子把动作打到 stdout，管道喂进来。
+    #    不用接引脚、不用 usbipd 挂串口、也不用动 Windows 防火墙：
+    ssh -i <key> root@192.168.137.242 \
+        'cd /root/board_src/build && ./vision_board_devmem --via-pl --frames 0 \
+         --keyboard-dev stdout' \
+      | python3 pc_key_driver.py --stdin --arm
+
+    注意 `--keyboard-dev stdout` 必须**成对**用 `--stdin` 收：两边是同一个协议，
+    管道里混着的日志（"帧 3: …"）会被解析器按前缀自动丢掉。
+
     # 平台用 WASD 而不是方向键
     python3 pc_key_driver.py --console /dev/ttyUSB0 --arm --keys wasd
+
+`--press` 是判定"平台收不收合成输入"的唯一可靠办法：**一次按键、你能亲眼看到**，
+比看日志猜强。它按一下就退出，不会把键卡住。
 
 ⚠ **控制台同一时刻只能被一个程序读**：跑这个脚本时别再开着 MobaXterm 读 COM3。
 ⚠ `--arm` 会真的按键。先把平台窗口点成焦点，别让按键打进编辑器里。
@@ -40,7 +63,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
+import select
+import socket
 import subprocess
 import sys
 import time
@@ -119,20 +145,136 @@ def _spawn_injector(quiet: bool = True) -> subprocess.Popen:
                             stderr=subprocess.PIPE, text=True, bufsize=1)
 
 
+def probe() -> int:
+    """只验证"PowerShell 注入器能不能起来"，不按任何键。
+
+    失败原因通常就三种：不在 WSL 里跑（没有 powershell.exe）、
+    Windows 那边禁了脚本执行、或者 WSL 互操作被关掉了。
+    先在这里把它排除掉，免得后面调平台时误判成"平台不认合成按键"。
+    """
+    print(f"注入器脚本：{HERE / 'win_sendinput.ps1'}")
+    try:
+        inj = _spawn_injector(quiet=True)
+    except FileNotFoundError:
+        print("✗ 找不到 powershell.exe —— 要在 WSL 里跑（Windows 互操作）")
+        return 1
+    time.sleep(1.0)                      # 等 Add-Type 编完
+    if inj.poll() is not None:
+        err = (inj.stderr.read() if inj.stderr else "") or "(无输出)"
+        print(f"✗ 注入器起不来（退出码 {inj.returncode}）：\n{err}")
+        return 1
+    try:
+        inj.stdin.write("ALLUP\nQUIT\n"); inj.stdin.flush()
+        inj.wait(timeout=3)
+    except Exception:
+        inj.kill()
+    print("✓ PowerShell 注入器可用 —— 合成按键这条路是通的")
+    print("  下一步：平台窗口点出来，然后 --press 3 --arm --delay-s 3")
+    return 0
+
+
+def press_once(action: int, keymap: str, delay_s: float, hold_ms: int,
+               arm: bool) -> int:
+    """单发一个动作（按住 → 松开），用来肉眼判定平台收不收合成按键。"""
+    if not 0 <= action < len(DISCRETE_ACTION_NAMES):
+        print(f"动作号 {action} 越界（协议只有 0..{len(DISCRETE_ACTION_NAMES) - 1}）")
+        return 2
+    want = keys_for_action(action, keymap)
+    if not want:
+        # 动作 0 是 stay —— 合法，但它本来就不按键，拿它测"平台收不收"没有意义
+        print(f"动作 {action}（{DISCRETE_ACTION_NAMES[action]}）不按任何键，"
+              f"换 1..{len(DISCRETE_ACTION_NAMES) - 1} 里的一个来测")
+        return 2
+    inj = None
+    if arm:
+        try:
+            inj = _spawn_injector(quiet=True)
+        except FileNotFoundError:
+            sys.exit("找不到 powershell.exe —— 这个脚本要在 WSL 里跑（Windows 互操作）")
+        time.sleep(1.0)
+        if inj.poll() is not None:
+            err = inj.stderr.read() if inj.stderr else ""
+            sys.exit(f"注入器起不来：\n{err}")
+    print(f"动作 {action}（{DISCRETE_ACTION_NAMES[action]}）→ 按住 {want} "
+          f"{hold_ms} ms，{delay_s:g} 秒后开始"
+          f"{'' if arm else '  [干跑，加 --arm 才真的按]'}")
+    if delay_s > 0:
+        print("  现在把平台窗口点成焦点 …", flush=True)
+        time.sleep(delay_s)
+    try:
+        if inj:
+            for k in want:
+                inj.stdin.write(f"DN {k}\n"); inj.stdin.flush()
+        print("  ↓ 按住", flush=True)
+        time.sleep(max(0, hold_ms) / 1000.0)
+        if inj:
+            for k in want:
+                inj.stdin.write(f"UP {k}\n"); inj.stdin.flush()
+        print("  ↑ 松开", flush=True)
+    finally:
+        if inj:
+            try:
+                inj.stdin.write("ALLUP\nQUIT\n"); inj.stdin.flush()
+                inj.wait(timeout=3)
+            except Exception:
+                inj.kill()
+    if arm:
+        print("  看到了吗？角色动了 → 平台收合成按键，RP2040 不用买了。")
+        print("  没动 → 平台多半走原始输入，去走 RP2040 那条路（README 路径 A/B）。")
+    return 0
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="板子控制台 @MOVE → PC 按键注入")
-    ap.add_argument("--console", required=True,
+    ap = argparse.ArgumentParser(description="板子 @MOVE → PC 按键注入（不用 RP2040）")
+    ap.add_argument("--console",
                     help="板子控制台串口（/dev/ttyUSB0、COM3、socket://host:port）")
+    ap.add_argument("--udp", type=int, metavar="PORT",
+                    help="改成**收 UDP**：板子用 --keyboard-dev udp://<本机IP>:PORT 直发。"
+                         "零接线，也不和控制台日志抢串口")
     ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--stdin", action="store_true",
+                    help="从标准输入读 `@MOVE` 行（配 SSH 管道："
+                         "板子 --keyboard-dev stdout | 本脚本 --stdin）")
     ap.add_argument("--keys", choices=sorted(VK), default="arrows",
                     help="平台认哪套键（默认方向键）")
     ap.add_argument("--arm", action="store_true",
                     help="**真的注入按键**（默认只干跑打印）。会打到当前焦点窗口，先点出平台窗口")
     ap.add_argument("--timeout-ms", type=int, default=DEFAULT_TIMEOUT_MS,
                     help="断流多久就全松（默认 500ms，与 code.py 一致）")
+    ap.add_argument("--probe", action="store_true",
+                    help="只检查注入器能不能起来（不按键、不用板子），然后退出")
+    ap.add_argument("--press", type=int, metavar="ACTION",
+                    help="单发一个动作号后退出（配合 --delay-s 用来判定平台收不收合成按键）")
+    ap.add_argument("--delay-s", type=float, default=3.0,
+                    help="--press 前留多少秒给你点平台窗口（默认 3）")
+    ap.add_argument("--hold-ms", type=int, default=300,
+                    help="--press 按住多久（默认 300ms）")
     args = ap.parse_args()
 
-    con = _open_serial(args.console, args.baud)
+    if args.probe:
+        return probe()
+    if args.press is not None:
+        return press_once(args.press, args.keys, args.delay_s, args.hold_ms, args.arm)
+    n_src = sum([bool(args.console), args.udp is not None, args.stdin])
+    if n_src == 0:
+        ap.error("要么给 --console / --udp / --stdin，要么用 --probe / --press 自检")
+    if n_src > 1:
+        ap.error("--console / --udp / --stdin 只能选一个（三路都是动作来源）")
+
+    sk = None
+    if args.stdin:
+        con = None
+        src = "标准输入（SSH 管道）"
+    elif args.udp is not None:
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sk.bind(("0.0.0.0", args.udp))
+        sk.settimeout(0.05)              # 短超时：否则看门狗没机会跑
+        con = None
+        src = f"UDP :{args.udp}"
+    else:
+        con = _open_serial(args.console, args.baud)
+        src = f"控制台 {args.console}"
     inj = None
     if args.arm:
         try:
@@ -144,9 +286,29 @@ def main() -> int:
             err = inj.stderr.read() if inj.stderr else ""
             sys.exit(f"注入器起不来：\n{err}")
 
-    print(f"控制台 {args.console}  键位 {args.keys}  "
+    print(f"{src}  键位 {args.keys}  "
           f"{'**真注入**' if args.arm else '干跑（加 --arm 才真的按键）'}"
-          f"   Ctrl-C 退出")
+          f"   Ctrl-C 退出", flush=True)
+
+    def read_chunk() -> bytes | None:
+        """UDP / 串口 / 标准输入统一成一个"可能返回空"的读接口，看门狗才能插进来。
+
+        返回 `None` 专门表示**输入结束**（管道那头关了）：串口/UDP 没有"结束"这个
+        状态，只有 stdin 有。EOF 时不能一直空转，得干净收工并把键松开。
+        """
+        if sk is not None:
+            try:
+                return sk.recv(512)
+            except socket.timeout:
+                return b""
+        if con is not None:
+            return con.read(256)
+        # stdin：管道是块缓冲的，select 能等到"有数据或 EOF"，两边都不空转
+        r, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not r:
+            return b""
+        data = os.read(sys.stdin.fileno(), 512)
+        return None if not data else data
 
     buf = bytearray()
     held: tuple[int, ...] = ()
@@ -167,7 +329,10 @@ def main() -> int:
 
     try:
         while True:
-            chunk = con.read(256)
+            chunk = read_chunk()
+            if chunk is None:
+                print("输入结束（管道那头关了），收工", flush=True)
+                break
             if chunk:
                 for n in parse_moves(chunk, buf):
                     want = keys_for_action(n, args.keys)
@@ -191,7 +356,10 @@ def main() -> int:
                 inj.wait(timeout=3)
             except Exception:
                 inj.kill()
-        con.close()
+        if sk is not None:
+            sk.close()
+        if con is not None:
+            con.close()
     return 0
 
 

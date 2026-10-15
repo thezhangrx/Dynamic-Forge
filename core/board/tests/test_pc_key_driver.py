@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import pathlib
 import re
+import select
 import shutil
+import socket
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -152,3 +155,155 @@ def test_powershell_injector_loads_and_pings() -> None:
         input="PING\nQUIT\n", capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, f"注入器退出码 {r.returncode}：\n{r.stdout}\n{r.stderr}"
     assert "PONG" in r.stdout, f"注入器没应答 PONG：\n{r.stdout}\n{r.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# 3) 命令行契约：C 路的入口就这几条命令，行为不能悄悄变
+# ---------------------------------------------------------------------------
+def _run(*argv: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(RP2040 / "pc_key_driver.py"), *argv],
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def test_source_is_required_and_exclusive() -> None:
+    """不给来源 / 同时给两个来源，都必须报错退出（而不是默默干等）。"""
+    r = _run("--press", "0", "--delay-s", "0")     # 有 --press，不走来源检查
+    assert r.returncode == 2, r.stdout + r.stderr
+    r = _run("--console", "socket://127.0.0.1:1", "--udp", "0")
+    assert r.returncode != 0, "两个来源同时给应当报错"
+    assert "只能选一个" in (r.stdout + r.stderr)
+
+
+def test_press_rejects_out_of_range_and_stay() -> None:
+    """`--press` 是判定"平台收不收合成按键"的手段，越界和 stay 都测不出东西。"""
+    assert _run("--press", "99", "--delay-s", "0").returncode == 2
+    r = _run("--press", "0", "--delay-s", "0")
+    assert r.returncode == 2 and "不按任何键" in r.stdout
+
+
+def test_press_dry_run_prints_both_edges() -> None:
+    """干跑也必须把"按住/松开"两个边都打出来，否则看不出会不会卡键。"""
+    r = _run("--press", "3", "--delay-s", "0", "--hold-ms", "50")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "按住" in r.stdout and "松开" in r.stdout
+    assert "干跑" in r.stdout, "默认必须是干跑，不能真按键"
+
+
+def test_udp_source_matches_console_source() -> None:
+    """UDP 源和串口源必须产生**同一串按键** —— 换传输不该改变行为。"""
+    # 探针 socket 必须先关掉再起子进程：否则它自己占着这个端口，
+    # 子进程 bind 会 EADDRINUSE（这条测试最初就是这么挂的）。
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    p = subprocess.Popen(
+        [sys.executable, str(RP2040 / "pc_key_driver.py"), "--udp", str(port)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        # 等它说出"就绪"再发：绑端口之前的报文会被内核丢掉（同 relay 那条测试）
+        deadline = time.monotonic() + 10.0
+        ready = False
+        while time.monotonic() < deadline and not ready:
+            r, _, _ = select.select([p.stdout], [], [], deadline - time.monotonic())
+            if not r:
+                break
+            line = p.stdout.readline()
+            if not line:
+                break
+            ready = "UDP :" in line
+        assert ready, "驱动没在 10s 内就绪"
+
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sk.sendto(b"@MOVE 1\n", ("127.0.0.1", port))       # left
+        time.sleep(0.3)
+        sk.sendto(b"@MOVE 1\n", ("127.0.0.1", port))       # 同向：不该有任何按键变化
+        time.sleep(0.3)
+        sk.sendto(b"@MOVE 5\n", ("127.0.0.1", port))       # up_left：LEFT 保持，只加 UP
+        time.sleep(0.3)
+        sk.sendto(b"@MOVE 0\n", ("127.0.0.1", port))       # stay：全松
+        time.sleep(0.3)
+        sk.close()
+        p.terminate()
+        out, _ = p.communicate(timeout=10)
+    finally:
+        if p.poll() is None:
+            p.kill()
+
+    vk_left, vk_up = drv.VK["arrows"]["LEFT"], drv.VK["arrows"]["UP"]
+    # 只算"真的按了键"的行：松开-only 的行前缀同样是「→ 按住 」（按住空列表），
+    # 直接 count("→ 按住") 会把松开那行也算进去（这条断言最初就是这么错的）。
+    presses = [ln for ln in out.splitlines()
+               if "→ 按住" in ln and "按住 []" not in ln]
+    assert len(presses) == 2, f"同向重复不该再按键，应当只有 2 次按下：\n{out}"
+    assert f"按住 [{vk_left}] 松开 []" in out, out
+    assert f"按住 [{vk_up}] 松开 []" in out, f"斜向应当只加 UP：\n{out}"
+    # 松开顺序 = keys_for_action 的顺序（先 y 后 x），两个键都要松掉
+    assert f"按住 [] 松开 [{vk_up}, {vk_left}]" in out, f"stay 应当全松：\n{out}"
+
+
+# ---------------------------------------------------------------------------
+# 4) SSH 管道：板子 `--keyboard-dev stdout` | 驱动 `--stdin`
+#
+# 这条路是 C 路里最省事的一条：复用已经在用的 SSH 通道，不用接引脚、不用
+# usbipd 挂串口、也不用动 Windows 防火墙。它是**成对**的：发射端写 stdout，
+# 接收端读 stdin，两边任何一边被改掉，命令就静默不工作了 —— 所以两边一起钉。
+# ---------------------------------------------------------------------------
+def test_stdin_source_end_to_end() -> None:
+    """管道里混着日志也要只挑 `@MOVE` 行，读完 EOF 要干净收工。"""
+    stream = (
+        '键盘桥: stdout → 标准输出（已打开，发 "@MOVE <n>"）\n'
+        "帧    1: seq=1  长度=76 B  障碍=0  缺口=0  尺寸=640x360\n"
+        "@MOVE 1\n"           # left
+        "@MOVE 1\n"           # 同向重复：不该再按
+        "  动作: 1 (left)\n"   # 日志里也带动作号，但不是协议行，必须忽略
+        "@MOVE 5\n"           # up_left：只加 UP
+        "@MOVE 0\n"           # stay：全松
+    ).encode("utf-8")
+    r = subprocess.run(
+        [sys.executable, str(RP2040 / "pc_key_driver.py"), "--stdin"],
+        input=stream, capture_output=True, timeout=30)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout.decode("utf-8", "replace")
+    vk_left, vk_up = drv.VK["arrows"]["LEFT"], drv.VK["arrows"]["UP"]
+    # 只算"真的按了键"的行（松开行也以「→ 按住 」开头，见上一条测试的坑）
+    presses = [ln for ln in out.splitlines()
+               if "→ 按住" in ln and "按住 []" not in ln]
+    assert len(presses) == 2, f"应当只按两次（left、left+up）：\n{out}"
+    assert f"按住 [{vk_left}] 松开 []" in out, out
+    assert f"按住 [{vk_up}] 松开 []" in out, f"斜向只该加 UP：\n{out}"
+    assert f"按住 [] 松开 [{vk_up}, {vk_left}]" in out, f"stay 该全松：\n{out}"
+    assert "输入结束" in out, f"管道关了应当收工退出（否则会空转）：\n{out}"
+
+
+def test_stdin_is_mutually_exclusive_with_other_sources() -> None:
+    r = _run("--stdin", "--udp", "0")
+    assert r.returncode != 0 and "只能选一个" in (r.stdout + r.stderr), r.stdout + r.stderr
+
+
+def test_emitter_has_matching_stdout_sink() -> None:
+    """发射端必须有配对的 `stdout` 目标，而且**必须 flush**。
+
+    stdout 接管道时是块缓冲的 —— 不 flush 的话动作串会卡在用户态缓冲区里，
+    直到进程退出才吐出来，那就完全不是实时控制了（这个坑很隐蔽：干跑看着
+    "有输出"，因为退出时刷了）。
+    """
+    src = (ROOT / "core" / "board" / "main.cpp").read_text(encoding="utf-8")
+    assert re.search(r'target\s*==\s*"stdout"\s*\|\|\s*target\s*==\s*"-"', src), \
+        "main.cpp 的 ActionEmitter 不认 stdout / - 这种目标"
+    assert "stdout_ = true" in src, "少了 stdout 目标的置位"
+    assert re.search(r"std::fflush\(stdout\)", src), \
+        "写 stdout 后必须 fflush，否则管道里拿不到实时动作"
+    # 帮助文本是多个相邻字符串字面量拼起来的，所以按**原文位置**截一段来看
+    at = src.index("--keyboard-dev T")
+    assert "stdout" in src[at:at + 400], \
+        "--keyboard-dev 的帮助文本里要写清 stdout 这种写法"
+
+
+def test_readme_documents_the_ssh_pipeline() -> None:
+    """文档里的这条命令两端必须成套出现，否则用户照着敲就是坏的。"""
+    for name in ("README.md", "pc_key_driver.py"):
+        text = (RP2040 / name).read_text(encoding="utf-8")
+        assert "--keyboard-dev stdout" in text, f"{name} 少了发射端写法"
+        assert "--stdin" in text, f"{name} 少了接收端写法"

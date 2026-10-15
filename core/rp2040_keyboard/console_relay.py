@@ -89,8 +89,11 @@ def _open_serial(port: str, baud: int):
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="板子控制台 → RP2040 USB 串口 转发")
+    ap = argparse.ArgumentParser(description="板子的 @MOVE 行 → RP2040 USB 串口 转发")
     ap.add_argument("--console", help="板子控制台串口（CP210x，如 /dev/ttyUSB0）")
+    ap.add_argument("--udp", type=int, metavar="PORT",
+                    help="改成**收 UDP**（板子用 --keyboard-dev udp://本机IP:PORT 直发）。"
+                         "不需要接任何线，也不和控制台日志抢串口")
     ap.add_argument("--rp2040", help="RP2040 的 USB 串口（CDC，如 /dev/ttyACM0）")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--dry-run", action="store_true", help="只打印挑出的动作，不写串口")
@@ -106,18 +109,43 @@ def main() -> int:
             print(f"  {p.device}  {p.description}")
         return 0
 
-    if not args.console:
-        ap.error("要么给 --list，要么给 --console（和 --rp2040）")
+    if not args.console and args.udp is None:
+        ap.error("要么给 --list，要么给 --console / --udp（和 --rp2040）")
     if not args.rp2040 and not args.dry_run:
         ap.error("需要 --rp2040（或者用 --dry-run 只看不写）")
 
-    con = _open_serial(args.console, args.baud)
     rp = None if args.dry_run else _open_serial(args.rp2040, args.baud)
-    print(f"控制台 {args.console} → {'(dry-run)' if rp is None else args.rp2040}"
-          f"   前缀 {PREFIX!r}   Ctrl-C 退出")
-
     buf = bytearray()
     n_sent = 0
+
+    if args.udp is not None:
+        # ---- UDP 源：板子直发（--keyboard-dev udp://...）----
+        import socket as _socket
+        sk = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        sk.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        sk.bind(("0.0.0.0", args.udp))
+        print(f"UDP :{args.udp} → {'(dry-run)' if rp is None else args.rp2040}"
+              f"   前缀 {PREFIX!r}   Ctrl-C 退出", flush=True)
+        try:
+            while True:
+                data, _peer = sk.recvfrom(512)
+                for n in parse_moves(data, buf):
+                    line = PREFIX + str(n).encode("ascii") + b"\n"
+                    if rp is not None:
+                        rp.write(line)
+                    n_sent += 1
+                    print(f"  → {line!r}  (累计 {n_sent})", flush=True)
+        except KeyboardInterrupt:
+            print(f"\n转发 {n_sent} 行后退出")
+        finally:
+            sk.close()
+            if rp is not None:
+                rp.close()
+        return 0
+
+    con = _open_serial(args.console, args.baud)
+    print(f"控制台 {args.console} → {'(dry-run)' if rp is None else args.rp2040}"
+          f"   前缀 {PREFIX!r}   Ctrl-C 退出", flush=True)
     try:
         while True:
             chunk = con.read(256)
