@@ -165,6 +165,15 @@ public:
     //  **它必须与 :meth:`run_frame` 给出逐字节相同的结果** —— 协同仿真的
     //  `tb_axi --fifo` 就是在证这一条（同一批真实照片，两条像素通路）。
 
+    //: 上一帧的分段耗时（毫秒）。实时那条路上"到底慢在哪"必须实测，不能猜 ——
+    //: ffmpeg 单独跑 720p MJPG 有 54 帧/秒，而端到端曾经只有 8.5 帧/秒，
+    //: 差的那 ~100ms 全在这两段里（推字 / 等流水线）。
+    struct FrameTiming {
+        double push_ms = 0.0;   // 把 691200 字节按 32 位字推给 PL
+        double wait_ms = 0.0;   // 等 busy 拉高再落 + 读 FLEN + 读窗口
+    };
+    const FrameTiming& last_timing() const { return timing_; }
+
     //: 像素源：``false`` = 外部 ``din_*``（板上是 tpg_source），``true`` = PS 的 FIFO。
     void set_pixel_source(bool from_fifo);
     //: 清空像素 FIFO 与溢出标志（换源/开新帧之前调）。
@@ -207,6 +216,8 @@ private:
     //: 从"已经写了 start"开始：等 busy 拉高再落，按 FLEN 读窗口。
     //: 两条像素通路（外部 din_* / PS 推 FIFO）共用。
     std::vector<uint8_t> finish_frame(int timeout_ms);
+
+    FrameTiming timing_;
 };
 
 }   // namespace vision_board

@@ -21,6 +21,7 @@
 #include "gap_avoid.hpp"
 #include "action_codec.hpp"
 #include "ppm_reader.hpp"
+#include "rgb_source.hpp"
 
 // C 参考模型（黄金模型）。板子上编它 = 给"真摄像头"一条**不需要 PL** 的通路，
 // 同时也是 PL 那侧的参照（协同仿真里同一个函数就是判据）。
@@ -78,6 +79,16 @@ struct Args {
     //: `--via-pl`：PPM 的像素**推进 PL 的 FIFO**，几何帧由 PL 产出
     //: （而不是在 PS 上跑黄金模型）。真摄像头要走 FPGA 加速时用这个。
     bool via_pl = false;
+    //: `--stdin-rgb`：帧从**标准输入**读原始 RGB24（`W*H*3` 字节一帧、无头）。
+    //: 实时采集走这条 —— 一次开设备、连续出帧，不像 `--ppm` 那样每帧重开设备。
+    //:    ffmpeg ... -pix_fmt rgb24 -f rawvideo - | ./vision_board_devmem --stdin-rgb
+    //: `--timing`：每帧打印分段耗时（读像素 / 推 PL / 等流水线），并在末尾给平均。
+    //: 实时那条路必须知道"慢在哪一段"——否则只能靠猜。
+    bool timing = false;
+    bool stdin_rgb = false;
+    //: 丢掉开头几帧：摄像头自动曝光要好几帧才收敛（实测第 5~9 帧才稳，早期抓到过
+    //: 全黑的第 1 帧）。**不是可选项** —— 不丢就是拿到黑图。
+    int skip_frames = 10;
     //: `--verify-both`：同一张图**两条路都跑一遍**（PL 推像素 + PS 黄金模型），
     //: 比对几何帧是否**逐字节相同**。这是"PL 吃真图"在真硅上的等价性判据
     //: —— 协同仿真的 `tb_axi --fifo` 证的是同一件事。
@@ -110,6 +121,9 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--dt-default")   a.dt_default = std::atof(next());
         else if (k == "--ppm")          a.ppm_file = next();
         else if (k == "--via-pl")       a.via_pl = true;
+        else if (k == "--stdin-rgb")    a.stdin_rgb = true;
+        else if (k == "--timing")       a.timing = true;
+        else if (k == "--skip-frames")  a.skip_frames = std::atoi(next());
         else if (k == "--verify-both")  a.verify_both = true;
         else if (k == "--ppm-dir")      a.ppm_dir = next();
         else if (k == "--keyboard-dev") a.keyboard_dev = next();
@@ -216,7 +230,22 @@ public:
         frame_.resize(8192);
     }
 
-    //: 取第 i 帧的几何帧字节。失败返回 false 并把原因写进 why。
+    //: 用**外部给的**像素跑参考模型（与 :meth:`next` 的唯一区别是"图从哪来"）。
+    //:
+    //: `--verify-both` 与实时（stdin）那条路都用它 —— 两条路**必须吃同一份像素**，
+    //: 否则比的就不是"两条像素通路"，而是"两张图"，那样的对账没有意义。
+    bool next_from(const std::vector<uint8_t>& rgb, int w, int h,
+                   uint32_t seq, uint64_t stamp_ns,
+                   std::vector<uint8_t>* out, std::string* why) {
+        if (w <= 0 || h <= 0) { *why = "图尺寸非法"; return false; }
+        if (static_cast<size_t>(w) * static_cast<size_t>(h) > gray_.size()) {
+            *why = "图太大（缓冲只准备了 1M 像素）";
+            return false;
+        }
+        return run(rgb.data(), w, h, seq, stamp_ns, out, why);
+    }
+
+    //: 取第 i 帧的几何帧字节（从文件/目录读图）。
     bool next(int i, uint32_t seq, uint64_t stamp_ns,
               std::vector<uint8_t>* out, std::string* why) {
         std::string path;
@@ -227,16 +256,18 @@ public:
         } else {
             path = file_;
         }
-        if (!vision_board::read_ppm_p6(path, &w_, &h_, &rgb_, why)) return false;
-        if (w_ <= 0 || h_ <= 0) { *why = "图尺寸非法"; return false; }
-        if (static_cast<size_t>(w_) * static_cast<size_t>(h_) > gray_.size()) {
-            *why = "图太大（缓冲只准备了 1M 像素）";
-            return false;
-        }
+        int w = 0, h = 0;
+        if (!vision_board::read_ppm_p6(path, &w, &h, &rgb_, why)) return false;
+        w_ = w; h_ = h;
+        return next_from(rgb_, w, h, seq, stamp_ns, out, why);
+    }
 
+private:
+    bool run(const uint8_t* rgb, int w, int h, uint32_t seq, uint64_t stamp_ns,
+             std::vector<uint8_t>* out, std::string* why) {
         VrRefResult res;
         std::memset(&res, 0, sizeof(res));
-        const int rc = vr_ref_process_ex(rgb_.data(), w_, h_, 1,
+        const int rc = vr_ref_process_ex(rgb, w, h, 1,
                                          gray_.data(), wall_.data(),
                                          bright_.data(), rowc_.data(),
                                          &res, frame_.data(), frame_.size(),
@@ -246,6 +277,7 @@ public:
         return true;
     }
 
+public:
     int width() const { return w_; }
     int height() const { return h_; }
 
@@ -382,8 +414,9 @@ int main(int argc, char** argv) {
     std::printf("设备: %s\n", args.device_url.c_str());
 
     const bool have_ppm = !args.ppm_file.empty() || !args.ppm_dir.empty();
+    const bool have_src = have_ppm || args.stdin_rgb;
     // 走 PL 时**不**用 PS 参考模型：像素推给 PL，几何帧从 PL 读回来
-    const bool use_ref = have_ppm && !args.via_pl && !args.verify_both;
+    const bool use_ref = have_src && !args.via_pl && !args.verify_both;
 
     // ---- 打开 PL（只有走 PL 那条路才需要）--------------------------------
     RegIo* io = nullptr;
@@ -405,24 +438,38 @@ int main(int argc, char** argv) {
     //   `--verify-both` 要**同时**建 ref 与 drv（两条路都要跑）。写成 else 的话
     //   只建了 ref，而帧循环里会去调 `drv->run_frame_push(...)` → **空指针段错误**
     //   （实测 exit 139，而且现象是"打印看起来正常、下一行就崩"，不好定位）。
+    // 每帧的像素来源（PPM 文件/目录，或 stdin 的原始 RGB）
+    //
+    // stdin 那条用 :class:`StdinPump`（**读线程**）：实测三段是串行的
+    // （等采集 33 + 推PL 17 + 等流水线 21 = 72ms ≈ 14 帧/秒），而读线程能在主线程
+    // 推像素/等流水线的时候把下一帧读好，重叠之后接近 max(33, 38) ≈ 40ms。
+    std::unique_ptr<RgbSource> src;
+    std::unique_ptr<StdinPump> pump;
+    if (args.stdin_rgb) {
+        pump.reset(new StdinPump(kPlWidth, kPlHeight, args.skip_frames, args.frames));
+        std::printf("帧来源: **stdin 原始 RGB**（%dx%d，丢掉开头 %d 帧热身，读线程重叠）\n"
+                    "  管道缓冲 = %d 字节（要 ≥1 帧 691200 才谈得上重叠；"
+                    "不够就在启动脚本里调 /proc/sys/fs/pipe-max-size）\n",
+                    kPlWidth, kPlHeight, args.skip_frames, pump->pipe_bytes());
+    } else if (have_ppm) {
+        src.reset(new PpmSource(args.ppm_file, args.ppm_dir));
+    }
     if (use_ref || args.verify_both) {
         ref.reset(new RefFrameSource(args));
-        std::printf("帧来源: PS 参考模型 (%s)\n",
-                    args.ppm_dir.empty() ? args.ppm_file.c_str() : args.ppm_dir.c_str());
     }
     if (!use_ref) {
         drv.reset(new VisionDriver(*io));
         if (args.verify_both) {
-            std::printf("帧来源: **两条都跑**（PL 推像素 vs PS 黄金模型，逐字节比）\n");
+            std::printf("PL: **两条都跑**（PL 推像素 vs PS 黄金模型，逐字节比）\n");
             drv->set_pixel_source(true);
             drv->flush_pixels();
-        } else if (have_ppm) {
-            std::printf("帧来源: PL（像素由 PS 推入 FIFO，帧取自 %s）\n",
-                        args.ppm_dir.empty() ? args.ppm_file.c_str() : args.ppm_dir.c_str());
+        } else if (have_src) {
+            std::printf("PL: 像素由 PS 推入 FIFO（来自 %s）\n",
+                        pump ? "stdin 原始 RGB（读线程）" : src->kind());
             drv->set_pixel_source(true);
             drv->flush_pixels();
         } else {
-            std::printf("帧来源: PL（外部 din_*，板上是 tpg_source）\n");
+            std::printf("PL: 外部 din_*（板上是 tpg_source）\n");
         }
     }
 
@@ -460,29 +507,53 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     int ok = 0, bad = 0;
     uint64_t stamp_ns = 0;
-    for (int i = 0; i < args.frames; ++i) {
+    double sum_read = 0, sum_push = 0, sum_wait = 0, sum_total = 0;
+    long n_timed = 0;
+    // `--frames 0` = 不限帧数，一直跑到输入结束（实时采集用）
+    const long want_frames = args.frames > 0 ? args.frames : 1000000000L;
+    for (long i = 0; i < want_frames; ++i) {
+        // ---- 取这一帧的像素（统一入口：PPM 或 stdin）------------------
+        // 两条下游（PL 推像素 / PS 参考模型）**吃同一份 rgb** ——
+        // 否则 --verify-both 比的就不是"两条像素通路"而是"两张图"。
+        const auto t_frame0 = std::chrono::steady_clock::now();
+        std::vector<uint8_t> rgb;
+        int pw = 0, ph = 0;
+        if (pump) {
+            std::string swhy;
+            if (!pump->get(&rgb, &swhy)) {
+                if (i > 0) break;
+                std::fprintf(stderr, "第一帧就取不到像素：%s\n", swhy.c_str());
+                ++bad; break;
+            }
+            pw = kPlWidth; ph = kPlHeight;
+        } else if (src) {
+            std::string swhy;
+            if (!src->next(&rgb, &pw, &ph, &swhy)) {
+                // 没有更多帧是**正常结束**（ppm-dir 取完了 / 管道关了）
+                if (i > 0) break;
+                std::fprintf(stderr, "第一帧就取不到像素：%s\n", swhy.c_str());
+                ++bad; break;
+            }
+            if (pw != kPlWidth || ph != kPlHeight) {
+                std::fprintf(stderr,
+                    "第 %d 帧：图是 %dx%d，而 PL 的流水线固定为 %dx%d —— 尺寸不符\n"
+                    "  （PL 的 WIDTH/HEIGHT 是编译期常量；要换尺寸得改 RTL 重建位流）\n",
+                    i, pw, ph, kPlWidth, kPlHeight);
+                ++bad; break;
+            }
+        }
+
+        const auto t_read1 = std::chrono::steady_clock::now();
         std::vector<uint8_t> bytes;
         std::vector<uint8_t> bytes_ref;      // --verify-both 时用来对账
         if (args.verify_both) {
-            // 先跑 PS 黄金模型（纯计算，不动硬件），再让 PL 跑同一张图。
-            // 两张几何帧必须**逐字节相同** —— 不同就说明 PL 那条路有问题，
-            // 而且差异会直接指出是哪个字段（这里打前 32 字节）。
-            std::string path = args.ppm_dir.empty()
-                             ? args.ppm_file
-                             : (args.ppm_dir + "/" + [&] {
-                                   char n[32]; std::snprintf(n, sizeof(n), "%06d.ppm", i);
-                                   return std::string(n);
-                               }());
+            // 先跑 PS 黄金模型（纯计算，不动硬件），再让 PL 跑**同一张图**。
+            // 两张几何帧必须逐字节相同 —— 不同就说明 PL 那条路有问题，
+            // 而且差异位置能直接指出是哪个字段。
             std::string rwhy;
-            if (!ref->next(i, static_cast<uint32_t>(i), stamp_ns, &bytes_ref, &rwhy)) {
+            if (!ref->next_from(rgb, pw, ph, static_cast<uint32_t>(i), stamp_ns,
+                                &bytes_ref, &rwhy)) {
                 std::fprintf(stderr, "第 %d 帧：参考模型失败：%s\n", i, rwhy.c_str());
-                ++bad; break;
-            }
-            std::vector<uint8_t> rgb;
-            int pw = 0, ph = 0;
-            std::string why2;
-            if (!vision_board::read_ppm_p6(path, &pw, &ph, &rgb, &why2)) {
-                std::fprintf(stderr, "第 %d 帧：%s\n", i, why2.c_str());
                 ++bad; break;
             }
             try {
@@ -508,33 +579,11 @@ int main(int argc, char** argv) {
                 std::printf("\n");
             } else {
                 ++cmp_ok;
-                std::printf("  ✓ 帧 %d：PL 与 PS 黄金模型**逐字节相同**（%zu 字节）\n",
-                            i, bytes.size());
+                if (args.verbose)
+                    std::printf("  ✓ 帧 %d：PL 与 PS 黄金模型逐字节相同（%zu 字节）\n",
+                                i, bytes.size());
             }
-        } else if (drv && have_ppm) {
-            // 真摄像头那条路：读 PPM → 推给 PL 的像素 FIFO → 从 PL 取几何帧。
-            // PL 的流水线尺寸是编译期常量（WIDTH/HEIGHT），所以这里必须**恰好**
-            // 是那个尺寸 —— 不符就直接说清楚，别喂进去得到一堆看不懂的错。
-            std::string path = args.ppm_dir.empty()
-                             ? args.ppm_file
-                             : (args.ppm_dir + "/" + [&] {
-                                   char n[32]; std::snprintf(n, sizeof(n), "%06d.ppm", i);
-                                   return std::string(n);
-                               }());
-            std::vector<uint8_t> rgb;
-            int pw = 0, ph = 0;
-            std::string why2;
-            if (!vision_board::read_ppm_p6(path, &pw, &ph, &rgb, &why2)) {
-                std::fprintf(stderr, "第 %d 帧失败：%s\n", i, why2.c_str());
-                ++bad; break;
-            }
-            if (pw != kPlWidth || ph != kPlHeight) {
-                std::fprintf(stderr,
-                    "第 %d 帧：图是 %dx%d，而 PL 的流水线固定为 %dx%d —— 尺寸不符\n"
-                    "  （PL 的 WIDTH/HEIGHT 是编译期常量；要换尺寸得改 RTL 重建位流）\n",
-                    i, pw, ph, kPlWidth, kPlHeight);
-                ++bad; break;
-            }
+        } else if (drv && (src || pump)) {
             try {
                 bytes = drv->run_frame_push(rgb.data(), rgb.size(),
                                             static_cast<uint32_t>(i), stamp_ns,
@@ -545,10 +594,10 @@ int main(int argc, char** argv) {
             }
         } else if (ref) {
             std::string rwhy;
-            if (!ref->next(i, static_cast<uint32_t>(i), stamp_ns, &bytes, &rwhy)) {
+            if (!ref->next_from(rgb, pw, ph, static_cast<uint32_t>(i), stamp_ns,
+                                &bytes, &rwhy)) {
                 std::fprintf(stderr, "第 %d 帧失败（参考模型）：%s\n", i, rwhy.c_str());
-                ++bad;
-                break;                 // ppm-dir 取完就停，不是错误
+                ++bad; break;
             }
         } else {
             try {
@@ -556,15 +605,26 @@ int main(int argc, char** argv) {
                                        args.timeout_ms);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "第 %d 帧失败：%s\n", i, e.what());
-                ++bad;
-                continue;
+                ++bad; continue;
             }
+        }
+        if (pump) pump->recycle(std::move(rgb));   // 还回空闲池，省一次分配
+
+        if (args.timing) {
+            const auto t_frame1 = std::chrono::steady_clock::now();
+            const double total = std::chrono::duration<double, std::milli>(t_frame1 - t_frame0).count();
+            const double rd    = std::chrono::duration<double, std::milli>(t_read1 - t_frame0).count();
+            const auto& tm = drv ? drv->last_timing() : VisionDriver::FrameTiming{};
+            sum_read += rd; sum_push += tm.push_ms; sum_wait += tm.wait_ms;
+            sum_total += total; ++n_timed;
+            std::printf("   [timing] 读像素 %6.1f  推PL %6.1f  等流水线 %6.1f  合计 %6.1f ms\n",
+                        rd, tm.push_ms, tm.wait_ms, total);
         }
         try {
             const GeometryFrame frame = parse_geometry_frame(bytes);
             const FrameHeader& h = frame.header;
             ++ok;
-            std::printf("帧 %4d: seq=%u  长度=%zu B  障碍=%u  缺口=%u  "
+            std::printf("帧 %4ld: seq=%u  长度=%zu B  障碍=%u  缺口=%u  "
                         "尺寸=%ux%u  stamp=%llu ns%s\n",
                         i, h.seq, bytes.size(), h.n_obs, h.n_gaps,
                         h.img_w, h.img_h,
@@ -598,6 +658,14 @@ int main(int argc, char** argv) {
         std::printf("（%.1f 帧/秒）", 1000.0 * ok / static_cast<double>(ms));
     }
     std::printf("\n");
+    if (args.timing && n_timed > 0) {
+        const double n = static_cast<double>(n_timed);
+        const double mean = sum_total / n;
+        std::printf("---- 分段平均（%ld 帧）：读像素 %.1f  推PL %.1f  等流水线 %.1f  合计 %.1f ms"
+                    "   → %.1f 帧/秒 ----\n",
+                    n_timed, sum_read / n, sum_push / n, sum_wait / n, mean,
+                    mean > 0.0 ? 1000.0 / mean : 0.0);
+    }
     if (args.verify_both) {
         // ---- 配置对账：PS 写进去的 21 个寄存器 vs 参考模型的默认参数 ----
         //

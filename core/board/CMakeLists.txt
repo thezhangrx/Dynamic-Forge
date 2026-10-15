@@ -94,14 +94,18 @@ add_library(vision_ref STATIC "${REF_DIR}/vision_ref.c")
 target_include_directories(vision_ref PUBLIC "${REF_DIR}")
 target_compile_definitions(vision_ref PRIVATE VR_NO_MAIN)
 
+# std::thread（StdinPump 的读线程）要显式链 pthread
+find_package(Threads REQUIRED)
+
 add_executable(vision_board_devmem
     vision_driver_devmem.cpp
     vision_driver_factory.cpp
     ppm_reader.cpp
+    rgb_source.cpp
     main.cpp
 )
 target_link_libraries(vision_board_devmem PRIVATE
-    vision_driver_core gap_avoid action_codec vision_ref)
+    vision_driver_core gap_avoid action_codec vision_ref Threads::Threads)
 
 # ---------------------------------------------------------------------------
 # 板上目标（可选）：需要 icraft SDK

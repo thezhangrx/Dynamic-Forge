@@ -184,7 +184,35 @@ ffmpeg -f v4l2 -input_format mjpeg -video_size 1280x720 -i /dev/video1 \
 三条可以任意组合：`--ppm FILE` 换掉帧来源，键盘那一段不变。
 决策/解码/键盘是**共用**的下游，所以"真图"和"PL 图"走的是同一条后处理。
 
-**真摄像头**（板子上已有 `v4l2-ctl` 与 `ffmpeg`，不用新写代码）：
+**真摄像头（实时）**：一条命令（脚本在 `core/board/tools/cam_live.sh`）：
+
+```bash
+ssh root@192.168.137.242 'cd /root/tools && bash cam_live.sh --frames 0 --echo-action --via-pl'
+```
+
+它做三件事：**自动识别**摄像头节点、关掉"为长曝光降帧率"、把 `ffmpeg` 的原始
+RGB 直接管道喂给程序（不再每帧重开设备 + 落盘）。
+
+实测（JMJP 640×480 → 裁剪 640×360 → PL → 决策 → 键盘）：
+
+| 段 | 耗时 | 说明 |
+|---|---|---|
+| 等采集 | 20.5 ms | 摄像头 MJPG 640×480 原始交付 48.4 帧/秒（=20.8ms），已到它上限 |
+| 推 PL | 20.2 ms | 与 `axi_bw` 的 40 MB/s 吻合，MMIO 上限 |
+| 等流水线 | 5.4 ms | 推完像素后的后处理 |
+| **合计** | **46.1 ms → 21.7 帧/秒** | 批处理（每帧重开设备）只有 ~1 帧/秒 |
+
+**四个实测坑**（都写进了脚本注释）：
+1. **节点号会随重启变**：重启后 capture 从 `video1` 变成 `video0`，而 `video1` 成了
+   它的 **metadata 节点**（打开就报 `VIDIOC_G_INPUT: Inappropriate ioctl`）；
+   另有 Linlon 的 M2M 编解码器**也列 YUYV**，是个诱饵。脚本按"支持 MJPG"自动识别。
+2. **`exposure_auto_priority=1` 会降帧率**（允许为长曝光拖长曝光时间）：
+   14.6 → 25.3 帧/秒（YUYV 实测）。
+3. **自动曝光要好几帧才收敛**（第 5~9 帧才稳，早期抓到过全黑的第 1 帧）→ `--skip-frames`。
+4. **别硬杀正在 stream 的进程**（`kill -9`）：设备会卡在 `Device or resource busy`，
+   之后所有采集都失败。复位用 `echo -n 1-1.3 > unbind/bind`（等价拔插）。
+
+**旧的一次一帧做法**（批处理，慢但简单）：
 
 ```bash
 # 1) 采一帧（USB UVC 摄像头插上后 /dev/video0 就是它）

@@ -137,6 +137,7 @@ std::vector<uint8_t> VisionDriver::run_frame_push(const uint8_t* rgb, size_t byt
     // 推像素。**盲写**：消费者（流水线）每拍 1 像素 = 150 MB/s，比 PS 的
     // 非缓存写（实测 ~40 MB/s）快得多，所以 FIFO 只会被抽空。推完读一次状态，
     // 溢出就报出来 —— 静默丢像素是最难查的失败。
+    const auto t_push0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < bytes; i += 4u) {
         const uint32_t w = static_cast<uint32_t>(rgb[i])
                          | (static_cast<uint32_t>(rgb[i + 1]) << 8)
@@ -144,6 +145,9 @@ std::vector<uint8_t> VisionDriver::run_frame_push(const uint8_t* rgb, size_t byt
                          | (static_cast<uint32_t>(rgb[i + 3]) << 24);
         write_reg(kOffPixPush, w);
     }
+    const auto t_push1 = std::chrono::steady_clock::now();
+    timing_.push_ms = std::chrono::duration<double, std::milli>(t_push1 - t_push0).count();
+
     const uint32_t st = pixel_status();
     if (st & (1u << 16)) {
         // 不抛异常：溢出后帧内容仍然可能是"合法的但错的"，交给上面的判据。
@@ -154,7 +158,11 @@ std::vector<uint8_t> VisionDriver::run_frame_push(const uint8_t* rgb, size_t byt
 
     // 把像素源切回去，免得后续 :meth:`run_frame` 以为还有像素进来
     write_reg(kOffPixCtl, 0x0u);
-    return finish_frame(timeout_ms);
+    const auto t_wait0 = std::chrono::steady_clock::now();
+    std::vector<uint8_t> out = finish_frame(timeout_ms);
+    const auto t_wait1 = std::chrono::steady_clock::now();
+    timing_.wait_ms = std::chrono::duration<double, std::milli>(t_wait1 - t_wait0).count();
+    return out;
 }
 
 // ---------------------------------------------------------------------------
