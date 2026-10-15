@@ -30,6 +30,16 @@ PREFIX     = b"@MOVE "
 TIMEOUT_MS = 500             # 超过这么久没收到**有效**指令 → 松开所有键
 DEBUG      = False           # True 时把收到的行打到 USB 串口（要 boot.py 里留 CDC）
 
+# ---- 指令从哪来 -----------------------------------------------------------
+# 两条路都支持，默认都开（收到就执行，谁先到算谁的）：
+#   UART:  GP1 ← 板子控制台 TX     —— 两根线，见 README §1
+#   USB :  sys.stdin（USB CDC）    —— **一根线都不用接**：让 PC 读板子控制台
+#                                     （CP210x）再把 @MOVE 行转发到 RP2040 的
+#                                     USB 串口，脚本见 console_relay.py
+# 只用其中一条时把另一条关掉，省得两份输入互相干扰。
+USE_UART_INPUT = True
+USE_USB_INPUT  = True
+
 # ---- 动作号 → 按键 --------------------------------------------------------
 # 下标必须与 core/bullet_sim/core/actions.py 的 DISCRETE_ACTION_NAMES 一致。
 # 那份顺序是**公开协议**（源码里写明 never reorder, only append），
@@ -90,28 +100,58 @@ def release_all(reason: str) -> None:
             print("release_all:", reason)
 
 
+def feed(chunk) -> None:
+    """把一段字节喂进解析器。**两条输入源共用这一条**，解析规则只有一份。
+
+    坏输入一律**静默忽略**（不是数字、越界、半行残渣）——宁可不动，
+    也不能因为控制台里一堆内核日志的噪声把键按错或卡住。
+    """
+    global _buf, _last_ok
+    _buf.extend(chunk)
+    # 只按 \n 拆行；半行留在缓冲里等下一批
+    while b"\n" in _buf:
+        line, _, rest = _buf.partition(b"\n")
+        _buf = bytearray(rest)
+        line = bytes(line).strip()
+        if not line.startswith(PREFIX):
+            continue                          # 控制台的其它输出，忽略
+        try:
+            n = int(line[len(PREFIX):])
+        except ValueError:
+            continue                          # 不是数字，忽略（别让噪声把键卡住）
+        if not 0 <= n <= 8:
+            continue                          # 序号越界，忽略
+        apply(n)
+        _last_ok = time.monotonic()
+    # 缓冲别无限涨：控制台日志量大时，半行残渣可能越积越多
+    if len(_buf) > 256:
+        _buf = bytearray()
+
+
+# USB CDC 那条输入。CircuitPython 的 sys.stdin.read(n) 是**非阻塞**的
+# （没数据返回 None），所以放在主循环里也不会把看门狗饿死。
+_usb_in = None
+if USE_USB_INPUT:
+    try:
+        import sys
+        _usb_in = sys.stdin
+    except Exception:
+        _usb_in = None
+
+
 while True:
-    chunk = uart.read(64)
-    if chunk:
-        _buf.extend(chunk)
-        # 只按 \n 拆行；半行留在缓冲里等下一批
-        while b"\n" in _buf:
-            line, _, rest = _buf.partition(b"\n")
-            _buf = bytearray(rest)
-            line = bytes(line).strip()
-            if not line.startswith(PREFIX):
-                continue                      # 控制台的其它输出，忽略
-            try:
-                n = int(line[len(PREFIX):])
-            except ValueError:
-                continue                      # 不是数字，忽略（别让噪声把键卡住）
-            if not 0 <= n <= 8:
-                continue                      # 序号越界，忽略
-            apply(n)
-            _last_ok = time.monotonic()
-        # 缓冲别无限涨：控制台日志量大时，半行残渣可能越积越多
-        if len(_buf) > 256:
-            _buf = bytearray()
+    if USE_UART_INPUT:
+        chunk = uart.read(64)
+        if chunk:
+            feed(chunk)
+
+    if _usb_in is not None:
+        try:
+            chunk = _usb_in.read(64)
+        except Exception:
+            chunk = None                       # USB 没连/被独占：当作没数据
+        if chunk:
+            feed(chunk)
 
     # ---- 看门狗：断流就全松 ----
     if _held and (time.monotonic() - _last_ok) * 1000.0 > TIMEOUT_MS:
