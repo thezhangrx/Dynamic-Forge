@@ -21,7 +21,7 @@
 # 交给板子时把可执行文件拷过去即可（aarch64 静态链或带上 .so）。
 # ===========================================================================
 cmake_minimum_required(VERSION 3.16)
-project(vision_board CXX)
+project(vision_board C CXX)   # C 也要：C 参考模型（黄金模型）是 .c
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -87,12 +87,21 @@ target_include_directories(action_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # 见 core/board/tests/test_action_codec_matches_python.py。
 target_compile_options(action_codec PRIVATE -ffp-contract=off)
 
+# C 参考模型（黄金模型）：PS 侧跑真图（真摄像头 PPM）时用它产出几何帧，
+# 同时也是 PL 那侧的参照。VR_NO_MAIN 去掉它自带的 main。
+set(REF_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../fpga/ref")
+add_library(vision_ref STATIC "${REF_DIR}/vision_ref.c")
+target_include_directories(vision_ref PUBLIC "${REF_DIR}")
+target_compile_definitions(vision_ref PRIVATE VR_NO_MAIN)
+
 add_executable(vision_board_devmem
     vision_driver_devmem.cpp
     vision_driver_factory.cpp
+    ppm_reader.cpp
     main.cpp
 )
-target_link_libraries(vision_board_devmem PRIVATE vision_driver_core gap_avoid action_codec)
+target_link_libraries(vision_board_devmem PRIVATE
+    vision_driver_core gap_avoid action_codec vision_ref)
 
 # ---------------------------------------------------------------------------
 # 板上目标（可选）：需要 icraft SDK

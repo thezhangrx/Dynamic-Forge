@@ -20,11 +20,19 @@
 // ===========================================================================
 #include "gap_avoid.hpp"
 #include "action_codec.hpp"
+#include "ppm_reader.hpp"
+
+// C 参考模型（黄金模型）。板子上编它 = 给"真摄像头"一条**不需要 PL** 的通路，
+// 同时也是 PL 那侧的参照（协同仿真里同一个函数就是判据）。
+extern "C" {
+#include "ref_api.h"
+}
 #include "geometry_frame.hpp"
 #include "vision_driver.hpp"
 #include "vision_regs.hpp"
 
 #include <chrono>
+#include <memory>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -55,6 +63,14 @@ struct Args {
     // 键盘桥：决策算出的速度 → 动作号 → "@MOVE <n>\n" → 板子控制台 TX。
     // RP2040 的 GP1 就接在控制台 TX 上（见 core/rp2040_keyboard/README.md），
     // 它从共享的控制台流里挑出带 @MOVE 前缀的行。空串 = 不发。
+    // 几何帧的来源：PL（默认，经 AXI 读窗口）或 PPM（PS 上跑 C 参考模型）。
+    // 后者是**真摄像头那条路**的入口：
+    //     ffmpeg -f v4l2 -i /dev/video0 -frames:v 1 out.ppm
+    //     ./vision_board_devmem --ppm out.ppm
+    // 也是 PL 拿不到时的参照实现。
+    std::string ppm_file;           // 单张图（每帧重复用它）
+    std::string ppm_dir;            // 目录（%06d.ppm，与协同仿真的激励同命名）
+
     std::string keyboard_dev = "/dev/ttyPS0";
     double action_deadzone = kDefaultDeadzone;
     bool echo_action = false;       // 把动作号也打到 stdout（人看）
@@ -80,6 +96,8 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--field-h")      a.field_h = std::atof(next());
         else if (k == "--player-speed") a.player_speed = std::atof(next());
         else if (k == "--dt-default")   a.dt_default = std::atof(next());
+        else if (k == "--ppm")          a.ppm_file = next();
+        else if (k == "--ppm-dir")      a.ppm_dir = next();
         else if (k == "--keyboard-dev") a.keyboard_dev = next();
         else if (k == "--no-keyboard")  a.keyboard_dev.clear();
         else if (k == "--action-deadzone") a.action_deadzone = std::atof(next());
@@ -98,8 +116,14 @@ Args parse_args(int argc, char** argv) {
                 "                        就接在这根线上，从控制台流里挑 @MOVE 行）。\n"
                 "  --no-keyboard        不发动作（只看视觉+决策）。\n"
                 "  --action-deadzone D  速度小于 D 就当 stay，默认 1e-3。\n"
-                "  --echo-action        把动作号也打到 stdout。\n",
-                argv[0]);
+                "  --echo-action        把动作号也打到 stdout。\n"
+                "  --ppm FILE           几何帧改由 PS 上跑 C 参考模型产出（单张图，重复用）。\n"
+                "                       **真摄像头就走这条**：\n"
+                "                         ffmpeg -f v4l2 -i /dev/video0 -frames:v 1 o.ppm\n"
+                "                         %s --ppm o.ppm\n"
+                "  --ppm-dir DIR        同上，但按 000000.ppm/000001.ppm/... 依次取\n"
+                "                       （与 data/fpga/stim_* 的命名一致）。\n",
+                argv[0], argv[0]);
             std::exit(0);
         } else {
             std::fprintf(stderr, "不认识参数 %s（--help 看用法）\n", k.c_str());
@@ -148,6 +172,71 @@ int tier_bucket(const char* t) {
 
 const char* kTierNames[8] = {"HOLD", "TRIM", "ALIGN", "PANIC",
                              "SLOW", "STOP", "NO_GAP", "其它"};
+
+// ---------------------------------------------------------------------------
+// PS 侧参考模型前端：PPM → 几何帧字节
+//
+// 产出的是**和 PL 逐位相同**的几何帧（协同仿真里 RTL 就是对着这个函数比的），
+// 所以下游的解码 / 决策 / 键盘一行都不用改 —— 换的只是"帧从哪来"。
+//
+// 这条路的用途有两个：
+//   ① **真摄像头**：板子上有 v4l2-ctl/ffmpeg，采一帧存 PPM 就能直接跑；
+//   ② **参照**：PL 那侧出问题时，用同一张图跑一遍 PS 版，就能判断是
+//      "算法/决策不对"还是"PL 通路不对"。
+// ---------------------------------------------------------------------------
+class RefFrameSource {
+public:
+    explicit RefFrameSource(const Args& args)
+        : file_(args.ppm_file), dir_(args.ppm_dir) {
+        vr_ref_default_params(&params_);
+        rgb_.reserve(1024 * 1024);
+        gray_.resize(1024 * 1024);
+        wall_.resize(1024 * 1024);
+        bright_.resize(1024 * 1024);
+        rowc_.resize(4096);
+        frame_.resize(8192);
+    }
+
+    //: 取第 i 帧的几何帧字节。失败返回 false 并把原因写进 why。
+    bool next(int i, uint32_t seq, uint64_t stamp_ns,
+              std::vector<uint8_t>* out, std::string* why) {
+        std::string path;
+        if (!dir_.empty()) {
+            char name[32];
+            std::snprintf(name, sizeof(name), "%06d.ppm", i);
+            path = dir_ + "/" + name;
+        } else {
+            path = file_;
+        }
+        if (!vision_board::read_ppm_p6(path, &w_, &h_, &rgb_, why)) return false;
+        if (w_ <= 0 || h_ <= 0) { *why = "图尺寸非法"; return false; }
+        if (static_cast<size_t>(w_) * static_cast<size_t>(h_) > gray_.size()) {
+            *why = "图太大（缓冲只准备了 1M 像素）";
+            return false;
+        }
+
+        VrRefResult res;
+        std::memset(&res, 0, sizeof(res));
+        const int rc = vr_ref_process_ex(rgb_.data(), w_, h_, 1,
+                                         gray_.data(), wall_.data(),
+                                         bright_.data(), rowc_.data(),
+                                         &res, frame_.data(), frame_.size(),
+                                         &params_, seq, stamp_ns);
+        if (rc != 0) { *why = "参考模型返回 " + std::to_string(rc); return false; }
+        out->assign(frame_.begin(), frame_.begin() + res.frame_bytes);
+        return true;
+    }
+
+    int width() const { return w_; }
+    int height() const { return h_; }
+
+private:
+    std::string file_, dir_;
+    VrRefParams params_{};
+    std::vector<uint8_t> rgb_, gray_, wall_, bright_, frame_;
+    std::vector<uint16_t> rowc_;
+    int w_ = 0, h_ = 0;
+};
 
 // ---------------------------------------------------------------------------
 // 动作发射：把动作号写成 "@MOVE <n>\n" 发到板子控制台 TX
@@ -273,8 +362,11 @@ int main(int argc, char** argv) {
     std::printf("=== vision board bring-up ===\n");
     std::printf("设备: %s\n", args.device_url.c_str());
 
-    // ---- 打开 PL ---------------------------------------------------------
+    const bool use_ref = !args.ppm_file.empty() || !args.ppm_dir.empty();
+
+    // ---- 打开 PL（只有走 PL 那条路才需要）--------------------------------
     RegIo* io = nullptr;
+    if (!use_ref) {
     try {
         io = open_reg_io(args.device_url);
     } catch (const std::exception& e) {
@@ -285,23 +377,35 @@ int main(int argc, char** argv) {
                      e.what());
         return 1;
     }
-    VisionDriver drv(*io);
-
-    // ---- 自检：写得进、读得出 -------------------------------------------
-    std::string why;
-    if (!drv.self_test(&why)) {
-        std::fprintf(stderr, "自检失败：%s\n", why.c_str());
-        std::fprintf(stderr,
-                     "  这条失败通常意味着：基址不对 / 位流没烧 / AXI 没接上。\n"
-                     "  先用 xsct 确认 PL 能认到（jtag targets 应看到 xc7z030）。\n");
-        return 1;
     }
-    std::printf("自检：通过（配置寄存器读写回一致）\n");
+    std::unique_ptr<VisionDriver> drv;
+    std::unique_ptr<RefFrameSource> ref;
+    if (use_ref) {
+        ref.reset(new RefFrameSource(args));
+        std::printf("帧来源: PS 参考模型 (%s)\n",
+                    args.ppm_dir.empty() ? args.ppm_file.c_str() : args.ppm_dir.c_str());
+    } else {
+        drv.reset(new VisionDriver(*io));
+        std::printf("帧来源: PL（AXI 窗口）\n");
+    }
 
-    // ---- 配置 ------------------------------------------------------------
-    VisionParams params;          // 默认值 = C 参考模型 / Python 真值
-    drv.configure(params);
-    std::printf("配置：已写入 %d 个寄存器（阈值用默认值）\n", (int)kCfgCount);
+    std::string why;
+    if (drv) {
+        // ---- 自检：写得进、读得出 ---------------------------------------
+        if (!drv->self_test(&why)) {
+            std::fprintf(stderr, "自检失败：%s\n", why.c_str());
+            std::fprintf(stderr,
+                         "  这条失败通常意味着：基址不对 / 位流没烧 / AXI 没接上。\n"
+                         "  或者用 --ppm/--ppm-dir 走 PS 参考模型那条路。\n");
+            return 1;
+        }
+        std::printf("自检：通过（配置寄存器读写回一致）\n");
+
+        // ---- 配置 --------------------------------------------------------
+        VisionParams params;      // 默认值 = C 参考模型 / Python 真值
+        drv->configure(params);
+        std::printf("配置：已写入 %d 个寄存器（阈值用默认值）\n", (int)kCfgCount);
+    }
 
     // ---- 键盘桥：动作行发到板子控制台 TX（RP2040 就听这根线）--------------
     ActionEmitter kb(args.keyboard_dev);
@@ -319,13 +423,22 @@ int main(int argc, char** argv) {
     uint64_t stamp_ns = 0;
     for (int i = 0; i < args.frames; ++i) {
         std::vector<uint8_t> bytes;
-        try {
-            bytes = drv.run_frame(static_cast<uint32_t>(i), stamp_ns,
-                                  args.timeout_ms);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "第 %d 帧失败：%s\n", i, e.what());
-            ++bad;
-            continue;
+        if (ref) {
+            std::string rwhy;
+            if (!ref->next(i, static_cast<uint32_t>(i), stamp_ns, &bytes, &rwhy)) {
+                std::fprintf(stderr, "第 %d 帧失败（参考模型）：%s\n", i, rwhy.c_str());
+                ++bad;
+                break;                 // ppm-dir 取完就停，不是错误
+            }
+        } else {
+            try {
+                bytes = drv->run_frame(static_cast<uint32_t>(i), stamp_ns,
+                                       args.timeout_ms);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "第 %d 帧失败：%s\n", i, e.what());
+                ++bad;
+                continue;
+            }
         }
         try {
             const GeometryFrame frame = parse_geometry_frame(bytes);
@@ -349,7 +462,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "帧 %d 解码失败：%s\n", i, e.what());
             ++bad;
         }
-        if (drv.overflow()) {
+        if (drv && drv->overflow()) {
             std::fprintf(stderr,
                          "⚠ 帧缓冲溢出位置位 —— 上一帧比窗口(2048B)还长。\n"
                          "  查 n_obs/n_gaps 是不是爆了（障碍上限 32、缺口上限 16）。\n");
@@ -378,6 +491,6 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
 
-    delete io;      // icraft 后端是 new 出来的；板子上也可以改成栈上对象
+    delete io;      // icraft/devmem 后端是 new 出来的
     return bad == 0 ? 0 : 1;
 }
