@@ -66,7 +66,14 @@
  * 这里给足余量，超时说明帧根本没启动。 */
 #define FRAME_TIMEOUT_MS 500
 
-/* 期望值（来自协同仿真的 Vvision_selftest，图案 0..7） */
+/* 期望值（来自协同仿真的 Vvision_selftest，图案 0..7）。
+ *
+ * ⚠ 这是帧**内嵌**的那个 CRC 字段（帧的最后 4 字节，小端），**不是**"对整帧
+ *   再算一遍 CRC32"。看 cosim/tb_tpg.cpp 提取期望常数的写法：
+ *       for (k=0..3) crc |= bytes[nb-4+k] << (8*k);
+ *   原来的工具对整帧算 crc32 再拿这张表比 —— **永远不可能相等**。
+ *   （原版就这样写，但它从来没跑通过，所以这个错一直没暴露；
+ *     2026-10-15 上板第一次真跑才看出来：8 帧 CRC 恒为 0x2144DF1C。） */
 static const uint32_t EXP_CRC[8] = {
     0xA9670ED9u, 0x621801BEu, 0x1EEBDE91u, 0x0BC5C6CAu,
     0x76D2BFA9u, 0xC71A351Au, 0xA5440B40u, 0xAEC7F26Eu,
@@ -118,9 +125,10 @@ static int probe_mapped(volatile uint8_t *base)
 
 int main(int argc, char **argv)
 {
-    int want = 1, watch = 0;
+    int want = 1, watch = 0, dump = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--watch")) watch = 1;
+        else if (!strcmp(argv[i], "--dump")) dump = 1;
         else want = atoi(argv[i]);
     }
     if (want <= 0) want = 1;
@@ -185,20 +193,38 @@ int main(int argc, char **argv)
         }
         memcpy(buf, (const void *)fp, len);      /* 快照，避免读到一半被改写 */
 
-        uint32_t crc = crc32(buf, len);
+        /* ① 帧内嵌的 CRC 字段（最后 4 字节，小端）—— 期望表比的就是它 */
+        uint32_t emb = (uint32_t)buf[len - 4]
+                     | ((uint32_t)buf[len - 3] << 8)
+                     | ((uint32_t)buf[len - 2] << 16)
+                     | ((uint32_t)buf[len - 1] << 24);
+        /* ② 自洽性：内嵌字段是否等于"对前面 len-4 字节算的 CRC32"。
+         *   这一条不需要任何期望表，能独立证明帧没被截断/没读飞。 */
+        uint32_t self_crc = crc32(buf, (size_t)(len - 4));
+
         int pat = -1;
         for (int i = 0; i < 8; i++)
-            if (len == EXP_LEN && crc == EXP_CRC[i]) { pat = i; break; }
+            if (len == EXP_LEN && emb == EXP_CRC[i]) { pat = i; break; }
 
         if (pat >= 0) { ok++; seen[pat]++; }
         else          { bad++; }
 
-        printf("帧 %2d: len=%4u crc=0x%08X  %s\n", f, len, crc,
+        printf("帧 %2d: len=%4u 内嵌crc=0x%08X 自洽%s  %s\n", f, len, emb,
+               (self_crc == emb) ? "✓" : "✗",
                pat >= 0 ? "✓ 与协同仿真一致" : "✗ **不符**");
+        if (self_crc != emb)
+            printf("       内嵌字段 0x%08X ≠ 对前 %u 字节算的 0x%08X\n",
+                   emb, len - 4, self_crc);
 
         if (pat < 0 && bad <= 2) {                   /* 头几次不符时打出头部，便于定位 */
             printf("       头 24 字节:");
             for (int i = 0; i < 24 && i < (int)len; i++) printf(" %02X", buf[i]);
+            printf("\n");
+        }
+        if (dump) {                                  /* 整帧十六进制，便于和协同仿真逐字节比 */
+            printf("       整帧 %u 字节:", len);
+            for (int i = 0; i < (int)len; i++)
+                printf("%s%02X", (i % 16) ? " " : "\n         ", buf[i]);
             printf("\n");
         }
     }
