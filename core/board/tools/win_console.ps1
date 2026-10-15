@@ -29,36 +29,67 @@ function Write-Line([string]$s) { [Console]::Out.WriteLine($s); [Console]::Out.F
 
 # 注意：不能用 `New-Object System.IO.Ports.SerialPort $Port, $Baud, [..]::None, ...`
 # —— 那种写法里 PowerShell 不解析 `::` 静态成员（会当成字符串），必须分步赋值。
-$sp = New-Object System.IO.Ports.SerialPort
-$sp.PortName = $Port
-$sp.BaudRate = $Baud
-$sp.Parity = [System.IO.Ports.Parity]::None
-$sp.DataBits = 8
-$sp.StopBits = [System.IO.Ports.StopBits]::One
-$sp.ReadTimeout = 200
-$sp.WriteTimeout = 1000
-if ($Dtr) { $sp.DtrEnable = $true; $sp.RtsEnable = $true }
-
-try { $sp.Open() } catch {
-    Write-Line "打开 $Port 失败：$($_.Exception.Message)"
-    Write-Line "（多半是别的程序占着这个串口：先关掉 MobaXterm / 串口助手）"
-    exit 1
-}
-Write-Line "---- 读 $Port @ $Baud，$Seconds 秒 ----"
-
-if ($Send -ne "") {
-    $sp.Write($Send + "`r")
-    Write-Line "---- 已发送：$Send ----"
-}
-
-$end = (Get-Date).AddSeconds($Seconds)
-while ((Get-Date) -lt $end) {
+function Open-Port {
     try {
+        $p = New-Object System.IO.Ports.SerialPort
+        $p.PortName = $Port
+        $p.BaudRate = $Baud
+        $p.Parity = [System.IO.Ports.Parity]::None
+        $p.DataBits = 8
+        $p.StopBits = [System.IO.Ports.StopBits]::One
+        $p.ReadTimeout = 200
+        $p.WriteTimeout = 1000
+        if ($Dtr) { $p.DtrEnable = $true; $p.RtsEnable = $true }
+        $p.Open()
+        return $p
+    } catch {
+        return $null
+    }
+}
+
+# 为什么要有重连：给板子**断电重上电**时，如果 USB 也跟着断了，CP210x 会从
+# Windows 上消失再出现（COMx 短暂不存在）。只"打开一次"的抓取会在那一刻失效，
+# 而我们要抓的偏偏就是上电那一瞬间的日志。
+$deadline = (Get-Date).AddSeconds($Seconds)
+$sp = $null
+$retries = 0
+$sent = $false
+
+while ((Get-Date) -lt $deadline) {
+    if ($null -eq $sp -or -not $sp.IsOpen) {
+        if ($null -ne $sp) { try { $sp.Close() } catch { } }
+        $sp = Open-Port
+        if ($null -eq $sp) {
+            # 端口在系统里但打不开 = 多半被别的程序占着 → 快速失败，别让人干等
+            $exists = ([System.IO.Ports.SerialPort]::GetPortNames() -contains $Port)
+            if (-not $exists) {
+                if ($retries -eq 0) { Write-Line "---- $Port 现在不在（设备可能刚被断电）—— 持续等待重连 ----" }
+                $retries++
+                Start-Sleep -Milliseconds 400
+                continue
+            }
+            Write-Line "打开 $Port 失败：端口存在但打不开（多半被 MobaXterm / 串口助手占着）"
+            exit 1
+        }
+        if ($retries -gt 0) { Write-Line "---- $Port 重新打开成功（等了 $retries 次）----" }
+        else { Write-Line "---- 读 $Port @ $Baud，$Seconds 秒 ----" }
+    }
+
+    try {
+        # 在 PowerShell 里就把 CR 去掉：**不能**交给外面的 `tr -d '\r'` ——
+        # tr 输出到管道/文件时是全缓冲的，板子的输出会卡在它缓冲区里，
+        # 日志文件和管道都看不到实时内容（抓启动日志时这个坑最致命）。
         $s = $sp.ReadExisting()
-        if ($s.Length -gt 0) { [Console]::Out.Write($s); [Console]::Out.Flush() }
+        if ($s.Length -gt 0) {
+            [Console]::Out.Write($s.Replace("`r", ""))
+            [Console]::Out.Flush()
+        }
     } catch { }
+    if ($Send -ne "" -and -not $sent) {
+        try { $sp.Write($Send + "`r"); Write-Line ""; Write-Line "---- 已发送：$Send ----"; $sent = $true } catch { }
+    }
     Start-Sleep -Milliseconds 50
 }
-$sp.Close()
+if ($null -ne $sp) { try { $sp.Close() } catch { } }
 Write-Line ""
 Write-Line "---- 结束 ----"

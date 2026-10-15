@@ -21,9 +21,23 @@ ROOT=$(cd "$HERE/../../.." && pwd)
 OUT="$ROOT/data/fpga/boot_logs/boot_$(date +%Y%m%d_%H%M%S).log"
 mkdir -p "$(dirname "$OUT")"
 
+# 退出时**必须**清掉 Windows 侧那个 PowerShell：job 被 kill（Ctrl-C / 超时 / 后台任务
+# 取消）时 Windows 子进程不一定跟着死，它会一直占着 COMx —— 下一次抓取就打不开端口，
+# 而失败信息又可能被缓冲住，表现成"日志 0 字节、看着像板子什么都没打印"。
+# 这个坑真踩过：清掉遗留进程后一切正常。
+cleanup() {
+    powershell.exe -NoProfile -Command \
+      "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { \$_.CommandLine -like '*win_console.ps1*' -and \$_.ProcessId -ne \$PID } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" \
+      >/dev/null 2>&1
+}
+trap cleanup EXIT INT TERM
+
 echo "串口 $PORT，抓 $SECS 秒 → ${OUT#$ROOT/}"
 echo "现在给板子**断电再上电**（或按复位）—— 先抓后上电才拿得到启动日志。"
 powershell.exe -NoProfile -ExecutionPolicy Bypass \
     -File "$(wslpath -w "$HERE/win_console.ps1")" -Port "$PORT" -Seconds "$SECS" 2>&1 \
-  | tr -d '\r' | tee "$OUT"
+  | tee "$OUT"
+# ⚠ 这里**故意没有** `tr -d '\r'`：tr 输出到管道/文件时全缓冲，会把板子的输出
+#   卡在它缓冲区里（日志文件一直 0 字节，看着像"板子什么都没打印"）。
+#   CR 已经在 win_console.ps1 里剥掉了。
 echo "已存：${OUT#$ROOT/}"
