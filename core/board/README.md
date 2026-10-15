@@ -119,6 +119,14 @@ cmake --build build/board -j$(nproc)
   `v_n` 会退化成"只算车自己的速度"。真正的修法是 PS 侧按 stamp 差分出速度再填；
 * **场宽/场高/速度上限来自命令行**（视觉帧不带），首帧 `dt` 用 `--dt-default`。
 
+⚠ **还有一件必须知道的事**：`VisionParams` 的默认值必须与 C 参考模型
+`vr_ref_default_params()` 逐项相同（也就等于 `core/vision/wall_with_gap.py` 的
+语义真值）。**这里曾经有 13 项不一样**，表现是"板上几何帧障碍个数对、坐标不对"，
+而且完全不报错 —— 因为协同仿真写进 RTL 的是 C 参考模型那套参数，
+板上之前的跑法又都绕开了 `VisionParams` 的默认值（TPG 或 PS 参考模型），
+于是三处都没验过它。现在由 `tests/test_params_defaults_match_reference.py`
+逐项钉住；板上可以用 `--verify-both` 直接对账（配置 21 项 + 几何帧逐字节）。
+
 ### 6.1 ⚠ 板上编，不用交叉编译（也不需要 icraft）
 
 **在板子上直接编** —— 板子自带 cmake 3.16.3 / g++ 9.4：
