@@ -180,6 +180,66 @@ module vision_axi #(
     wire        dout_last;
 
     // =====================================================================
+    // AXI 写数据的两种选通掩码（**必须在使用之前声明**）
+    //
+    // ⚠ 踩过：这段原来放在文件后面，而 pixfeed 的例化（`.push_data(w_masked32)`）
+    //   在它前面。Verilog 对"先用后声明"会先建一个 **1 位隐式网络** ——
+    //   仿真器没报（它按整模块解析），**综合器报了**：
+    //     WARNING: [Synth 8-992] w_masked32 is already implicitly declared earlier
+    //   真按 1 位处理的话，推像素的数据就只有 1 位了。**声明一律放使用之前。**
+    //
+    // ⚠ 另一条踩过的：**注释别以仿真器的名字开头**。`// Verilator ...`（大小写
+    //   不敏感、连写成 VerilatorX 也算）会被它当成**元注释**去解析，后面的词不是
+    //   合法指令就报 `syntax error, unexpected '/'` —— 而报错指向注释那一行，
+    //   极容易朝"注释怎么会语法错"这个方向查。加个括号或换个说法即可。
+    //   有测试守着这条（core/fpga/tests/test_cosim.py）。
+    // =====================================================================
+    // AXI 字节写选通
+    function [31:0] wstrb_merge(input [31:0] old, input [31:0] newd, input [3:0] strb);
+        begin
+            wstrb_merge[7:0]   = strb[0] ? newd[7:0]   : old[7:0];
+            wstrb_merge[15:8]  = strb[1] ? newd[15:8]  : old[15:8];
+            wstrb_merge[23:16] = strb[2] ? newd[23:16] : old[23:16];
+            wstrb_merge[31:24] = strb[3] ? newd[31:24] : old[31:24];
+        end
+    endfunction
+
+    // ---- 写数据的两条选通路径 -------------------------------------------
+    //
+    // ⚠ 这里修的是**第二个**"主控行为被理想化"的盲区（第一个是 AW/W 时序，见上）。
+    //   `wstrb_merge(32'd0, ...)` 会把**未被选通的字节变成 0**。配置寄存器块
+    //   （0x000..0x07F）在 vision_top 里是**整字写**（`cfg_addr` 选中的那个寄存器
+    //   整体被 `cfg_wdata` 覆盖），所以只要主控用字节/半字写配置寄存器，其余
+    //   三条字节就被静默清零 —— 例如对 0x000 写 1 字节，`r_wall_rb` 之外的
+    //   `r_wall_min_r/g` 会一起变 0。SEQ/STAMP 那三个寄存器是就地 `wstrb_merge`，
+    //   反而是对的，于是**同一个 AXI-Lite 从口上两种字节语义并存**。
+    //
+    //   修法：写提交时只锁存原始 `w_d`/`w_s`，下一拍（`reg_we=1` 那一拍）
+    //   先读该寄存器的**旧值**再合并：
+    //       cfg_wdata = wstrb_merge(cfg_rdata, reg_wdata, reg_strb)
+    //   没有循环依赖（cfg_rdata ← cfg_addr ← 寄存器；cfg_wdata 不被 cfg_rdata
+    //   之外的组合逻辑回头依赖），也没有时序竞争：仲裁保证读写**严格串行**
+    //   （s_arready 要求 !aw_v&&!w_v&&!b_v，s_awready/s_wready 要求 rd_idle），
+    //   所以 `reg_we=1` 那一拍不可能有读在飞，cfg_addr 必然等于 reg_addr、
+    //   cfg_rdata 必然是该寄存器的旧值。
+    //   整字写（strb=4'hF）下 `wstrb_merge` 恒等，行为与原来完全一致。
+    //
+    // DBG/CTRL 的写数据只用到低 26 位（sel[3:0] / idx[21:4] / sub[25:22]），
+    // 高 6 位保留。单独做一个 26 位宽的选通合并，免得 -Wall 的 UNUSEDSIGNAL
+    // 拿"w_masked[31:26] 没被读"报错。
+    function [25:0] wstrb_merge26(input [25:0] old, input [25:0] newd, input [3:0] strb);
+        begin
+            wstrb_merge26[7:0]   = strb[0] ? newd[7:0]   : old[7:0];
+            wstrb_merge26[15:8]  = strb[1] ? newd[15:8]  : old[15:8];
+            wstrb_merge26[23:16] = strb[2] ? newd[23:16] : old[23:16];
+            wstrb_merge26[25:24] = strb[3] ? newd[25:24] : old[25:24];
+        end
+    endfunction
+    // 32 位选通掩码版：PIXPUSH 要用**全 32 位**（一个像素的 4 个打包字节都在这儿）
+    wire [31:0] w_masked32 = wstrb_merge(32'd0, w_d, w_s);
+    wire [25:0] w_masked   = w_masked32[25:0];
+
+    // =====================================================================
     // PS 喂像素：真摄像头采到的帧在 PS 手上，经 AXI 写进 FIFO，这里还原成
     // 像素时序。见 vision_pixfeed.v（含"为什么不需要 PS 等 FIFO 不满"）。
     // =====================================================================
@@ -283,50 +343,6 @@ module vision_axi #(
                     : rd_status ? 6'd31                  // CFG_STATUS
                     :             reg_addr;
 
-    // AXI 字节写选通
-    function [31:0] wstrb_merge(input [31:0] old, input [31:0] newd, input [3:0] strb);
-        begin
-            wstrb_merge[7:0]   = strb[0] ? newd[7:0]   : old[7:0];
-            wstrb_merge[15:8]  = strb[1] ? newd[15:8]  : old[15:8];
-            wstrb_merge[23:16] = strb[2] ? newd[23:16] : old[23:16];
-            wstrb_merge[31:24] = strb[3] ? newd[31:24] : old[31:24];
-        end
-    endfunction
-
-    // ---- 写数据的两条选通路径 -------------------------------------------
-    //
-    // ⚠ 这里修的是**第二个**"主控行为被理想化"的盲区（第一个是 AW/W 时序，见上）。
-    //   `wstrb_merge(32'd0, ...)` 会把**未被选通的字节变成 0**。配置寄存器块
-    //   （0x000..0x07F）在 vision_top 里是**整字写**（`cfg_addr` 选中的那个寄存器
-    //   整体被 `cfg_wdata` 覆盖），所以只要主控用字节/半字写配置寄存器，其余
-    //   三条字节就被静默清零 —— 例如对 0x000 写 1 字节，`r_wall_rb` 之外的
-    //   `r_wall_min_r/g` 会一起变 0。SEQ/STAMP 那三个寄存器是就地 `wstrb_merge`，
-    //   反而是对的，于是**同一个 AXI-Lite 从口上两种字节语义并存**。
-    //
-    //   修法：写提交时只锁存原始 `w_d`/`w_s`，下一拍（`reg_we=1` 那一拍）
-    //   先读该寄存器的**旧值**再合并：
-    //       cfg_wdata = wstrb_merge(cfg_rdata, reg_wdata, reg_strb)
-    //   没有循环依赖（cfg_rdata ← cfg_addr ← 寄存器；cfg_wdata 不被 cfg_rdata
-    //   之外的组合逻辑回头依赖），也没有时序竞争：仲裁保证读写**严格串行**
-    //   （s_arready 要求 !aw_v&&!w_v&&!b_v，s_awready/s_wready 要求 rd_idle），
-    //   所以 `reg_we=1` 那一拍不可能有读在飞，cfg_addr 必然等于 reg_addr、
-    //   cfg_rdata 必然是该寄存器的旧值。
-    //   整字写（strb=4'hF）下 `wstrb_merge` 恒等，行为与原来完全一致。
-    //
-    // DBG/CTRL 的写数据只用到低 26 位（sel[3:0] / idx[21:4] / sub[25:22]），
-    // 高 6 位保留。单独做一个 26 位宽的选通合并，免得 -Wall 的 UNUSEDSIGNAL
-    // 拿"w_masked[31:26] 没被读"报错。
-    function [25:0] wstrb_merge26(input [25:0] old, input [25:0] newd, input [3:0] strb);
-        begin
-            wstrb_merge26[7:0]   = strb[0] ? newd[7:0]   : old[7:0];
-            wstrb_merge26[15:8]  = strb[1] ? newd[15:8]  : old[15:8];
-            wstrb_merge26[23:16] = strb[2] ? newd[23:16] : old[23:16];
-            wstrb_merge26[25:24] = strb[3] ? newd[25:24] : old[25:24];
-        end
-    endfunction
-    // 32 位选通掩码版：PIXPUSH 要用**全 32 位**（一个像素的 4 个打包字节都在这儿）
-    wire [31:0] w_masked32 = wstrb_merge(32'd0, w_d, w_s);
-    wire [25:0] w_masked   = w_masked32[25:0];
     assign cfg_wdata = wstrb_merge(cfg_rdata, reg_wdata, reg_strb);
 
     // 几何帧窗口：一次给一个字（4 字节，小端）。

@@ -77,6 +77,40 @@ def _env() -> dict:
 # ---------------------------------------------------------------------------
 # 1) RTL 必须过 lint（-Wall，除了有意记录在案的几类）
 # ---------------------------------------------------------------------------
+def test_no_comment_starts_with_the_simulator_name() -> None:
+    """RTL 注释**不许以仿真器的名字开头** —— 那会被当成元注释去解析。
+
+    踩过：写了一句 ``//   Verilator 没报（…），Vivado 报了：``，仿真器报
+
+        syntax error, unexpected '/'
+
+    **指向那一行注释本身**。原因：``//`` 后面跟 ``verilator``（大小写不敏感、
+    连写成 ``VerilatorX`` 也算）会被识别成**元注释**，后面的词不是合法指令就报错。
+    合法用法（``// verilator lint_off …``）不受影响，加个括号或换个说法也能绕开。
+
+    这条错误的信息量极低（"注释怎么会语法错"），所以用测试挡在门口，
+    而不是等下次再查一遍。**synth（Vivado）不认这个规则**，所以只看仿真会漏。
+    """
+    import re as _re
+    pat = _re.compile(r"^\s*//\s*verilator", _re.IGNORECASE)
+    # 合法的元注释形式（仿真器自己的指令）不算违规
+    ok = _re.compile(r"^\s*//\s*verilator\s+(lint_off|lint_on|tracing_off|"
+                     r"tracing_on|coverage_off|coverage_on|hierarchical|"
+                     r"no_inline|inline|isolate_assignments|public|public_flat|"
+                     r"public_flat_rd|public_flat_rw|protect|clock_enable|"
+                     r"create_clock|assume|coverage|waiver|timescale)\b", _re.IGNORECASE)
+    rtl = ROOT / "core" / "fpga" / "rtl"
+    bad: list[str] = []
+    for path in sorted(list(rtl.glob("*.v")) + list(rtl.glob("*.vh"))):
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if pat.match(line) and not ok.match(line):
+                bad.append(f"{path.name}:{n}: {line.strip()[:60]}")
+    assert not bad, (
+        "这些注释会被仿真器当成元注释、报一个指向注释本身的语法错：\n  "
+        + "\n  ".join(bad)
+        + "\n（换掉开头的名字，或加个括号）")
+
+
 def test_rtl_lint_clean():
     v = _verilator()
     r = subprocess.run(
