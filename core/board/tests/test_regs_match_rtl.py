@@ -58,6 +58,10 @@ PAIRS = {
     "ADDR_STAMP1": "kOffStamp1",
     "ADDR_FLEN":   "kOffFLen",
     "ADDR_FRAME":  "kOffFrame",
+    # PS 喂像素（真摄像头）：见 rtl/vision_pixfeed.v
+    "ADDR_PIXPUSH": "kOffPixPush",
+    "ADDR_PIXSTAT": "kOffPixStat",
+    "ADDR_PIXCTL":  "kOffPixCtl",
 }
 
 

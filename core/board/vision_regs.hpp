@@ -95,6 +95,9 @@ constexpr uint32_t kOffSeq    = 0x0C4u;
 constexpr uint32_t kOffStamp0 = 0x0C8u;   // stamp_ns 低 32 位
 constexpr uint32_t kOffStamp1 = 0x0CCu;   // stamp_ns 高 32 位
 constexpr uint32_t kOffFLen   = 0x0D0u;   // 只读：上一帧实际字节数
+constexpr uint32_t kOffPixPush = 0x0D4u;   // 写：像素 FIFO 推入（整字写，4 字节打包）
+constexpr uint32_t kOffPixStat = 0x0D8u;   // 读：[15:0]缓冲字节 [16]溢出 [17]还在放
+constexpr uint32_t kOffPixCtl  = 0x0DCu;   // 写：bit0 像素源(0=外部/TPG,1=FIFO) bit1 flush
 constexpr uint32_t kOffFrame  = 0x100u;   // 几何帧字节窗口
 
 //: 写 kOffCtrl 时置 bit0 = 1 启动一帧（自清）。

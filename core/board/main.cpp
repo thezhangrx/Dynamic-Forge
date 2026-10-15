@@ -48,6 +48,11 @@ using namespace vision_board;
 
 namespace {
 
+//: PL 流水线的固定尺寸（vision_axi.v 的 WIDTH/HEIGHT 默认值）。
+//: 走 `--via-pl` 时输入的图必须**恰好**这么大 —— 不符就早报，别喂进去。
+constexpr int kPlWidth  = 640;
+constexpr int kPlHeight = 360;
+
 struct Args {
     // 板子上 PL 的寄存器窗口用 /dev/mem 直接访问（板上工具已验证）。
     // icraft 的 defaultRegRegion 是**另一个窗口**，不是我们这块 PL。
@@ -70,6 +75,9 @@ struct Args {
     // 也是 PL 拿不到时的参照实现。
     std::string ppm_file;           // 单张图（每帧重复用它）
     std::string ppm_dir;            // 目录（%06d.ppm，与协同仿真的激励同命名）
+    //: `--via-pl`：PPM 的像素**推进 PL 的 FIFO**，几何帧由 PL 产出
+    //: （而不是在 PS 上跑黄金模型）。真摄像头要走 FPGA 加速时用这个。
+    bool via_pl = false;
 
     std::string keyboard_dev = "/dev/ttyPS0";
     double action_deadzone = kDefaultDeadzone;
@@ -97,6 +105,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--player-speed") a.player_speed = std::atof(next());
         else if (k == "--dt-default")   a.dt_default = std::atof(next());
         else if (k == "--ppm")          a.ppm_file = next();
+        else if (k == "--via-pl")       a.via_pl = true;
         else if (k == "--ppm-dir")      a.ppm_dir = next();
         else if (k == "--keyboard-dev") a.keyboard_dev = next();
         else if (k == "--no-keyboard")  a.keyboard_dev.clear();
@@ -122,7 +131,10 @@ Args parse_args(int argc, char** argv) {
                 "                         ffmpeg -f v4l2 -i /dev/video0 -frames:v 1 o.ppm\n"
                 "                         %s --ppm o.ppm\n"
                 "  --ppm-dir DIR        同上，但按 000000.ppm/000001.ppm/... 依次取\n"
-                "                       （与 data/fpga/stim_* 的命名一致）。\n",
+                "                       （与 data/fpga/stim_* 的命名一致）。\n"
+                "  --via-pl             配上 --ppm/--ppm-dir 时，把像素**推进 PL**、\n"
+                "                       几何帧由 PL 产出（真摄像头走 FPGA 加速就走这条）。\n"
+                "                       不加则是在 PS 上跑黄金模型。\n",
                 argv[0], argv[0]);
             std::exit(0);
         } else {
@@ -362,7 +374,9 @@ int main(int argc, char** argv) {
     std::printf("=== vision board bring-up ===\n");
     std::printf("设备: %s\n", args.device_url.c_str());
 
-    const bool use_ref = !args.ppm_file.empty() || !args.ppm_dir.empty();
+    const bool have_ppm = !args.ppm_file.empty() || !args.ppm_dir.empty();
+    // 走 PL 时**不**用 PS 参考模型：像素推给 PL，几何帧从 PL 读回来
+    const bool use_ref = have_ppm && !args.via_pl;
 
     // ---- 打开 PL（只有走 PL 那条路才需要）--------------------------------
     RegIo* io = nullptr;
@@ -386,7 +400,14 @@ int main(int argc, char** argv) {
                     args.ppm_dir.empty() ? args.ppm_file.c_str() : args.ppm_dir.c_str());
     } else {
         drv.reset(new VisionDriver(*io));
-        std::printf("帧来源: PL（AXI 窗口）\n");
+        if (have_ppm) {
+            std::printf("帧来源: PL（像素由 PS 推入 FIFO，帧取自 %s）\n",
+                        args.ppm_dir.empty() ? args.ppm_file.c_str() : args.ppm_dir.c_str());
+            drv->set_pixel_source(true);
+            drv->flush_pixels();
+        } else {
+            std::printf("帧来源: PL（外部 din_*，板上是 tpg_source）\n");
+        }
     }
 
     std::string why;
@@ -423,7 +444,39 @@ int main(int argc, char** argv) {
     uint64_t stamp_ns = 0;
     for (int i = 0; i < args.frames; ++i) {
         std::vector<uint8_t> bytes;
-        if (ref) {
+        if (drv && have_ppm) {
+            // 真摄像头那条路：读 PPM → 推给 PL 的像素 FIFO → 从 PL 取几何帧。
+            // PL 的流水线尺寸是编译期常量（WIDTH/HEIGHT），所以这里必须**恰好**
+            // 是那个尺寸 —— 不符就直接说清楚，别喂进去得到一堆看不懂的错。
+            std::string path = args.ppm_dir.empty()
+                             ? args.ppm_file
+                             : (args.ppm_dir + "/" + [&] {
+                                   char n[32]; std::snprintf(n, sizeof(n), "%06d.ppm", i);
+                                   return std::string(n);
+                               }());
+            std::vector<uint8_t> rgb;
+            int pw = 0, ph = 0;
+            std::string why2;
+            if (!vision_board::read_ppm_p6(path, &pw, &ph, &rgb, &why2)) {
+                std::fprintf(stderr, "第 %d 帧失败：%s\n", i, why2.c_str());
+                ++bad; break;
+            }
+            if (pw != kPlWidth || ph != kPlHeight) {
+                std::fprintf(stderr,
+                    "第 %d 帧：图是 %dx%d，而 PL 的流水线固定为 %dx%d —— 尺寸不符\n"
+                    "  （PL 的 WIDTH/HEIGHT 是编译期常量；要换尺寸得改 RTL 重建位流）\n",
+                    i, pw, ph, kPlWidth, kPlHeight);
+                ++bad; break;
+            }
+            try {
+                bytes = drv->run_frame_push(rgb.data(), rgb.size(),
+                                            static_cast<uint32_t>(i), stamp_ns,
+                                            args.timeout_ms);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "第 %d 帧失败（推像素）：%s\n", i, e.what());
+                ++bad; continue;
+            }
+        } else if (ref) {
             std::string rwhy;
             if (!ref->next(i, static_cast<uint32_t>(i), stamp_ns, &bytes, &rwhy)) {
                 std::fprintf(stderr, "第 %d 帧失败（参考模型）：%s\n", i, rwhy.c_str());

@@ -16,6 +16,10 @@
 //   0x0C4         写：seq（进几何帧头）
 //   0x0C8/0x0CC   写：stamp_ns 的低/高 32 位
 //   0x0D0         读：上一帧的**实际字节数**（PS 照这个长度读窗口）
+//   0x0D4         写：像素 FIFO 推入（每个 32 位字 = 4 个打包字节，**整字写**）
+//   0x0D8         读：[15:0] 还在缓冲的字节数，[16] 溢出（粘滞），[17] 这一帧还在放
+//   0x0DC         写：bit0 = 像素源（0 = din_* 外部/TPG，1 = PS 的 FIFO）
+//                       bit1 = flush（清空 FIFO 与 ovf）
 //   0x100 + 4*j   读：几何帧字节窗口，第 j 个字（小端）
 //
 // 为什么用"BRAM 窗口"而不是 AXI-Stream + DMA：第一个 bring-up 的目标是
@@ -84,6 +88,10 @@ module vision_axi #(
     localparam [11:0] ADDR_STAMP0 = 12'h0C8;
     localparam [11:0] ADDR_STAMP1 = 12'h0CC;
     localparam [11:0] ADDR_FLEN   = 12'h0D0;   // 只读：上一帧字节数
+    // ---- PS 喂像素（真摄像头）：见 vision_pixfeed.v ----------------------
+    localparam [11:0] ADDR_PIXPUSH = 12'h0D4;  // 写：推一个 32 位字（4 个打包字节）
+    localparam [11:0] ADDR_PIXSTAT = 12'h0D8;  // 读：{ovf, level[15:0]}
+    localparam [11:0] ADDR_PIXCTL  = 12'h0DC;  // 写：bit0=像素源(0=din_*外部,1=FIFO) bit1=flush
     localparam [11:0] ADDR_FRAME  = 12'h100;   // 几何帧窗口
     localparam [11:0] ADDR_FRAME_END = ADDR_FRAME + FRAME_BYTES[11:0];
     localparam [FB_BITS:0] FB_MAX    = FRAME_BYTES[FB_BITS:0];
@@ -112,6 +120,9 @@ module vision_axi #(
     localparam [ADDR_W-3:0] W_STAMP0   = ADDR_STAMP0[ADDR_W-1:2];
     localparam [ADDR_W-3:0] W_STAMP1   = ADDR_STAMP1[ADDR_W-1:2];
     localparam [ADDR_W-3:0] W_FLEN     = ADDR_FLEN[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_PIXPUSH  = ADDR_PIXPUSH[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_PIXSTAT  = ADDR_PIXSTAT[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_PIXCTL   = ADDR_PIXCTL[ADDR_W-1:2];
     localparam [ADDR_W-3:0] W_FRAME    = ADDR_FRAME[ADDR_W-1:2];
     localparam [ADDR_W-3:0] W_FRAME_END = ADDR_FRAME_END[ADDR_W-1:2];
     // 配置块的窗口边界保持用**字节地址**判（ADDR_CONFIG+0x080 是字对齐的，
@@ -145,6 +156,16 @@ module vision_axi #(
     reg [31:0]  cfg_seq_r;
     reg [63:0]  cfg_stamp_r;
 
+    // ---- PS 喂像素（真摄像头那条路）--------------------------------------
+    reg         pix_src;          // 0 = din_*（外部/TPG），1 = PS 的 FIFO
+    reg         pix_push;         // 一拍脉冲
+    reg         pix_flush;        // 一拍脉冲
+    wire [15:0] pix_buffered;
+    wire        pix_ovf;
+    wire        pf_vld, pf_sof, pf_eol;
+    wire [7:0]  pf_r, pf_g, pf_b;
+    wire        pix_busy;
+
     // ---- 几何帧缓冲（按 32 bit 字存，字节写用位选，读一次给一个字）------
     reg [31:0]      frame_mem [0:FRAME_BYTES/4-1];
     reg [FB_BITS:0] frame_wptr;
@@ -159,10 +180,34 @@ module vision_axi #(
     wire        dout_last;
 
     // =====================================================================
+    // PS 喂像素：真摄像头采到的帧在 PS 手上，经 AXI 写进 FIFO，这里还原成
+    // 像素时序。见 vision_pixfeed.v（含"为什么不需要 PS 等 FIFO 不满"）。
+    // =====================================================================
+    wire pf_sel = pix_src;      // 0 = 用 din_*（外部/TPG），1 = 用 PS 的 FIFO
+
+    vision_pixfeed #(.WIDTH(WIDTH), .HEIGHT(HEIGHT)) u_pixfeed (
+        .clk(clk), .rst_n(aresetn),
+        .push(pix_push), .push_data(w_masked32),
+        // `level`（FIFO 里的字数）是纯诊断量，对外报的是 `buffered`（字节数，
+        // 含蓄水池），所以这里不接 —— 留着悬空，避免"声明了却没人用"的 lint 告警。
+        .flush(pix_flush), .buffered(pix_buffered), .ovf(pix_ovf),
+        .sink_ready(busy),      // 见 vision_pixfeed.v：busy 恰在进入 S_RECV 时拉高
+        .dout_vld(pf_vld), .dout_sof(pf_sof), .dout_eol(pf_eol),
+        .dout_r(pf_r), .dout_g(pf_g), .dout_b(pf_b),
+        .busy(pix_busy)
+    );
+
+    // 像素源二选一（**逐条对应**：vld/sof/eol/r/g/b 必须整体切换，不能混）
+    wire        src_vld = pf_sel ? pf_vld : din_vld;
+    wire        src_sof = pf_sel ? pf_sof : din_sof;
+    wire        src_eol = pf_sel ? pf_eol : din_eol;
+    wire [7:0]  src_r   = pf_sel ? pf_r   : din_r;
+    wire [7:0]  src_g   = pf_sel ? pf_g   : din_g;
+    wire [7:0]  src_b   = pf_sel ? pf_b   : din_b;
     vision_top #(.WIDTH(WIDTH), .HEIGHT(HEIGHT)) u_vision (
         .pix_clk(clk), .rst_n(aresetn),
-        .din_vld(din_vld), .din_sof(din_sof), .din_eol(din_eol),
-        .din_r(din_r), .din_g(din_g), .din_b(din_b),
+        .din_vld(src_vld), .din_sof(src_sof), .din_eol(src_eol),
+        .din_r(src_r), .din_g(src_g), .din_b(src_b),
         .frame_start(start_pulse),
         .cfg_seq(cfg_seq_r), .cfg_stamp_ns(cfg_stamp_r),
         .frame_done(frame_done), .busy(busy),
@@ -279,7 +324,9 @@ module vision_axi #(
             wstrb_merge26[25:24] = strb[3] ? newd[25:24] : old[25:24];
         end
     endfunction
-    wire [25:0] w_masked = wstrb_merge26(26'd0, w_d[25:0], w_s);
+    // 32 位选通掩码版：PIXPUSH 要用**全 32 位**（一个像素的 4 个打包字节都在这儿）
+    wire [31:0] w_masked32 = wstrb_merge(32'd0, w_d, w_s);
+    wire [25:0] w_masked   = w_masked32[25:0];
     assign cfg_wdata = wstrb_merge(cfg_rdata, reg_wdata, reg_strb);
 
     // 几何帧窗口：一次给一个字（4 字节，小端）。
@@ -304,10 +351,13 @@ module vision_axi #(
             reg_we <= 0; reg_addr <= 0; reg_wdata <= 0; reg_strb <= 0; start_pulse <= 0;
             dbg_sel <= 0; dbg_idx <= 0; dbg_sub <= 0;
             cfg_seq_r <= 0; cfg_stamp_r <= 0;
+            pix_src <= 1'b0; pix_push <= 1'b0; pix_flush <= 1'b0;
             frame_wptr <= 0; frame_total <= 0; frame_len <= 0; frame_ovf <= 0;
         end else begin
             reg_we      <= 1'b0;      // 默认：写使能只持续一拍
             start_pulse <= 1'b0;
+            pix_push    <= 1'b0;
+            pix_flush   <= 1'b0;
 
             // ---------------- 写通道 ----------------
             if (s_awvalid && s_awready) begin aw_a <= s_awaddr; aw_v <= 1'b1; end
@@ -333,6 +383,15 @@ module vision_axi #(
                     W_SEQ:    cfg_seq_r          <= wstrb_merge(cfg_seq_r, w_d, w_s);
                     W_STAMP0: cfg_stamp_r[31:0]  <= wstrb_merge(cfg_stamp_r[31:0],  w_d, w_s);
                     W_STAMP1: cfg_stamp_r[63:32] <= wstrb_merge(cfg_stamp_r[63:32], w_d, w_s);
+                    W_PIXPUSH: begin
+                        // 推一个 32 位字进像素 FIFO。**必须整字写**（strb=4'hF）
+                        // —— FIFO 没有"按字节合并"的语义，部分字节写没有意义。
+                        pix_push <= 1'b1;
+                    end
+                    W_PIXCTL: begin
+                        pix_src   <= w_masked[0];
+                        pix_flush <= w_masked[1];
+                    end
                     default: ;                     // 未映射地址：忽略
                 endcase
             end else if (b_v && s_bready) begin
@@ -349,6 +408,8 @@ module vision_axi #(
                 else case (ar_word)
                     W_DBGDAT: rdata_q <= dbg_data;
                     W_CTRL:   rdata_q <= ctrl_rd;
+                    // [15:0] 还在缓冲的**字节**数；[16] 溢出（粘滞）；[17] 这一帧还在放
+                    W_PIXSTAT: rdata_q <= {14'b0, pix_busy, pix_ovf, pix_buffered};
                     W_FLEN:   rdata_q <= {{(32-FB_BITS-1){1'b0}}, frame_len};
                     W_SEQ:    rdata_q <= cfg_seq_r;
                     W_STAMP0: rdata_q <= cfg_stamp_r[31:0];

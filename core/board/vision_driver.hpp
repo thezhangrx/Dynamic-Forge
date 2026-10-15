@@ -148,6 +148,30 @@ public:
     void set_cfg(CfgAddr a, int32_t value);
 
     // -- 取帧 --------------------------------------------------------------
+    // -- 真摄像头那条路：PS 把像素推进 PL ----------------------------------
+    //
+    //  真摄像头采到的帧在 PS 手上（V4L2），而 `vision_top` 的像素来自 PL 侧。
+    //  这三件套把帧推给 PL 的像素 FIFO（见 fpga/rtl/vision_pixfeed.v）：
+    //
+    //      set_pixel_source(true) → flush_pixels() → run_frame_push(...)
+    //
+    //  **它必须与 :meth:`run_frame` 给出逐字节相同的结果** —— 协同仿真的
+    //  `tb_axi --fifo` 就是在证这一条（同一批真实照片，两条像素通路）。
+
+    //: 像素源：``false`` = 外部 ``din_*``（板上是 tpg_source），``true`` = PS 的 FIFO。
+    void set_pixel_source(bool from_fifo);
+    //: 清空像素 FIFO 与溢出标志（换源/开新帧之前调）。
+    void flush_pixels();
+    //: 读 PIXSTAT：``[15:0]`` 还在缓冲的字节数，``[16]`` 溢出（粘滞），``[17]`` 还在放。
+    uint32_t pixel_status() const;
+
+    //: 把一帧 RGB（连续三元组，``w*h*3`` 字节，就是 PPM 的像素区）推进 PL，
+    //: 然后取回几何帧字节。**调用方负责先 :meth:`set_pixel_source` 与
+    //: :meth:`flush_pixels`。** 返回前会把像素源切回外部。
+    std::vector<uint8_t> run_frame_push(const uint8_t* rgb, size_t bytes,
+                                        uint32_t seq, uint64_t stamp_ns,
+                                        int timeout_ms);
+
     //: 跑一帧，返回**几何帧原始字节**。
     //: ``timeout_ms`` 内没等到 busy 落就抛 std::runtime_error。
     std::vector<uint8_t> run_frame(uint32_t seq, uint64_t stamp_ns,
@@ -172,6 +196,10 @@ public:
 
 private:
     RegIo& io_;
+
+    //: 从"已经写了 start"开始：等 busy 拉高再落，按 FLEN 读窗口。
+    //: 两条像素通路（外部 din_* / PS 推 FIFO）共用。
+    std::vector<uint8_t> finish_frame(int timeout_ms);
 };
 
 }   // namespace vision_board

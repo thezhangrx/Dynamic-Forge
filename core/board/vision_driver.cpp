@@ -13,6 +13,7 @@
 #include "vision_driver.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -99,6 +100,71 @@ std::vector<uint8_t> VisionDriver::run_frame(uint32_t seq, uint64_t stamp_ns,
     // ---- 2) 启动 ---------------------------------------------------------
     write_reg(kOffCtrl, kCtrlStart);
 
+    return finish_frame(timeout_ms);
+}
+
+// ---------------------------------------------------------------------------
+// 真摄像头那条路：PS 把像素推进 PL 的 FIFO
+// ---------------------------------------------------------------------------
+void VisionDriver::set_pixel_source(bool from_fifo) {
+    write_reg(kOffPixCtl, from_fifo ? 0x1u : 0x0u);
+}
+void VisionDriver::flush_pixels() {
+    write_reg(kOffPixCtl, 0x2u);          // bit1 = flush
+}
+uint32_t VisionDriver::pixel_status() const {
+    return read_reg(kOffPixStat);
+}
+
+std::vector<uint8_t> VisionDriver::run_frame_push(const uint8_t* rgb, size_t bytes,
+                                                  uint32_t seq, uint64_t stamp_ns,
+                                                  int timeout_ms) {
+    if (bytes == 0 || (bytes % 4u) != 0) {
+        // 推入是按 32 位字走的，字节数必须整除 4。
+        // 640x360x3 = 691200 ✓；换成别的尺寸时调用方自己补零到 4 的倍数。
+        throw std::runtime_error("run_frame_push：字节数必须是 4 的倍数");
+    }
+    uint32_t lo = 0, hi = 0;
+    split_stamp(stamp_ns, lo, hi);
+    write_reg(kOffSeq, seq);
+    write_reg(kOffStamp0, lo);
+    write_reg(kOffStamp1, hi);
+
+    // 选 FIFO 源 + 清空（同一次写：bit0=1, bit1=1）
+    write_reg(kOffPixCtl, 0x3u);
+    write_reg(kOffCtrl, kCtrlStart);
+
+    // 推像素。**盲写**：消费者（流水线）每拍 1 像素 = 150 MB/s，比 PS 的
+    // 非缓存写（实测 ~40 MB/s）快得多，所以 FIFO 只会被抽空。推完读一次状态，
+    // 溢出就报出来 —— 静默丢像素是最难查的失败。
+    for (size_t i = 0; i < bytes; i += 4u) {
+        const uint32_t w = static_cast<uint32_t>(rgb[i])
+                         | (static_cast<uint32_t>(rgb[i + 1]) << 8)
+                         | (static_cast<uint32_t>(rgb[i + 2]) << 16)
+                         | (static_cast<uint32_t>(rgb[i + 3]) << 24);
+        write_reg(kOffPixPush, w);
+    }
+    const uint32_t st = pixel_status();
+    if (st & (1u << 16)) {
+        // 不抛异常：溢出后帧内容仍然可能是"合法的但错的"，交给上面的判据。
+        // 但一定要让调用方看见（这是最难查的一类失败）。
+        std::fprintf(stderr, "⚠ 像素 FIFO 溢出（缓冲 %u 字节）—— 这一帧不可信\n",
+                     st & 0xFFFFu);
+    }
+
+    // 把像素源切回去，免得后续 :meth:`run_frame` 以为还有像素进来
+    write_reg(kOffPixCtl, 0x0u);
+    return finish_frame(timeout_ms);
+}
+
+// ---------------------------------------------------------------------------
+// 等一整帧跑完，然后读 FLEN + 窗口
+//
+// 两条像素通路（外部 din_* 与 PS 推 FIFO）**共用这一段**：入参前提是"已经写了
+// start"，出来的是几何帧字节。抽出来是为了让两条路走**同一份**等待与读取逻辑
+// —— 分开写迟早会在超时/长度校验上分家。
+// ---------------------------------------------------------------------------
+std::vector<uint8_t> VisionDriver::finish_frame(int timeout_ms) {
     // ---- 3) 等 busy 拉高再落 --------------------------------------------
     // 先等它忙起来：写 start 到 busy 拉高之间有若干拍，直接等"落"可能
     // 在还没起来的时候就通过。

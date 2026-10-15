@@ -54,6 +54,9 @@ enum {
     A_STAMP0         = 0x0C8,
     A_STAMP1         = 0x0CC,
     A_FLEN           = 0x0D0,
+    A_PIXPUSH        = 0x0D4,   // 写：推一个 32 位字（4 个打包字节）
+    A_PIXSTAT        = 0x0D8,   // 读：[15:0]占用 [16]溢出 [17]还在放
+    A_PIXCTL         = 0x0DC,   // 写：bit0 像素源(0=外部/TPG,1=FIFO) bit1 flush
     A_FRAME          = 0x100,
     A_CFG_STATUS     = 0x07C    // 4*31：vision_top 的 CFG_STATUS
 };
@@ -75,6 +78,11 @@ static bool g_verbose = false;
 //   "AW/W 不同拍"这条路每次跑测试都会被走到。
 //   `--w-delay 0` 可以退回同拍的老行为（两个都要覆盖）。
 static int g_w_delay = 1;
+
+//: `--fifo`：像素不直接从 din_* 灌，而是**经 AXI 推 0x0D4**（真摄像头那条路）。
+//  这是"PS 喂帧"通路唯一的判据 —— 它必须给出与直接灌 din_* **逐字节相同**的
+//  几何帧，否则真摄像头接上去就会出别的结果。
+static bool g_via_fifo = false;
 
 static void cmp_u32(const char *what, long long idx, uint32_t got, uint32_t want)
 {
@@ -238,6 +246,7 @@ int main(int argc, char **argv)
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--verbose")) g_verbose = true;
         else if (!strcmp(argv[i], "--w-delay") && i + 1 < argc) g_w_delay = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fifo")) g_via_fifo = true;
         else if (!strcmp(argv[i], "--bright") && i + 1 < argc) params.bright_min = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bright-spread") && i + 1 < argc) params.bright_spread = atoi(argv[++i]);
         // 反面控制：只改 RTL 的寄存器、不改 C 的参数 → AXI 路径必须报不一致
@@ -420,6 +429,44 @@ int main(int argc, char **argv)
         CHECK(axi_read(A_STAMP1, &v) && v == save_st1, "选通自检：恢复 STAMP1 不符");
     }
 
+    // ---- 1.6) 像素 FIFO 的语义（占用 / flush / 溢出）--------------------
+    // 这几个在真硬件上很难构造（要精确控制"刚好写满"），但在仿真里是确定的。
+    // 关键前提：**像素源选 din_*（bit0=0）时 FIFO 不会被抽走** ——
+    // vision_pixfeed 只在 din_ready（流水线 S_RECV）且 busy 时才吐像素，
+    // 所以这时候能安心地数占用。
+    {
+        uint32_t st = 0;
+        const uint32_t kDepth = 2048;              // AW=11
+
+        // (a) flush 后应为空
+        CHECK(axi_write(A_PIXCTL, 0x2), "FIFO 测试：flush 超时");
+        CHECK(axi_read(A_PIXSTAT, &st) && (st & 0xFFFF) == 0, "FIFO 测试：flush 后占用不为 0");
+        CHECK((st & (1u << 16)) == 0, "FIFO 测试：flush 应同时清溢出位");
+
+        // (b) 推 N 个字 → **缓冲字节数**应恰为 4N（源选 din_*，没人抽）。
+        //     注意不能拿"FIFO 占用字数"来判：蓄水池会预取最多 2 个字，
+        //     那个差值是实现细节（这条测试最初就是这么写错的）。
+        for (uint32_t i = 0; i < 10; i++) CHECK(axi_write(A_PIXPUSH, 0x11223344u + i), "推像素超时");
+        CHECK(axi_read(A_PIXSTAT, &st) && (st & 0xFFFF) == 40, "FIFO 测试：缓冲字节数不对");
+        CHECK((st & (1u << 16)) == 0, "FIFO 测试：没满就报溢出");
+
+        // (c) flush 清零
+        CHECK(axi_write(A_PIXCTL, 0x2), "FIFO 测试：二次 flush 超时");
+        CHECK(axi_read(A_PIXSTAT, &st) && (st & 0xFFFF) == 0, "FIFO 测试：flush 没清干净");
+
+        // (d) 一直写到溢出 → 溢出位必须立起来
+        //     （蓄水池最多吸 8 字节，所以多写 16 个字足够越过边界）
+        for (uint32_t i = 0; i < kDepth + 16; i++) {
+            if (!axi_write(A_PIXPUSH, i)) { CHECK(false, "推像素超时"); break; }
+        }
+        CHECK(axi_read(A_PIXSTAT, &st) && (st & (1u << 16)) != 0,
+              "FIFO 测试：写满后再写必须报溢出（否则 PS 盲写时会**静默丢像素**）");
+        CHECK(axi_write(A_PIXCTL, 0x2), "FIFO 测试：收尾 flush 超时");
+        CHECK(axi_read(A_PIXSTAT, &st) && (st & 0xFFFF) == 0 && (st & (1u << 16)) == 0,
+              "FIFO 测试：收尾 flush 未清干净");
+        printf("    [FIFO] 缓冲字节/flush/溢出 语义正确（FIFO 深度 %u 字）\n", kDepth);
+    }
+
     // ---- 1) 配置寄存器：写进去再读回来 --------------------------------
     for (int f = 0; f < frames; f++) {
         char name[64];
@@ -464,21 +511,40 @@ int main(int argc, char **argv)
                               frame_g.data(), frame_g.size(), &params,
                               (uint32_t)f, 0) != 0) return 1;
 
+        size_t npix = (size_t)w * h;
         CHECK(axi_write(A_CTRL, 1), "写 CTRL 启动超时");
         for (int i = 0; i < 4; i++) step();      // 让状态机进 S_RECV
 
-        size_t npix = (size_t)w * h;
-        for (size_t i = 0; i < npix; i++) {
-            int x = (int)(i % (size_t)w);
-            top->din_vld = 1;
-            top->din_sof = (i == 0) ? 1 : 0;
-            top->din_eol = (x == w - 1) ? 1 : 0;
-            top->din_r = rgb[i * 3 + 0];
-            top->din_g = rgb[i * 3 + 1];
-            top->din_b = rgb[i * 3 + 2];
-            step();
+        if (g_via_fifo) {
+            // ---- PS 喂像素那条路：选 FIFO + flush，然后把整帧的 RGB 字节
+            //      按 32 位字推 0x0D4。字节布局必须与 vision_pixfeed.v 的约定
+            //      一致：**连续 RGB 三元组**，bit[7:0] 是先到的字节。
+            CHECK(axi_write(A_PIXCTL, 0x3), "写 PIXCTL(src=1,flush=1) 超时");
+            const size_t nwords = npix * 3 / 4;      // 640x360x3 = 691200，整除 4
+            for (size_t i = 0; i < nwords; i++) {
+                const uint32_t w32 = (uint32_t)rgb[4 * i]
+                                   | ((uint32_t)rgb[4 * i + 1] << 8)
+                                   | ((uint32_t)rgb[4 * i + 2] << 16)
+                                   | ((uint32_t)rgb[4 * i + 3] << 24);
+                if (!axi_write(A_PIXPUSH, w32)) { CHECK(false, "推像素超时"); break; }
+            }
+            // 溢出位必须没立（TB 推得比消费者慢，FIFO 只会被抽空）
+            uint32_t st = 0;
+            if (axi_read(A_PIXSTAT, &st) && (st & (1u << 16)))
+                CHECK(false, "像素 FIFO 溢出（TB 推得比流水线快？）");
+        } else {
+            for (size_t i = 0; i < npix; i++) {
+                int x = (int)(i % (size_t)w);
+                top->din_vld = 1;
+                top->din_sof = (i == 0) ? 1 : 0;
+                top->din_eol = (x == w - 1) ? 1 : 0;
+                top->din_r = rgb[i * 3 + 0];
+                top->din_g = rgb[i * 3 + 1];
+                top->din_b = rgb[i * 3 + 2];
+                step();
+            }
+            top->din_vld = 0; top->din_sof = 0; top->din_eol = 0;
         }
-        top->din_vld = 0; top->din_sof = 0; top->din_eol = 0;
 
         // ---- 3) 轮询到帧完成 -----------------------------------------
         bool ok = false;
@@ -526,9 +592,11 @@ int main(int argc, char **argv)
             cmp_u32("status.frames", 0, (v >> 8) & 0xFFFFu, 1u);
         }
 
+        if (g_via_fifo) CHECK(axi_write(A_PIXCTL, 0x0), "复位 PIXCTL 超时");
         if (g_verbose)
-            printf("帧 %d: AXI 路径一致（%u 字节, %d 障碍, %d 缺口, 角色 %d）\n",
-                   f, flen, res.n_obstacles, res.n_gaps, res.player_valid);
+            printf("帧 %d: AXI 路径一致（%u 字节, %d 障碍, %d 缺口, 角色 %d）%s\n",
+                   f, flen, res.n_obstacles, res.n_gaps, res.player_valid,
+                   g_via_fifo ? "  [经 PS 推像素 FIFO]" : "");
     }
 
     printf("\n=== AXI 协同仿真结果 ===\n");
