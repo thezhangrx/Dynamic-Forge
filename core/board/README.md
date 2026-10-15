@@ -141,9 +141,25 @@ ssh root@192.168.137.242 'cd /root/board_src && cmake -S core/board -B build && 
 
 | 路 | 命令 | 帧来源 | 用途 |
 |---|---|---|---|
-| **PL** | `./vision_board_devmem --frames 8` | `tpg_source` → PL 流水 → AXI 窗口 | 项目目标路径；验 PL 加速 |
-| **PS 参照** | `--ppm-dir DIR` / `--ppm FILE` | PS 上跑 C 参考模型（黄金模型） | 真图；也是 PL 出问题时的参照 |
+| **PL（片上图案）** | `./vision_board_devmem --frames 8` | `tpg_source` → PL 流水 → AXI 窗口 | 自检；验 PL 通路 |
+| **PL（真图）** | `--ppm FILE --via-pl` | PPM 像素**推进 PL 的 FIFO** → PL 流水 → 窗口 | **真摄像头走 FPGA 加速** |
+| **PS 参照** | `--ppm FILE` / `--ppm-dir DIR` | PS 上跑 C 参考模型（黄金模型） | 真图；也是 PL 出问题时的参照 |
 | **键盘** | 默认就发（`--keyboard-dev /dev/ttyPS0`） | 决策 → 动作号 → `@MOVE <n>\n` | 给 RP2040 键盘桥 |
+
+**PL（真图）那条路怎么走的**：PS 把一帧 RGB 按 32 位字推 `0x0D4`（像素 FIFO），
+PL 侧 `vision_pixfeed.v` 把字节流还原成像素时序喂给流水线，几何帧照旧从窗口读。
+
+* **为什么不用"DDR + PL AXI master"**：先量过 PS→PL 的吞吐
+  （`tools/axi_bw.c`）：691200 B 要 17.4 ms（30fps 预算的 52%）。非缓存写
+  ~40 MB/s 是 PS 侧的硬约束 —— 写 PL 还是写 `/dev/mem` 映射的 DDR 都逃不掉。
+  所以不引入 AXI master，少一个要写要验、还要 DDR 预留的部件。
+* **为什么不存整帧**：消费者每拍 1 像素 = 150 MB/s，比 PS 的 40 MB/s 快 3.75 倍，
+  所以 FIFO 只会被抽空、不会被塞满 → **PS 可以盲写**（不必每字回读状态）。
+  省掉 150 个 BRAM，也不用把 ADDR_W 从 12 位撑到 20 位。
+* **溢出不会静默**：`PIXSTAT` 的 bit16 是粘滞溢出位，PS 推完读一次就知道。
+
+**三条路给出的几何帧必须逐字节相同** —— 这一点由协同仿真的 `tb_axi --fifo`
+直接证（同一批真照片，两条像素通路都跑一遍）。
 
 三条可以任意组合：`--ppm FILE` 换掉帧来源，键盘那一段不变。
 决策/解码/键盘是**共用**的下游，所以"真图"和"PL 图"走的是同一条后处理。
@@ -172,7 +188,7 @@ ffmpeg -f v4l2 -i /dev/video0 -frames:v 1 -pix_fmt rgb24 /root/cam.ppm
 |---|---|---|
 | 1 | ~~C++ 决策~~ | ✅ 已完成：`core/cpu/cpp/`，10 条交叉验证用例 |
 | 2 | ~~像素从哪来~~ | ✅ PL 侧用 `tpg_source` 已跑通；真图走 PS 参考模型也已跑通（`--ppm`） |
-| 3 | **PL 也吃真图** | 现在真图是 **PS 上跑黄金模型**。要让 PL 加速也吃真图，需要一条 PS→PL 像素通路：板子已有 `S_AXI_HP0..3`，可走 DDR + PL 侧 AXI master 读帧（或先把一帧写进 PL 的 BRAM）。**这是下一步的 RTL 工作** |
+| 3 | ~~PL 也吃真图~~ | ✅ 已完成：PS 推像素 FIFO（`rtl/vision_pixfeed.v`）+ `--via-pl`；`tb_axi --fifo` 逐字节验过 |
 | 4 | **移动墙的速度** | 线协议不带速度，PS 侧要按 `stamp` 差分出来再填进 `Rect.vx/vy` |
 | 5 | ~~上板实测~~ | ✅ 已完成（2026-10-15）：自检通过、8 帧全解码、决策 8 帧、**72～77 帧/秒**；键盘行串口实收。见 `core/fpga/docs/板上验证.md` §4/§6 |
 | 6 | **RP2040 那一端** | 板子侧已验（串口实收 `@MOVE n`）；RP2040 要刷 CircuitPython + 拷 `adafruit_hid` + 接两根线。见 `core/rp2040_keyboard/README.md` |
