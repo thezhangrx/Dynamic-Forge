@@ -401,11 +401,16 @@ int main(int argc, char** argv) {
     }
     std::unique_ptr<VisionDriver> drv;
     std::unique_ptr<RefFrameSource> ref;
+    // ⚠ 这两段必须是**两个独立的 if**，不能写成 if/else：
+    //   `--verify-both` 要**同时**建 ref 与 drv（两条路都要跑）。写成 else 的话
+    //   只建了 ref，而帧循环里会去调 `drv->run_frame_push(...)` → **空指针段错误**
+    //   （实测 exit 139，而且现象是"打印看起来正常、下一行就崩"，不好定位）。
     if (use_ref || args.verify_both) {
         ref.reset(new RefFrameSource(args));
         std::printf("帧来源: PS 参考模型 (%s)\n",
                     args.ppm_dir.empty() ? args.ppm_file.c_str() : args.ppm_dir.c_str());
-    } else {
+    }
+    if (!use_ref) {
         drv.reset(new VisionDriver(*io));
         if (args.verify_both) {
             std::printf("帧来源: **两条都跑**（PL 推像素 vs PS 黄金模型，逐字节比）\n");
@@ -594,6 +599,43 @@ int main(int argc, char** argv) {
     }
     std::printf("\n");
     if (args.verify_both) {
+        // ---- 配置对账：PS 写进去的 21 个寄存器 vs 参考模型的默认参数 ----
+        //
+        // 为什么单列这一步：**协同仿真测不到它** —— `tb_axi` 两边都用 C 参考模型的
+        // 默认值，所以"PS 侧那份结构体的默认值 / 下标映射"从来没被验过。而板上
+        // 写进去的是 C++ 的 `VisionParams`。两者只要有一项不同，PL 与模型的
+        // 判据就会不同 → 几何帧"个数对、坐标不对"，且**完全不报错**。
+        {
+            VrRefParams rp;
+            vr_ref_default_params(&rp);
+            const int32_t want[21] = {
+                rp.wall_rb, rp.wall_min_r, rp.wall_min_g, rp.bright_min,
+                rp.bright_spread, rp.green_gm, rp.green_min, rp.band_row_pct,
+                rp.band_join_rows, rp.band_min_rows, rp.field_col_min,
+                rp.wall_col_pct, rp.wall_col_min, rp.edge_min, rp.edge_min_cols,
+                rp.min_seg_px, rp.min_gap_px, rp.player_min_area,
+                rp.player_max_area, rp.player_min_fill_pct, rp.player_max_aspect_pct,
+            };
+            const char* nm[21] = {
+                "wall_rb", "wall_min_r", "wall_min_g", "bright_min", "bright_spread",
+                "green_gm", "green_min", "band_row_pct", "band_join_rows",
+                "band_min_rows", "field_col_min", "wall_col_pct", "wall_col_min",
+                "edge_min", "edge_min_cols", "min_seg_px", "min_gap_px",
+                "player_min_area", "player_max_area", "player_min_fill_pct",
+                "player_max_aspect_pct",
+            };
+            int ncfg_bad = 0;
+            for (int j = 0; j < 21; ++j) {
+                const uint32_t got = drv->read_reg(kOffConfig + 4u * (uint32_t)j);
+                if (static_cast<int32_t>(got) != want[j]) {
+                    std::printf("  ✗ 配置第 %2d 项 %-22s PL=%d  参考=%d\n",
+                                j, nm[j], static_cast<int>(got), want[j]);
+                    ++ncfg_bad;
+                }
+            }
+            std::printf("---- 配置对账：21 项，不符 %d ----\n", ncfg_bad);
+            if (ncfg_bad) ++bad;
+        }
         std::printf("---- 等价性对账：%ld 帧，逐字节相同 %ld，不符 %ld ----\n",
                     cmp_total, cmp_ok, cmp_bad);
         if (cmp_bad) ++bad;

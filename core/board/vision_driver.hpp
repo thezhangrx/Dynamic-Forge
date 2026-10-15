@@ -89,6 +89,13 @@ RegIo* open_reg_io(const std::string& device_url);
 // 默认值取自 `core/vision/wall_with_gap.py` 的 WallWithGapParams（语义真值），
 // 并且 C 参考模型 `vr_ref_default_params()` 会给同一组 —— 三方一致有测试守着。
 // ---------------------------------------------------------------------------
+// ⚠ **这些默认值必须与 C 参考模型 `vr_ref_default_params()` 逐项相同**
+//   （也就等于 `core/vision/wall_with_gap.py` 的 WallWithGapParams，那份是语义真值）。
+//   踩过：这里曾经有 13 项和参考模型不一样（band_row_pct 12 vs 5、edge_min 20 vs 12、
+//   player_max_area 6000 vs 1500 …），于是 PS 写进 PL 的阈值与**整条验证链**
+//   （RTL 复位值 / C 参考模型 / Python 真值）用的那一套不同 —— 表现是"板上几何帧
+//   障碍个数对、坐标不对"，而且**完全不报错**。已由
+//   `tests/test_params_defaults_match_reference.py` 逐项钉住。
 struct VisionParams {
     // ① 逐像素分类
     int wall_rb       = 40;    // R - B 下限（橙墙）
@@ -99,20 +106,20 @@ struct VisionParams {
     int green_gm      = 10;    // 绿：G - max(R,B) 下限
     int green_min     = 90;    // 绿：G 下限
     // ②..⑥ 检测参数
-    int band_row_pct    = 12;
-    int band_join_rows  = 2;
-    int band_min_rows   = 4;
-    int field_col_min   = 8;
-    int wall_col_pct    = 50;
-    int wall_col_min    = 3;
-    int edge_min        = 20;
-    int edge_min_cols   = 2;
+    int band_row_pct    = 5;
+    int band_join_rows  = 4;
+    int band_min_rows   = 5;
+    int field_col_min   = 5;
+    int wall_col_pct    = 25;
+    int wall_col_min    = 2;
+    int edge_min        = 12;
+    int edge_min_cols   = 1;
     int min_seg_px      = 8;
-    int min_gap_px      = 12;
-    int player_min_area = 120;
-    int player_max_area = 6000;
-    int player_min_fill = 30;
-    int player_max_aspect = 250;
+    int min_gap_px      = 8;
+    int player_min_area = 60;
+    int player_max_area = 1500;
+    int player_min_fill = 45;
+    int player_max_aspect = 160;
 
     //: 按 :enum:`CfgAddr` 的顺序摊平成 21 个数（写寄存器时用它）。
     std::vector<int32_t> to_regs() const;
