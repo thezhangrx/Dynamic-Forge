@@ -11,8 +11,20 @@
 #include "action_codec.hpp"
 
 #include <cstdio>
+#include <cstring>
 
-int main() {
+int main(int argc, char** argv) {
+    // `--lines`：把 9 个动作各编成一行原样打出来（不带额外修饰），
+    // 给"发射器 ↔ RP2040 解析器"的往返契约测试用
+    // （core/board/tests/test_keyboard_wire_protocol.py）。
+    if (argc > 1 && std::strcmp(argv[1], "--lines") == 0) {
+        char buf[16];
+        for (int a = 0; a < vision_board::kNumDiscreteActions; ++a) {
+            const int n = vision_board::format_action_line(a, buf, sizeof(buf));
+            if (n > 0) std::fwrite(buf, 1, static_cast<size_t>(n), stdout);
+        }
+        return 0;
+    }
     double wx = 0.0, wy = 0.0;
     while (std::scanf("%lf %lf", &wx, &wy) == 2) {
         std::printf("%d\n", vision_board::action_from_velocity(wx, wy));
