@@ -492,11 +492,12 @@ def test_windowed_path_probes_before_opening() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8) 开场只放一种障碍（`--stage-seconds`）
+# 8) 开场只放一种障碍（`--stage-seconds`）/ 障碍分开展示（`--obstacle-cycle`）
 #
 # 板子那侧读的是**摄像头看到的画面**：开场同时出现墙+缺口、移动块、小障碍时，
 # 分不清"哪个是墙、哪个是目标"，控制根本无从验起。所以给人看/给摄像头看的
-# `play` / `board-control` 默认分批进场，第一批只有墙+缺口。
+# `play` / `board-control` 默认分批进场，第一批只有墙+缺口；要逐个类型单独看
+# （同一时刻只有一种）就用 `--obstacle-cycle S`。
 # ---------------------------------------------------------------------------
 def test_play_and_board_control_stage_by_default() -> None:
     from bullet_sim.cli import DEFAULT_STAGE_SECONDS, _spec_from_args, build_parser
@@ -535,3 +536,56 @@ def test_stage_seconds_flag_sets_the_window() -> None:
     times = [s["first_spawn_s"] for s in spec.meta["obstacle_stages"]]
     assert len(times) == len(set(times)), f"每种障碍必须占一个批次：{times}"
     assert times[0] == 0.0 and all(t >= 3.0 for t in times[1:]), times
+
+
+def test_obstacle_cycle_shows_each_type_alone() -> None:
+    """`--obstacle-cycle S`：每个类型独占 S 秒，整轮循环 —— 逐个类型验的唯一办法。"""
+    from bullet_sim.cli import _spec_from_args, build_parser
+
+    spec = _spec_from_args(build_parser().parse_args(
+        ["board-control", "--level", "medium", "--obstacle-cycle", "10"]))
+    assert spec.meta["cycle_seconds"] == 10.0
+    assert spec.meta["cycle_period_s"] == 30.0, "3 种类型 × 10 秒"
+    assert [e["slot_s"] for e in spec.meta["obstacle_cycle"]] == [0.0, 10.0, 20.0]
+    # 轮播接管分批（同时给两个没有意义），而且不该再往 meta 里写批次表
+    assert "stage_seconds" not in spec.meta
+    for p in spec.patterns:
+        assert p.interval == 30.0 and p.repetitions == 0, p.describe()
+
+
+def test_obstacle_cycle_follows_the_order_the_types_are_listed() -> None:
+    """`--obstacle-type` 一个个写出来时，**写的顺序就是展示顺序**。"""
+    from bullet_sim.cli import _spec_from_args, build_parser
+
+    spec = _spec_from_args(build_parser().parse_args([
+        "board-control", "--obstacle-type", "small_obstacles",
+        "--obstacle-type", "wall_with_gap", "--obstacle-cycle", "6",
+    ]))
+    assert [e["type"] for e in spec.meta["obstacle_cycle"]] == [
+        "small_obstacles", "wall_with_gap"]
+    assert spec.meta["cycle_period_s"] == 12.0
+    starts = {p.params["layout"]: p.start_time for p in spec.patterns}
+    assert starts == {"small": 0.0, "wall_gap": 6.0}, starts
+
+
+def test_staging_also_follows_the_listed_order() -> None:
+    """分批同理：用户列出的先后不能被我们的"可读性顺序"重排。"""
+    from bullet_sim.cli import _spec_from_args, build_parser
+
+    spec = _spec_from_args(build_parser().parse_args([
+        "board-control", "--obstacle-type", "small_obstacles",
+        "--obstacle-type", "wall_with_gap", "--stage-seconds", "5",
+    ]))
+    stages = {e["type"]: e["first_spawn_s"] for e in spec.meta["obstacle_stages"]}
+    assert stages == {"small_obstacles": 0.0, "wall_with_gap": 5.0}, stages
+
+
+def test_obstacle_cycle_is_off_by_default() -> None:
+    from bullet_sim.cli import _spec_from_args, build_parser
+
+    spec = _spec_from_args(build_parser().parse_args(["board-control", "--level", "medium"]))
+    assert "cycle_seconds" not in spec.meta and "obstacle_cycle" not in spec.meta
+    off = _spec_from_args(build_parser().parse_args(
+        ["board-control", "--level", "medium", "--obstacle-cycle", "0"]))
+    assert "cycle_seconds" not in off.meta
+    assert off.meta["stage_seconds"] > 0, "0 = 关，回到分批的默认行为"

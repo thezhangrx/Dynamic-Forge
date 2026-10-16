@@ -333,6 +333,100 @@ def test_stage_patterns_leaves_unknown_layouts_alone():
     assert staged[0].start_time == 1.5
 
 
+# --------------------------------------------------------------------------
+# 分开展示（`--obstacle-cycle`）：每个类型独占一段档期，整轮循环
+#
+# 与"分批进场"的区别是**叠加 vs 独占**：分批是 10 秒后场上同时有墙和移动块；
+# 轮播是同一时刻场上只有一种障碍 —— 逐个类型验视觉/决策时只有这个能用。
+# --------------------------------------------------------------------------
+
+
+def test_cycle_gives_every_kind_its_own_slot():
+    spec = scenario_for_level("medium", seed=3, duration=40.0, cycle_seconds=10.0)
+    period = spec.meta["cycle_period_s"]
+    assert period == 30.0, "3 种障碍 × 10 秒 = 一整轮 30 秒"
+    slots = {e["type"]: e["slot_s"] for e in spec.meta["obstacle_cycle"]}
+    assert slots == {"wall_with_gap": 0.0, "moving_block": 10.0, "small_obstacles": 20.0}
+    for p in spec.patterns:
+        kind = _CYCLE_LAYOUT_KIND[_layout(p)]
+        assert p.start_time == slots[kind], f"{kind} 的档期起点不对"
+        assert p.interval == period, f"{kind} 必须每整轮才发一次"
+        assert p.repetitions == 0, "repetitions=0 = 一直发到回合结束（整轮循环）"
+
+
+#: `PatternSpec.params['layout']` -> 障碍类型名（测试里对账用，故意写死）。
+_CYCLE_LAYOUT_KIND = {"wall_gap": "wall_with_gap", "block": "moving_block",
+                      "small": "small_obstacles"}
+
+
+def test_cycle_emits_only_inside_the_own_slot():
+    """发射步必须**全部落在自己的档期相位上**（这是"分开展示"的严格判据）。"""
+    spec = scenario_for_level("medium", seed=3, duration=40.0, cycle_seconds=10.0)
+    slots = {e["type"]: e["slot_s"] for e in spec.meta["obstacle_cycle"]}
+    period_steps = int(round(spec.meta["cycle_period_s"] / spec.dt))
+    seen = 0
+    for ev in build_from_spec(spec).timeline.iter_events():
+        layout = ev.pattern.split(":", 1)[1]
+        slot_steps = int(round(slots[_CYCLE_LAYOUT_KIND[layout]] / spec.dt))
+        assert ev.step % period_steps == slot_steps, (
+            f"{layout} 在第 {ev.step} 步发射，不在自己的档期相位 {slot_steps}")
+        seen += 1
+    assert seen >= 4, f"只看到 {seen} 次发射，轮播没转起来"
+
+
+def test_cycle_keeps_only_one_kind_on_the_field():
+    """跑世界：任何时刻**场上只有一种**障碍（上一档已经离场）。"""
+    from bullet_sim.simulator.world import World
+
+    spec = build_scenario("medium", seed=0, duration=40.0, cycle_seconds=10.0).spec
+    layouts = {i: _layout(p) for i, p in enumerate(spec.patterns)}
+    world = World(spec, reward="zero", terminate_on_collision=False, clamp_player=True)
+    who: list[set[str]] = []
+    for _ in range(int(40.0 / spec.dt)):
+        world.step(0)
+        pool = world.state.bullets
+        idx = pool.active_indices()
+        if idx.size:
+            who.append({layouts[int(g)] for g in np.unique(pool.data["group_id"][idx])})
+    assert who, "轮播场景里居然一个障碍都没出现过"
+    assert all(len(k) == 1 for k in who), (
+        f"出现了两种障碍同时在场的时刻：{sorted(k for k in who if len(k) > 1)[:5]}")
+
+
+def test_cycle_uses_each_type_own_counts():
+    """分开展示是**演示**模式：不要按难度预算把某一种放大成一大团。
+
+    默认 medium 的小障碍是 15 个一批；如果标定还开着，它会为了凑 208 个同时在场
+    把小障碍放大到 208 个一批 —— 那样反而看不清这一种类型。
+    """
+    spec = scenario_for_level("medium", seed=3, duration=40.0, cycle_seconds=10.0)
+    counts = {_layout(p): p.resolved_count for p in spec.patterns}
+    assert counts == {"wall_gap": 1, "block": 1, "small": 15}, counts
+    assert spec.meta["measured_peak_bullets"] <= 32, spec.meta["measured_peak_bullets"]
+    # 容量必须跟着真实峰值走：给小了会静默丢障碍
+    assert spec.bullet_capacity >= spec.meta["measured_peak_bullets"]
+
+
+def test_cycle_is_off_by_default_and_survives_a_round_trip(tmp_path):
+    plain = scenario_for_level("medium", seed=3, duration=30.0)
+    assert "obstacle_cycle" not in plain.meta and "cycle_seconds" not in plain.meta
+    zero = scenario_for_level("medium", seed=3, duration=30.0, cycle_seconds=0.0)
+    assert zero.to_dict() == plain.to_dict()
+
+    spec = scenario_for_level("medium", seed=3, duration=30.0, cycle_seconds=6.0)
+    loaded = ScenarioSpec.load(spec.save(tmp_path / "cycle.json"))
+    assert loaded.meta["obstacle_cycle"] == spec.meta["obstacle_cycle"]
+    assert build_from_spec(loaded).timeline.total_bullets == \
+        build_from_spec(spec).timeline.total_bullets
+
+
+def test_cycle_beats_staging_when_both_are_given():
+    spec = scenario_for_level("medium", seed=3, duration=40.0,
+                              stage_seconds=8.0, cycle_seconds=10.0)
+    assert spec.meta["cycle_seconds"] == 10.0
+    assert "stage_seconds" not in spec.meta, "轮播接管分批：两者都是按类型分时间"
+
+
 def test_built_scenario_can_be_saved_and_inspected(tmp_path):
     built = build_scenario("easy", seed=0)
     path = built.save(tmp_path / "built.json")

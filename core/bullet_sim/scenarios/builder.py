@@ -163,20 +163,44 @@ def pattern_kind(pattern: PatternSpec) -> str | None:
     return _LAYOUT_KINDS.get(layout)
 
 
-def stage_offsets(patterns: Sequence[PatternSpec], stage_seconds: float) -> dict[str, float]:
-    """First-appearance delay per obstacle kind, in the staged order."""
+def kind_order(
+    patterns: Sequence[PatternSpec], preferred: Sequence[str] | None = None
+) -> list[str]:
+    """障碍类型在时间轴上的先后顺序。
+
+    ``preferred`` 是**调用方明确给的**顺序（例如用户 `--obstacle-type` 的书写顺序）：
+    用户既然一个个列出来了，那个顺序就是他要的展示顺序，不能被我们按"可读性"重排。
+    没给就按 :data:`STAGE_ORDER`（墙最先），剩下的未知类型排在最后。
+    """
     present: list[str] = []
     for p in patterns:
         kind = pattern_kind(p)
         if kind is not None and kind not in present:
             present.append(kind)
-    ordered = [k for k in STAGE_ORDER if k in present]
-    ordered += [k for k in present if k not in STAGE_ORDER]  # unknown kinds last
+    head = [k for k in (preferred or ()) if k in present]
+    if not head:
+        head = [k for k in STAGE_ORDER if k in present]
+    tail = [k for k in STAGE_ORDER if k in present and k not in head]
+    tail += [k for k in present if k not in head and k not in tail]
+    return head + tail
+
+
+def stage_offsets(
+    patterns: Sequence[PatternSpec],
+    stage_seconds: float,
+    *,
+    order: Sequence[str] | None = None,
+) -> dict[str, float]:
+    """First-appearance delay per obstacle kind, in the staged order."""
+    ordered = kind_order(patterns, order)
     return {kind: i * float(stage_seconds) for i, kind in enumerate(ordered)}
 
 
 def stage_patterns(
-    patterns: Sequence[PatternSpec], stage_seconds: float
+    patterns: Sequence[PatternSpec],
+    stage_seconds: float,
+    *,
+    order: Sequence[str] | None = None,
 ) -> list[PatternSpec]:
     """Push every obstacle kind after the first to its own first-appearance time.
 
@@ -186,7 +210,7 @@ def stage_patterns(
     seconds = float(stage_seconds)
     if seconds <= 0.0 or not patterns:
         return list(patterns)
-    offsets = stage_offsets(patterns, seconds)
+    offsets = stage_offsets(patterns, seconds, order=order)
     out: list[PatternSpec] = []
     for p in patterns:
         kind = pattern_kind(p)
@@ -195,17 +219,22 @@ def stage_patterns(
     return out
 
 
-def stage_spec(spec: ScenarioSpec, stage_seconds: float) -> ScenarioSpec:
+def stage_spec(
+    spec: ScenarioSpec, stage_seconds: float, *, order: Sequence[str] | None = None
+) -> ScenarioSpec:
     """Apply :func:`stage_patterns` to a whole scenario and record the schedule.
 
     The schedule lands in ``spec.meta['obstacle_stages']`` (kind + real first
     spawn time), so a report can state *when* each kind enters instead of only
     *which* kinds exist.
+
+    注意这是"**叠加**"：第 2 种进场时第 1 种还在场上。要"同一时刻只有一种"
+    用 :func:`cycle_spec`（障碍**分开展示**）。
     """
     seconds = float(stage_seconds)
     if seconds <= 0.0:
         return spec
-    patterns = stage_patterns(spec.patterns, seconds)
+    patterns = stage_patterns(spec.patterns, seconds, order=order)
     first: dict[str, float] = {}
     for p in patterns:
         kind = pattern_kind(p)
@@ -217,6 +246,69 @@ def stage_spec(spec: ScenarioSpec, stage_seconds: float) -> ScenarioSpec:
     meta["obstacle_stages"] = [
         {"type": kind, "first_spawn_s": round(t, 6)}
         for kind, t in sorted(first.items(), key=lambda kv: (kv[1], kv[0]))
+    ]
+    return spec.replaced(patterns=patterns, meta=meta)
+
+
+def cycle_period(patterns: Sequence[PatternSpec], slot_seconds: float,
+                 *, order: Sequence[str] | None = None) -> float:
+    """一个完整轮次有多长：类型数 × 每类的档期。"""
+    return float(slot_seconds) * max(1, len(kind_order(patterns, order)))
+
+
+def cycle_patterns(
+    patterns: Sequence[PatternSpec],
+    slot_seconds: float,
+    *,
+    order: Sequence[str] | None = None,
+) -> list[PatternSpec]:
+    """**分开展示**：每个障碍类型独占一段档期，整轮循环。
+
+    与 :func:`stage_patterns` 的区别就在于"叠加"还是"轮播"：
+
+    * 分批进场（stage）：10 秒后场上同时有墙和移动块；
+    * 轮播（cycle）：每个类型只在自己的档期里出场，**同一时刻场上只有一种**
+      （上一档的障碍正在离场属于物理自然现象），整轮 ``n × S`` 秒后重复。
+
+    做法只用现有语义，不新增字段：``start_time = 档期起点``、
+    ``interval = 整轮时长``、``repetitions = 0``（一直发到回合结束）。
+    """
+    seconds = float(slot_seconds)
+    if seconds <= 0.0 or not patterns:
+        return list(patterns)
+    ordered = kind_order(patterns, order)
+    if len(ordered) < 2:
+        return list(patterns)  # 只有一种类型，轮播没有意义
+    period = cycle_period(patterns, seconds, order=order)
+    starts = {kind: i * seconds for i, kind in enumerate(ordered)}
+    out: list[PatternSpec] = []
+    for p in patterns:
+        kind = pattern_kind(p)
+        if kind is None:
+            out.append(p)
+            continue
+        out.append(p.replaced(start_time=starts[kind], interval=period, repetitions=0))
+    return out
+
+
+def cycle_spec(
+    spec: ScenarioSpec, slot_seconds: float, *, order: Sequence[str] | None = None
+) -> ScenarioSpec:
+    """Apply :func:`cycle_patterns` to a scenario and record the rotation."""
+    seconds = float(slot_seconds)
+    if seconds <= 0.0:
+        return spec
+    patterns = cycle_patterns(spec.patterns, seconds, order=order)
+    ordered = kind_order(spec.patterns, order)
+    if len(ordered) < 2:
+        return spec
+    period = cycle_period(spec.patterns, seconds, order=order)
+    meta = dict(spec.meta)
+    meta["cycle_seconds"] = seconds
+    meta["cycle_period_s"] = period
+    meta["obstacle_cycle"] = [
+        {"type": kind, "slot_s": round(i * seconds, 6), "until_s": round((i + 1) * seconds, 6)}
+        for i, kind in enumerate(ordered)
     ]
     return spec.replaced(patterns=patterns, meta=meta)
 
@@ -360,9 +452,10 @@ def make_scenario(
     field_h: float = 480.0,
     dt: float = 1.0 / 120.0,
     name: str | None = None,
-    calibrate: bool = True,
+    calibrate: bool | None = None,
     ensure_valid: bool = True,
     stage_seconds: float = 0.0,
+    cycle_seconds: float = 0.0,
     **spec_overrides: Any,
 ) -> ScenarioSpec:
     """Build a fully-specified scenario for a difficulty level or bullet count.
@@ -375,6 +468,13 @@ def make_scenario(
     kind every ``stage_seconds``.  Staging happens **before** calibration and the
     safety check, so the measured peak and the safety report describe the scene
     that actually runs.
+
+    ``cycle_seconds > 0`` **分开展示**（see :func:`cycle_spec`）: every kind gets a
+    slot of its own and the rotation repeats, so only one kind is on the field at
+    a time.  It replaces staging when both are given, and for a *level* scene it
+    also turns ``calibrate`` off by default (a per-type demo wants each type's own
+    counts, not the level's object budget) — an explicit bullet count
+    (``--bullets N``) or ``calibrate=True`` still calibrates.
 
     Any further keyword is forwarded verbatim to :class:`ScenarioSpec`
     (``player_speed``, ``player_x``, ``wrap``, ``cull_margin``, ...).
@@ -422,14 +522,26 @@ def make_scenario(
     )
     base.update(spec_overrides)
     spec = ScenarioSpec(**base)
-    if stage_seconds and float(stage_seconds) > 0.0:
+    cycling = bool(cycle_seconds) and float(cycle_seconds) > 0.0
+    if cycling:
+        spec = cycle_spec(spec, float(cycle_seconds))
+    elif stage_seconds and float(stage_seconds) > 0.0:
         spec = stage_spec(spec, float(stage_seconds))
+    # 分开展示（轮播）是**演示 / 逐项验收**模式：每种类型就用它自己的数量定义。
+    # 按难度预算去标定会把某一档放大成一大团（例如 208 个小圆点同时涌进来），
+    # 那样反而看不清这一种类型长什么样 —— 而这正是开这个开关的目的。
+    # 但**显式点名要多少**（`--bullets N` / `stress(N)`）仍然优先：那是明确要求。
+    if calibrate is None:
+        calibrate = not (cycling and not explicit_count)
     if calibrate and profile.bullet_count > 0:
         spec, peak = calibrate_bullet_count(spec, profile.bullet_count, return_peak=True)
         spec.meta["target_bullet_count"] = profile.bullet_count
         spec.meta["measured_peak_bullets"] = float(peak)
     else:
-        peak = int(measure_live_bullets(spec)["peak"]) if calibrate else 0
+        # 不标定也要量一次：这个数既写进 meta（不假装达到了难度预算），
+        # 也决定障碍池容量（容量给小了会静默丢障碍）。
+        peak = int(measure_live_bullets(spec)["peak"])
+        spec.meta["measured_peak_bullets"] = float(peak)
 
     # A *level* must always keep a safe region ("extreme 也要有安全区"), so the
     # built scene is measured and thinned until it passes.  Rescaling the already

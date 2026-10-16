@@ -302,7 +302,16 @@ def _add_obstacle_args(p: argparse.ArgumentParser) -> None:
         "--obstacle-type", action="append", default=None, metavar="KEY",
         help="dynamic obstacle type, repeatable - list several to compose a "
              "scene: moving_block|wall_with_gap|small_obstacles|corridor|"
-             "cross_traffic (see `python -m bullet_sim obstacles`)",
+             "cross_traffic (see `python -m bullet_sim obstacles`)。"
+             "只给一种 = 只看这一种；配合 `--obstacle-cycle S` = 逐个类型分开展示",
+    )
+    p.add_argument(
+        "--obstacle-cycle", type=float, default=0.0, metavar="S",
+        help="**把障碍分开展示**：每个类型独占 S 秒档期，整轮（类型数 × S 秒）循环，"
+             "同一时刻场上只有一种 —— 想逐个类型验视觉/决策时用这个。"
+             "顺序：`--obstacle-type` 就按你写的先后，难度场景按"
+             "墙缺口 → 移动块 → 小障碍 → 交叉 → 走廊。0 = 关（默认）。"
+             "给了它就接管 `--stage-seconds`（分批是「叠加」，轮播是「独占」）",
     )
     p.add_argument("--obstacle-count", type=int, default=None,
                    help="obstacles emitted per interval by the chosen type(s)")
@@ -399,26 +408,38 @@ def _spec_from_args(args: argparse.Namespace):
     """构造本次运行要用的 ``ScenarioSpec``。
 
     三条来源（``--scenario`` 文件 / ``--obstacle-type`` 组合 / ``--level`` 难度）
-    都会应用 ``--stage-seconds``：障碍**分批进场**，开场只放第一种。
-    难度那条走 ``make_scenario(stage_seconds=...)``，因为分批必须在"标定数量 +
-    安全校验"之前发生，否则 meta 里记的峰值描述的不是真正会跑的场景。
+    都会应用"按类型分时间"的两个开关：
+
+    * ``--obstacle-cycle S``（**分开展示**）：每个类型独占 S 秒，整轮循环；
+    * ``--stage-seconds S``（分批进场）：开场一种，之后每 S 秒**再多**一种。
+
+    后者给 `--obstacle-cycle` 让路（轮播更彻底，两个一起给没有意义）。难度那条走
+    ``make_scenario(...)``，因为分时间必须在"标定数量 + 安全校验"之前发生，
+    否则 meta 里记的峰值描述的不是真正会跑的场景。
+
+    ``--obstacle-type`` 的书写顺序就是展示顺序（用户一个个列出来，那就是他要的顺序）。
     """
-    from bullet_sim.scenarios.builder import build_scenario, stage_spec
+    from bullet_sim.scenarios.builder import build_scenario, cycle_spec, stage_spec
     from bullet_sim.scenarios.presets import stress
     from bullet_sim.scenarios.spec import ScenarioSpec
 
-    stage = float(getattr(args, "stage_seconds", None) or 0.0)
+    cycle = float(getattr(args, "obstacle_cycle", 0.0) or 0.0)
+    stage = 0.0 if cycle > 0.0 else float(getattr(args, "stage_seconds", None) or 0.0)
+    order = list(getattr(args, "obstacle_type", None) or []) or None
     level_kwargs: dict[str, Any] = {}
     if getattr(args, "player_radius", None) is not None:
         level_kwargs["player_radius"] = float(args.player_radius)
     if getattr(args, "scenario", None):
-        spec = stage_spec(ScenarioSpec.load(args.scenario), stage)
+        spec = ScenarioSpec.load(args.scenario)
+        spec = cycle_spec(spec, cycle) if cycle > 0.0 else stage_spec(spec, stage)
     elif getattr(args, "obstacle_type", None):
-        spec = stage_spec(_obstacle_scenario_from_args(args).to_spec(), stage)
+        spec = _obstacle_scenario_from_args(args).to_spec()
+        spec = (cycle_spec(spec, cycle, order=order) if cycle > 0.0
+                else stage_spec(spec, stage, order=order))
     elif getattr(args, "bullets", None):
         spec = stress(
             int(args.bullets), seed=args.seed, dt=args.dt,
-            stage_seconds=stage, **level_kwargs,
+            stage_seconds=stage, cycle_seconds=cycle, **level_kwargs,
         )
     else:
         spec = build_scenario(
@@ -429,6 +450,7 @@ def _spec_from_args(args: argparse.Namespace):
             field_w=args.field[0],
             field_h=args.field[1],
             stage_seconds=stage,
+            cycle_seconds=cycle,
             **level_kwargs,
         ).spec
     if getattr(args, "action_space", None):

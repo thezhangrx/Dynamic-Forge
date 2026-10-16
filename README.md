@@ -496,6 +496,54 @@ python -m bullet_sim run  --level medium                   # 批处理路径默�
 分批只**推迟**发射：同一种障碍的出生位置、速度、几何完全不变（有回归测试逐项对账）。
 固定长度回合里晚进场的类型自然少发几次，密度由标定按实测峰值补回来。
 
+> **分批 = 叠加**：第 2 种进场时第 1 种还在场上。要"同一时刻只有一种"，见 9.5。
+
+### 9.5 逐个类型分开展示（`--obstacle-type` + `--obstacle-cycle`）
+
+`--obstacle-type` 一次可以只给一种 —— 那就是"只看这一种"，数量、速度、缺口宽度
+全用这个类型自己的定义：
+
+```bash
+python -m bullet_sim play --obstacle-type wall_with_gap      # 只有墙+缺口
+python -m bullet_sim play --obstacle-type moving_block       # 只有移动块
+python -m bullet_sim play --obstacle-type small_obstacles    # 只有小障碍
+```
+
+要一条命令轮着看（不用重启、不用改参数），加 `--obstacle-cycle S`：每个类型独占
+`S` 秒档期，整轮 `类型数 × S` 秒循环，**同一时刻场上只有一种**障碍。
+
+```bash
+# 难度场景的 3 种类型：墙(0-10s) → 移动块(10-20s) → 小障碍(20-30s) → 循环
+python -m bullet_sim play --level medium --obstacle-cycle 10
+python -m bullet_sim board-control --stdin --obstacle-cycle 10    # 板子在环里
+
+# 手写组合：**列出的先后就是展示顺序**（不会被按"可读性"重排）
+python -m bullet_sim play --obstacle-type small_obstacles \
+    --obstacle-type wall_with_gap --obstacle-type moving_block --obstacle-cycle 10
+
+# 档期太长末尾会空场（前一种已经穿过场地了），要紧凑就把 S 调小
+python -m bullet_sim play --level medium --obstacle-cycle 6
+```
+
+| | `--stage-seconds S`（分批） | `--obstacle-cycle S`（轮播） |
+|---|---|---|
+| 时间线 | 开场 1 种，之后每 S 秒**再多**一种 | 每种独占 S 秒，整轮循环 |
+| 同一时刻 | 多种（叠加） | **只有一种** |
+| 默认（`play`/`board-control`） | 8 秒 | 关（0） |
+| 数量 | 按难度标定到目标峰值 | 用每种类型**自己的**数量 |
+
+* 顺序：`--obstacle-type` 用**你写的先后**；难度场景用 `墙缺口 → 移动块 → 小障碍
+  → 交叉 → 走廊`（墙最先，理由同 9.4）；
+* 轮播**接管**分批（两个都写以轮播为准），因为它本身就是最彻底的"分开展示"；
+* 轮播默认**不按难度标定数量**（否则 `medium` 会把小障碍标到 208 个一批，反而看不清
+  这一种类型长什么样）。显式要数量仍然优先：`--bullets N` 会照标定来；
+* 轮播时刻表在 `meta['obstacle_cycle']`（每类的 `slot_s` 起止），整轮长度在
+  `meta['cycle_period_s']`，单档长度在 `meta['cycle_seconds']`；
+* 只有**一种**类型时轮播不生效（本来就只有一种，没什么可轮），场景按原样跑。
+
+板子侧建议：**逐个类型验**时一条命令就够 —— 板子的 `gap_avoid` 只对"墙+缺口"有明确
+语义，另外两种用来确认"没墙时不乱发指令"，轮播正好依次给出这两种情况。
+
 ---
 
 ## 10. Collision（碰撞 = 惩罚事件）
@@ -868,6 +916,7 @@ BULLET_SIM_NO_PYTEST=1 python -m bullet_sim.tests.run_tests
 | **13** | 窗口缩放 | 拖动窗口 / 滚轮 / `B` | 画面等比缩放不拉伸；角色圆的画面大小 = 碰撞大小 |
 | **14** | 走廊延伸与间距 | 第 8.3 节命令，改 `--corridor-width` / `--corridor-min-width` / `--wall-length` | 间距随之变化；低于 `1.25d` 直接报错 |
 | **15** | 开场分批 | `python -m bullet_sim play --level medium` | 前 8 秒只有墙+缺口，之后每 8 秒多一种障碍；`--stage-seconds 0` 立刻恢复"全都在场" |
+| **16** | 障碍分开展示 | `python -m bullet_sim play --level medium --obstacle-cycle 10` | 墙(0-10s) → 移动块(10-20s) → 小障碍(20-30s)，任一时刻场上只有一种；`--obstacle-type A --obstacle-type B --obstacle-cycle 10` 按书写顺序轮 |
 
 ---
 
