@@ -219,6 +219,27 @@ ssh root@板子 'cd /root/board_src/build && make -B -j4 vision_board_devmem'
 # 判定标准不是"make 成功"，而是 ① 二进制 md5 **变了** ② 新功能能自证（如 --help 里出现新开关）
 ```
 
+### 6.2.0 把**仿真器当平台**（不碰键盘注入，绕开"平台收不收合成按键"）
+
+板子的 `@MOVE n` 可以直接驱动 `bullet_sim`，于是"板子→平台"这一段**不需要键盘注入**
+就能闭环。真实平台吃不吃软件合成按键一直是链路上唯一没法离线验证的一环，
+这条路把它绕开了：
+
+```bash
+# SSH 管道（推荐）：板子跑视觉+决策，动作直接喂给仿真
+ssh -i data/fpga/board_ssh/board_key root@192.168.137.242 \
+    'cd /root/tools && ./cam_live.sh --frames 0 --via-pl --keyboard-dev stdout' \
+  | Env/bin/python -m bullet_sim board-control --stdin
+
+# 串口 / UDP 也行
+Env/bin/python -m bullet_sim board-control --port /dev/ttyUSB0
+Env/bin/python -m bullet_sim board-control --udp 9999
+```
+
+`board-control` 默认 **`--nostop`**：不设回合步数上限、不因回合结束终止（只由 Ctrl-C
+停）；显式 `--max-steps` 仍然优先。协议与规矩见
+`core/bullet_sim/docs/INPUT_MODES.md` §3（断流 500 ms 回中；解析规则与键盘桥逐批对账）。
+
 ### 6.2.1 一条命令常驻闭环（推荐入口）
 
 ```bash

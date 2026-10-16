@@ -197,3 +197,66 @@ def test_cli_board_control_needs_a_transport() -> None:
     assert r.returncode != 0
     msg = (r.stdout + r.stderr).decode()
     assert "传输" in msg and ("--port" in msg or "--udp" in msg or "--stdin" in msg), msg
+
+
+# ---------------------------------------------------------------------------
+# 4) 信号必须**真的让角色动**（不只是"动作对象对了"）
+# ---------------------------------------------------------------------------
+def test_board_signal_actually_moves_the_player() -> None:
+    """`@MOVE 1` 要真的把角色推向左 —— 这一段跨了 `action_to_codec_input` 与
+    `World.step`，只断言"解析出的 Action 对"是盖不住它的。"""
+    from bullet_sim.action.base import Action, action_to_codec_input
+    from bullet_sim.entities.player import P_SPEED, P_X
+    from bullet_sim.hardware_interface import HardwareInputSource, UdpBoardAdapter
+    from bullet_sim.simulator.env import BulletHellEnv
+    from bullet_sim.tests.helpers import blank_spec
+
+    env = BulletHellEnv(blank_spec(), seed=0)
+    ad = UdpBoardAdapter(port=0, hold_s=1.0)      # hold 长一点，别在测试中途回中
+    src = HardwareInputSource(ad)
+    ad.open()
+    try:
+        env.reset(seed=0)
+        x0 = float(env.world.player[P_X])
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sk.sendto(b"@MOVE 1\n", ("127.0.0.1", ad.port))      # 左
+        for _ in range(30):
+            a = src.poll(env.spec.dt) or Action.zero()
+            raw = action_to_codec_input(a, env.world.codec, float(env.world.player[P_SPEED]))
+            env.step(raw)
+        sk.close()
+        x1 = float(env.world.player[P_X])
+        assert x1 < x0 - 1.0, f"角色应当被推向左：x {x0} → {x1}"
+    finally:
+        ad.close()
+        env.close()
+
+
+def test_board_signal_up_moves_the_other_axis() -> None:
+    """正交方向也要对：`@MOVE 3` 是上（+y 或 -y，取决于场地约定，只要**换了一个轴**）。"""
+    from bullet_sim.action.base import Action, action_to_codec_input
+    from bullet_sim.entities.player import P_SPEED, P_X, P_Y
+    from bullet_sim.hardware_interface import HardwareInputSource, UdpBoardAdapter
+    from bullet_sim.simulator.env import BulletHellEnv
+    from bullet_sim.tests.helpers import blank_spec
+
+    env = BulletHellEnv(blank_spec(), seed=0)
+    ad = UdpBoardAdapter(port=0, hold_s=1.0)
+    src = HardwareInputSource(ad)
+    ad.open()
+    try:
+        env.reset(seed=0)
+        p0 = (float(env.world.player[P_X]), float(env.world.player[P_Y]))
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sk.sendto(b"@MOVE 3\n", ("127.0.0.1", ad.port))      # 上
+        for _ in range(30):
+            a = src.poll(env.spec.dt) or Action.zero()
+            env.step(action_to_codec_input(a, env.world.codec,
+                                           float(env.world.player[P_SPEED])))
+        sk.close()
+        p1 = (float(env.world.player[P_X]), float(env.world.player[P_Y]))
+        assert abs(p1[0] - p0[0]) < 1.0, f"上不该动 x：{p0} → {p1}"
+        assert abs(p1[1] - p0[1]) > 1.0, f"上应当动 y：{p0} → {p1}"
+    finally:
+        ad.close()
+        env.close()
