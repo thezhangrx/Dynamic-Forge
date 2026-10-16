@@ -422,6 +422,9 @@ world.spawn_pattern(
 （`LEVEL_VALUES = {trivial:0.0, easy:0.15, medium:0.40, hard:0.70, extreme:1.0}`）。
 也可以直接给一个 `[0,1]` 的浮点数。
 
+> 上表的顺序是**解锁顺序**（level 越高解锁越多）。每种类型**在镜头前第几秒出现**
+> 是另一件事，由 `--stage-seconds` 控制，而且顺序不同（墙+缺口最先）——见 9.4。
+
 ### 9.2 难度是**测出来的**
 
 `validate_scenario()` 把实测到的自由空间、可达集、路径最小余量、峰值相对速度喂给
@@ -456,6 +459,42 @@ extreme     400      34.1%      22      0.587        1
 
 **显式的 `--bullets N` / `stress(N)` 不受这把安全锁限制**——那是纯粹的"还能不能跑"
 压力测试（100 … 10000）。
+
+### 9.4 开场分批放障碍（`--stage-seconds`）
+
+`--level` 决定场景**有哪些**障碍类型；`--stage-seconds S` 决定每种类型**从第几秒开始
+出现**：第 1 种从 `t = 0` 开始，之后每 `S` 秒再多解锁一种。
+
+顺序**固定**，与 level 的解锁顺序不同——按"视觉可读性"排：
+
+```
+wall_with_gap (0s)  →  moving_block (+S)  →  small_obstacles (+2S)
+                    →  cross_traffic (+3S) →  corridor (+4S)
+```
+
+**为什么墙最先**：摄像头 → PL 几何 → 决策这条链路里，墙+缺口是唯一能被稳定读出
+"缺口在哪"的几何（板子侧 `gap_avoid` 就吃这个）。开场把 3 种障碍一次全放上去，
+画面里同时有墙、方块和碎点，视觉分不清"哪个是墙、哪个是目标"，控制根本无从验起。
+
+```bash
+python -m bullet_sim play --level medium                  # 默认每 8 秒解锁一种
+python -m bullet_sim board-control --stdin --level medium  # 同上（板子在环里时用这个）
+python -m bullet_sim play --level medium --stage-seconds 0 # 关掉：所有类型开场就到齐
+python -m bullet_sim run  --level medium                   # 批处理路径默认**不分批**
+```
+
+* `play` / `board-control` 默认 `S = 8`（`DEFAULT_STAGE_SECONDS`）：这两条命令是给人
+  看、给摄像头看的，第一段只有墙+缺口，先把闭环跑通再加难度；
+* `run` / `record` / `benchmark` / `scenario` 默认 `S = 0`（不分批）——批处理要的是
+  历史的、可复现的场景，行为一个字节都不许变；
+* `--scenario 文件.json` 与 `--obstacle-type ...` 组合出来的场景同样认这个参数；
+* 分批发生在**标定数量与安全校验之前**，所以 `meta['measured_peak_bullets']` /
+  `meta['safety']` 描述的就是真正会跑的那个场景；
+* 进场时刻记在 `meta['obstacle_stages']`（`[{"type": ..., "first_spawn_s": ...}]`，
+  按实际首次出场时间排序，`meta['stage_seconds']` 是窗口长度）。
+
+分批只**推迟**发射：同一种障碍的出生位置、速度、几何完全不变（有回归测试逐项对账）。
+固定长度回合里晚进场的类型自然少发几次，密度由标定按实测峰值补回来。
 
 ---
 
@@ -828,6 +867,7 @@ BULLET_SIM_NO_PYTEST=1 python -m bullet_sim.tests.run_tests
 | **12** | 走廊旋转 | `python -m bullet_sim play --obstacle-type corridor --corridor-motion rotate_same --corridor-change 16 --seed 1` | 两墙绕各自中心同向旋转，墙心不动，间距不变 |
 | **13** | 窗口缩放 | 拖动窗口 / 滚轮 / `B` | 画面等比缩放不拉伸；角色圆的画面大小 = 碰撞大小 |
 | **14** | 走廊延伸与间距 | 第 8.3 节命令，改 `--corridor-width` / `--corridor-min-width` / `--wall-length` | 间距随之变化；低于 `1.25d` 直接报错 |
+| **15** | 开场分批 | `python -m bullet_sim play --level medium` | 前 8 秒只有墙+缺口，之后每 8 秒多一种障碍；`--stage-seconds 0` 立刻恢复"全都在场" |
 
 ---
 

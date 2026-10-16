@@ -166,6 +166,12 @@ python -m bullet_sim board-control --headless --stdin --steps 600 --json
 `board-control` 就是"输入源换成板子、**默认不自动停**"的 `play`
 （`--headless` 时走 `run`）：主循环只有一份，不存在第三套"什么时候停"的规矩。
 
+板子在环里时**开场只放一种障碍**（`--stage-seconds`，`play`/`board-control` 默认 8 秒）：
+第一段只有墙+缺口 —— 摄像头 → PL 几何 → `gap_avoid` 唯一能稳定读出的就是它。
+开场把墙、移动块、小障碍一次全放上去，画面里分不清"哪个是墙、哪个是目标"，
+控制对不对根本看不出来。要回到"全都在场"就加 `--stage-seconds 0`。
+（详见根 `README.md` §9.4。）
+
 ### 3.3 `--nostop`：平台不许自己停
 
 | 行为 | 默认 | `--nostop`（`board-control` 的默认） |
@@ -186,7 +192,7 @@ truncated=True`；`play --input board`（不带 `--nostop`）→ `ran 60 steps`�
 
 ### 3.5 怎么验（不需要板子）
 
-`tests/test_board_link.py`（17 条）：解析器与键盘桥逐批对账、stdin/UDP 传输、
+`tests/test_board_link.py`（33 条）：解析器与键盘桥逐批对账、stdin/UDP 传输、
 **看门狗回中**、CLI 把板子信号喂进仿真、以及 `--nostop` 真的跑过回合终点
 （对照组用不带 `--nostop` 的 `run`）。都给的是假信号（管道 / 本地 socket），
 所以 CI 里也能跑。

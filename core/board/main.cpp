@@ -519,7 +519,18 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
     world.field_h = args.field_h;
 
     const gap_avoid::Decision d = gap_avoid::plan(world, st.mem, st.cfg, 2.0);
-    const gap_avoid::Vec2 cmd = gap_avoid::to_command(d);
+    gap_avoid::Vec2 cmd = gap_avoid::to_command(d);
+    if (!f.player.present) {
+        // 角色没检出来时，上面用的位置是**兜底值**（场地中线）—— 拿它发指令等于
+        // 闭着眼睛开：实测在仿真器画面上漏检角色时，指令会恒定不变、平台一直朝
+        // 一个方向走且永不收敛（角色早就顶上边了还在"左"）。
+        // 所以这一帧只发 stay，并把原因打出来。
+        cmd.x = 0.0;
+        cmd.y = 0.0;
+        if (args.verbose) {
+            std::fprintf(stderr, "  ⚠ 本帧没检出角色 → 只发 stay（不拿兜底位置发指令）\n");
+        }
+    }
     ++st.n_decisions;
     st.tier_count[tier_bucket(d.tier)] += 1;
 

@@ -97,7 +97,9 @@ def test_every_documented_package_module_imports(readme_text: str):
 
 def test_every_documented_cli_command_exists(readme_text: str, parser):
     subs = _subparsers(parser)
-    documented = set(re.findall(r"python -m bullet_sim ([a-z_]+)", readme_text))
+    # ⚠ 必须允许连字符：`board-control` 是子命令名，早先的 `[a-z_]+` 只截到
+    #   `board`，于是 README 里一写这条命令就被判成"文档了不存在的子命令"。
+    documented = set(re.findall(r"python -m bullet_sim ([a-z][a-z_\-]*)", readme_text))
     assert documented, "README should document at least one CLI command"
     unknown = sorted(c for c in documented if c not in subs)
     assert not unknown, f"README documents unknown subcommands: {unknown} (have {sorted(subs)})"
@@ -108,7 +110,7 @@ def test_every_documented_cli_flag_exists(readme_text: str, parser):
     global_flags = set()
     for sub in subs.values():
         global_flags |= _option_strings(sub)
-    examples = re.findall(r"python -m bullet_sim ([a-z_]+)([^\n`]*)", readme_text)
+    examples = re.findall(r"python -m bullet_sim ([a-z][a-z_\-]*)([^\n`]*)", readme_text)
     unknown: list[str] = []
     for command, tail in examples:
         flags = set(re.findall(r"(--[a-z][a-z0-9\-]*)", tail))

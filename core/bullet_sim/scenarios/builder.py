@@ -127,6 +127,101 @@ def estimate_peak_bullets(timeline: SpawnTimeline, dt: float) -> int:
 
 
 # --------------------------------------------------------------------------
+# staged obstacle introduction
+# --------------------------------------------------------------------------
+
+#: Order in which obstacle *kinds* appear when a scene is staged.
+#:
+#: The complexity ladder decides **which** kinds a scene may contain; staging
+#: decides **when** each kind may first appear.  The wall with a gap comes first
+#: on purpose: it is the only kind the real camera -> PL geometry -> decision
+#: loop reads unambiguously, so a staged scene opens with exactly one obstacle
+#: and the loop can be verified before a second kind is added.
+STAGE_ORDER: tuple[str, ...] = (
+    "wall_with_gap",
+    "moving_block",
+    "small_obstacles",
+    "cross_traffic",
+    "corridor",
+)
+
+#: ``PatternSpec.params['layout']`` -> obstacle kind name.
+_LAYOUT_KINDS: dict[str, str] = {
+    "wall_gap": "wall_with_gap",
+    "block": "moving_block",
+    "small": "small_obstacles",
+    "cross": "cross_traffic",
+    "corridor": "corridor",
+}
+
+
+def pattern_kind(pattern: PatternSpec) -> str | None:
+    """Obstacle kind behind a generator spec, or ``None`` if it is not an obstacle."""
+    if str(getattr(pattern, "kind", "")) != "obstacle":
+        return None
+    layout = str(pattern.params.get("layout", "")).lower()
+    return _LAYOUT_KINDS.get(layout)
+
+
+def stage_offsets(patterns: Sequence[PatternSpec], stage_seconds: float) -> dict[str, float]:
+    """First-appearance delay per obstacle kind, in the staged order."""
+    present: list[str] = []
+    for p in patterns:
+        kind = pattern_kind(p)
+        if kind is not None and kind not in present:
+            present.append(kind)
+    ordered = [k for k in STAGE_ORDER if k in present]
+    ordered += [k for k in present if k not in STAGE_ORDER]  # unknown kinds last
+    return {kind: i * float(stage_seconds) for i, kind in enumerate(ordered)}
+
+
+def stage_patterns(
+    patterns: Sequence[PatternSpec], stage_seconds: float
+) -> list[PatternSpec]:
+    """Push every obstacle kind after the first to its own first-appearance time.
+
+    ``stage_seconds <= 0`` returns the patterns untouched, so the historic
+    "everything starts at t = 0" scene stays available and unchanged.
+    """
+    seconds = float(stage_seconds)
+    if seconds <= 0.0 or not patterns:
+        return list(patterns)
+    offsets = stage_offsets(patterns, seconds)
+    out: list[PatternSpec] = []
+    for p in patterns:
+        kind = pattern_kind(p)
+        offset = 0.0 if kind is None else float(offsets.get(kind, 0.0))
+        out.append(p if offset == 0.0 else p.replaced(start_time=float(p.start_time) + offset))
+    return out
+
+
+def stage_spec(spec: ScenarioSpec, stage_seconds: float) -> ScenarioSpec:
+    """Apply :func:`stage_patterns` to a whole scenario and record the schedule.
+
+    The schedule lands in ``spec.meta['obstacle_stages']`` (kind + real first
+    spawn time), so a report can state *when* each kind enters instead of only
+    *which* kinds exist.
+    """
+    seconds = float(stage_seconds)
+    if seconds <= 0.0:
+        return spec
+    patterns = stage_patterns(spec.patterns, seconds)
+    first: dict[str, float] = {}
+    for p in patterns:
+        kind = pattern_kind(p)
+        if kind is None:
+            continue
+        first[kind] = min(first.get(kind, float("inf")), float(p.start_time))
+    meta = dict(spec.meta)
+    meta["stage_seconds"] = seconds
+    meta["obstacle_stages"] = [
+        {"type": kind, "first_spawn_s": round(t, 6)}
+        for kind, t in sorted(first.items(), key=lambda kv: (kv[1], kv[0]))
+    ]
+    return spec.replaced(patterns=patterns, meta=meta)
+
+
+# --------------------------------------------------------------------------
 # complexity -> scenario
 # --------------------------------------------------------------------------
 
@@ -267,12 +362,19 @@ def make_scenario(
     name: str | None = None,
     calibrate: bool = True,
     ensure_valid: bool = True,
+    stage_seconds: float = 0.0,
     **spec_overrides: Any,
 ) -> ScenarioSpec:
     """Build a fully-specified scenario for a difficulty level or bullet count.
 
     ``complexity`` accepts ``'easy'``/``'medium'``/``'hard'``/``'extreme'``,
     any float in ``[0, 1]``, or an int bullet count.
+
+    ``stage_seconds > 0`` stages the obstacle kinds in time (see
+    :func:`stage_spec`): the scene opens with one kind only and unlocks one more
+    kind every ``stage_seconds``.  Staging happens **before** calibration and the
+    safety check, so the measured peak and the safety report describe the scene
+    that actually runs.
 
     Any further keyword is forwarded verbatim to :class:`ScenarioSpec`
     (``player_speed``, ``player_x``, ``wrap``, ``cull_margin``, ...).
@@ -320,6 +422,8 @@ def make_scenario(
     )
     base.update(spec_overrides)
     spec = ScenarioSpec(**base)
+    if stage_seconds and float(stage_seconds) > 0.0:
+        spec = stage_spec(spec, float(stage_seconds))
     if calibrate and profile.bullet_count > 0:
         spec, peak = calibrate_bullet_count(spec, profile.bullet_count, return_peak=True)
         spec.meta["target_bullet_count"] = profile.bullet_count
@@ -398,6 +502,14 @@ def calibrate_bullet_count(
     The analytic estimate is only an upper bound (it ignores boundary culling),
     so calibration *measures* the scene with the real spawn/motion/lifecycle
     code path but no player and no collision detection.
+
+    **收敛不了就停，不许指数级放大。** 缩放的是每种模式的 ``count``，可有些
+    布局对 ``count`` 不敏感（``wall_gap`` 一次就是一道墙），再加上分批进场会把
+    "数量敏感"的类型推到回合之外（例如 `--duration 0.5` + `--stage-seconds 8`：
+    0.5 秒里只有墙）—— 这时"实测峰值"永远不动，而 ``ratio = target / peak``
+    每一轮都把数量乘一遍，4 轮就能堆到 10^8 个障碍，光建时间线就卡死（实测过：
+    180 秒超时）。所以每轮之后比较峰值：**不涨就带着当前最好的结果收工**，
+    真实达到的峰值照实记在 ``measured_peak_bullets`` 里。
     """
     if target <= 0:
         return (spec, 0) if return_peak else spec
@@ -413,20 +525,26 @@ def calibrate_bullet_count(
         clock=FixedClock.make(dt=spec.dt),
     )
     est = estimate_peak_bullets(pre, spec.dt)
-    current = spec
+    best = spec
     if est > 0:
-        current = current.replaced(patterns=_scale_patterns(current.patterns, target / est))
-    stats = measure_live_bullets(current)
+        best = best.replaced(patterns=_scale_patterns(best.patterns, target / est))
+    best_peak = measure_live_bullets(best)["peak"]
+    if best_peak <= 0:
+        return (best, 0) if return_peak else best
     for _ in range(max_iterations):
-        peak = stats["peak"]
-        if peak == 0:
-            return (current, 0) if return_peak else current
-        ratio = target / peak
+        ratio = target / best_peak
         if abs(ratio - 1.0) <= tolerance:
             break
-        current = current.replaced(patterns=_scale_patterns(current.patterns, ratio))
-        stats = measure_live_bullets(current)
-    return (current, int(stats["peak"])) if return_peak else current
+        candidate = best.replaced(patterns=_scale_patterns(best.patterns, ratio))
+        peak = measure_live_bullets(candidate)["peak"]
+        if abs(float(peak) - target) >= abs(float(best_peak) - target):
+            # 不再更接近目标（最坏情况：峰值**完全不动**，因为场上只剩对
+            # `count` 不敏感的墙，或者数量敏感的类型被分批推到了回合之外）——
+            # 此时再乘下去只是每轮翻倍地堆数字，4 轮就能到 10^8 个障碍，光建
+            # 时间线就卡死（实测过：180 秒超时）。收工，照实返回达到的峰值。
+            break
+        best, best_peak = candidate, peak
+    return (best, int(best_peak)) if return_peak else best
 
 
 def _scale_patterns(patterns: Sequence[PatternSpec], ratio: float) -> list[PatternSpec]:

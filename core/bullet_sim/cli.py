@@ -24,6 +24,13 @@ from bullet_sim.ai.policy import MODEL_NOT_AVAILABLE_YET
 from bullet_sim.core.errors import ConfigError, ScenarioError
 from bullet_sim.debug_log import start as start_debug_log
 
+#: `play` / `board-control` 的默认障碍分批进场间隔（秒）。
+#:
+#: 这两条命令是给人看、给摄像头看的：开场把 3 种障碍一次全放上去，视觉链路
+#: 根本来不及分辨"哪个是墙、哪个是目标"。默认每 8 秒再解锁一种，第一段只有
+#: 墙+缺口（也正是板子侧 `gap_avoid` 唯一能可靠读出的几何）。
+DEFAULT_STAGE_SECONDS: float = 8.0
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -160,8 +167,11 @@ def _add_play_args(p: argparse.ArgumentParser, *, input_default: str = "manual")
 
     共用是必须的：`board-control` 就是"输入源换成板子、默认不自动停"的 `play`；
     两边各写一份参数迟早会分家（比如新加一个 `--danger` 只加在一边）。
+
+    这两条命令都是**给人看/给摄像头看**的，所以障碍默认分批进场（`--stage-seconds`）：
+    开场只有一种障碍，视觉链路先跑通再接难度。
     """
-    _add_scenario_args(p)
+    _add_scenario_args(p, stage_default=DEFAULT_STAGE_SECONDS)
     p.add_argument("--controller", default="stay")
     p.add_argument(
         "--input",
@@ -244,7 +254,9 @@ def _add_play_args(p: argparse.ArgumentParser, *, input_default: str = "manual")
     p.add_argument("--quiet", action="store_true", help="do not print the start-up banner")
 
 
-def _add_scenario_args(p: argparse.ArgumentParser) -> None:
+def _add_scenario_args(
+    p: argparse.ArgumentParser, *, stage_default: float | None = None
+) -> None:
     p.add_argument("--scenario", type=str, default=None, help="path to a scenario .json")
     p.add_argument(
         "--level",
@@ -257,6 +269,16 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--duration", type=float, default=None)
     p.add_argument("--dt", type=float, default=1.0 / 120.0)
     p.add_argument("--field", type=float, nargs=2, default=(640.0, 480.0))
+    p.add_argument(
+        "--stage-seconds",
+        type=float,
+        default=stage_default,
+        metavar="S",
+        help="**开场不要一次全放**：第 1 种障碍从 0 秒开始，之后每 S 秒再多放一种"
+             "（顺序：墙缺口 → 移动块 → 小障碍 → 交叉 → 走廊）。0 = 关闭（所有类型"
+             "开场就到齐，历史行为）；不填 = 按命令的默认值"
+             + (f"（本命令默认 {stage_default:g} 秒）" if stage_default else "（默认关闭）"),
+    )
     p.add_argument(
         "--action-space",
         default=None,
@@ -374,28 +396,41 @@ def parse_hex_color(text: str) -> tuple[int, int, int]:
 
 
 def _spec_from_args(args: argparse.Namespace):
-    from bullet_sim.scenarios.builder import build_scenario
+    """构造本次运行要用的 ``ScenarioSpec``。
+
+    三条来源（``--scenario`` 文件 / ``--obstacle-type`` 组合 / ``--level`` 难度）
+    都会应用 ``--stage-seconds``：障碍**分批进场**，开场只放第一种。
+    难度那条走 ``make_scenario(stage_seconds=...)``，因为分批必须在"标定数量 +
+    安全校验"之前发生，否则 meta 里记的峰值描述的不是真正会跑的场景。
+    """
+    from bullet_sim.scenarios.builder import build_scenario, stage_spec
     from bullet_sim.scenarios.presets import stress
     from bullet_sim.scenarios.spec import ScenarioSpec
 
-    if getattr(args, "scenario", None):
-        return ScenarioSpec.load(args.scenario)
-    if getattr(args, "obstacle_type", None):
-        return _obstacle_scenario_from_args(args).to_spec()
+    stage = float(getattr(args, "stage_seconds", None) or 0.0)
     level_kwargs: dict[str, Any] = {}
     if getattr(args, "player_radius", None) is not None:
         level_kwargs["player_radius"] = float(args.player_radius)
-    if getattr(args, "bullets", None):
-        return stress(int(args.bullets), seed=args.seed, dt=args.dt, **level_kwargs)
-    spec = build_scenario(
-        _level_value(args.level),
-        seed=args.seed,
-        dt=args.dt,
-        duration=getattr(args, "duration", None),
-        field_w=args.field[0],
-        field_h=args.field[1],
-        **level_kwargs,
-    ).spec
+    if getattr(args, "scenario", None):
+        spec = stage_spec(ScenarioSpec.load(args.scenario), stage)
+    elif getattr(args, "obstacle_type", None):
+        spec = stage_spec(_obstacle_scenario_from_args(args).to_spec(), stage)
+    elif getattr(args, "bullets", None):
+        spec = stress(
+            int(args.bullets), seed=args.seed, dt=args.dt,
+            stage_seconds=stage, **level_kwargs,
+        )
+    else:
+        spec = build_scenario(
+            _level_value(args.level),
+            seed=args.seed,
+            dt=args.dt,
+            duration=getattr(args, "duration", None),
+            field_w=args.field[0],
+            field_h=args.field[1],
+            stage_seconds=stage,
+            **level_kwargs,
+        ).spec
     if getattr(args, "action_space", None):
         spec = spec.replaced(action_space=args.action_space)
     return spec
@@ -1116,6 +1151,7 @@ def cmd_play(args: argparse.Namespace) -> int:
     import signal as _signal
 
     _stop: dict[str, Any] = {"flag": False, "n": 0}
+    _last_link_print = 0.0
 
     def _on_signal(signum, frame):          # pragma: no cover - 真信号路径
         _stop["n"] = _stop.get("n", 0) + 1
@@ -1173,6 +1209,19 @@ def cmd_play(args: argparse.Namespace) -> int:
             # ⚠ 窗口被关掉时 SDL 不一定投递 pygame.QUIT（WSLg 上实测过），
             #   而 `--nostop` 不设步数上限 —— 那就变成"窗口没了、进程还在跑"（卡死）。
             #   所以每一帧都判一次显示是否还活着，渲染失败也直接退。
+            # 板子模式：每 2 秒往**终端**报一次链路状态。
+            # 为什么打终端而不是画在屏幕上：屏幕上的文字会被相机拍进去，而视觉判据里
+            # "亮块"正是找角色的判据 —— 那等于自己给视觉制造假目标（`show_text` 默认
+            # 关掉就是这个道理）。终端里看得到，且不污染相机画面。
+            if mode == "board" and not args.quiet:
+                now_mono = time.monotonic()
+                if now_mono - _last_link_print >= 2.0:
+                    _last_link_print = now_mono
+                    _fn = getattr(source, "hud_line", None)
+                    _line = _fn() if callable(_fn) else None
+                    if _line:
+                        print(f"  [{_line.strip()}]", flush=True)
+
             alive = getattr(renderer, "alive", None)
             if callable(alive) and not alive():
                 print("窗口已关闭（显示子系统已退出），收工", file=sys.stderr)

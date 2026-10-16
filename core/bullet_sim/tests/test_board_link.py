@@ -446,6 +446,21 @@ def test_cli_windowed_run_is_not_killed_at_startup() -> None:
     assert steps >= 100, f"只跑了 {steps} 步 —— 多半又被启动期的 alive() 误判杀掉了"
 
 
+def test_windowed_board_run_reports_the_link_in_the_terminal() -> None:
+    """有窗口的板子模式要**每 2 秒往终端报一次链路状态**。
+
+    为什么打终端而不画在屏幕上：屏幕上的文字会被相机拍进去，而视觉判据里"亮块"正是
+    找角色的判据 —— 那等于自己给视觉造一个假目标（所以 `show_text` 默认是关的）。
+    """
+    r = _cli(["board-control", "--stdin", "--bullets", "20", "--duration", "2",
+              "--max-seconds", "2.6"],
+             stdin_data=b"@MOVE 1\n", env_extra={"SDL_VIDEODRIVER": "dummy"})
+    assert r.returncode == 0, r.stdout.decode() + r.stderr.decode()
+    out = r.stdout.decode()
+    assert "board     :" in out, f"终端里没有链路状态行：\n{out}"
+    assert "行" in out, f"状态行里应当有收到多少条动作：\n{out}"
+
+
 # ---------------------------------------------------------------------------
 # 7) 开窗探测：把"静默卡死"变成"几秒一句能照做的诊断"
 # ---------------------------------------------------------------------------
@@ -474,3 +489,49 @@ def test_windowed_path_probes_before_opening() -> None:
     assert "_probe_display()" in src, "开窗前要先探测显示"
     assert "wsl --shutdown" in src, "诊断里要给出 WSLg 的正规解法"
     assert "--headless" in src
+
+
+# ---------------------------------------------------------------------------
+# 8) 开场只放一种障碍（`--stage-seconds`）
+#
+# 板子那侧读的是**摄像头看到的画面**：开场同时出现墙+缺口、移动块、小障碍时，
+# 分不清"哪个是墙、哪个是目标"，控制根本无从验起。所以给人看/给摄像头看的
+# `play` / `board-control` 默认分批进场，第一批只有墙+缺口。
+# ---------------------------------------------------------------------------
+def test_play_and_board_control_stage_by_default() -> None:
+    from bullet_sim.cli import DEFAULT_STAGE_SECONDS, _spec_from_args, build_parser
+
+    assert DEFAULT_STAGE_SECONDS > 0, "给人看的命令必须有默认批次间隔"
+    parser = build_parser()
+    staged = _spec_from_args(parser.parse_args(["board-control", "--level", "medium"]))
+    assert staged.meta["stage_seconds"] == DEFAULT_STAGE_SECONDS
+    assert {s["type"] for s in staged.meta["obstacle_stages"]} == {
+        "wall_with_gap", "moving_block", "small_obstacles"
+    }, "medium 有 3 种障碍，批次表必须把 3 种都列出来"
+    head = staged.meta["obstacle_stages"][0]
+    assert head["type"] == "wall_with_gap" and head["first_spawn_s"] == 0.0, (
+        f"第一批必须是墙+缺口（板子唯一能可靠读出的几何）：{staged.meta['obstacle_stages']}")
+    for entry in staged.meta["obstacle_stages"][1:]:
+        assert entry["first_spawn_s"] >= DEFAULT_STAGE_SECONDS, entry
+
+
+def test_staging_is_off_for_headless_run_and_can_be_disabled() -> None:
+    from bullet_sim.cli import _spec_from_args, build_parser
+
+    parser = build_parser()
+    plain = _spec_from_args(parser.parse_args(["run", "--level", "medium"]))
+    assert "stage_seconds" not in plain.meta, "`run` 是批处理路径，默认行为不许变"
+    off = _spec_from_args(
+        parser.parse_args(["board-control", "--level", "medium", "--stage-seconds", "0"]))
+    assert "stage_seconds" not in off.meta, "`--stage-seconds 0` 必须回到历史行为"
+
+
+def test_stage_seconds_flag_sets_the_window() -> None:
+    from bullet_sim.cli import _spec_from_args, build_parser
+
+    spec = _spec_from_args(
+        build_parser().parse_args(["board-control", "--level", "hard", "--stage-seconds", "3"]))
+    assert spec.meta["stage_seconds"] == 3.0
+    times = [s["first_spawn_s"] for s in spec.meta["obstacle_stages"]]
+    assert len(times) == len(set(times)), f"每种障碍必须占一个批次：{times}"
+    assert times[0] == 0.0 and all(t >= 3.0 for t in times[1:]), times
