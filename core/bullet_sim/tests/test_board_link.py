@@ -492,19 +492,68 @@ def test_windowed_path_probes_before_opening() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8) 开场只放一种障碍（`--stage-seconds`）/ 障碍分开展示（`--obstacle-cycle`）
+# 8) 场景里放几种障碍（板子只许一种；`play` 分批 / 轮播）
 #
-# 板子那侧读的是**摄像头看到的画面**：开场同时出现墙+缺口、移动块、小障碍时，
-# 分不清"哪个是墙、哪个是目标"，控制根本无从验起。所以给人看/给摄像头看的
-# `play` / `board-control` 默认分批进场，第一批只有墙+缺口；要逐个类型单独看
-# （同一时刻只有一种）就用 `--obstacle-cycle S`。
+# 板子那侧读的是**摄像头看到的画面**，而它的决策（`gap_avoid`）只对"墙 + 一个缺口"
+# 有语义。所以：**板子控制平台时，场景只能有一种障碍类型**，由 `--obstacle-type`
+# 指定（不给就是墙+缺口）—— 给多种 / 轮播 / 多类型场景文件都直接报错，不静默放宽。
+# 不带板子的 `play` 不受这条限制：默认分批进场，需要时 `--obstacle-cycle S` 轮播。
 # ---------------------------------------------------------------------------
-def test_play_and_board_control_stage_by_default() -> None:
+def test_board_control_puts_one_kind_on_the_field() -> None:
+    from bullet_sim.cli import BOARD_KINDS, _spec_from_args, build_parser
+
+    parser = build_parser()
+    assert len(BOARD_KINDS) == 1, "板子那侧只允许一种障碍"
+    default = _spec_from_args(parser.parse_args(["board-control", "--level", "medium"]))
+    assert [p.params["layout"] for p in default.patterns] == ["wall_gap"]
+    assert default.meta["kinds_override"] == list(BOARD_KINDS)
+    assert "stage_seconds" not in default.meta, "只有一种类型，分批没有意义"
+
+    # 难度照样生效（更快、更窄、更密），但**类型不会跟着变多**
+    hard = _spec_from_args(parser.parse_args(["board-control", "--level", "hard"]))
+    assert [p.params["layout"] for p in hard.patterns] == ["wall_gap"]
+    assert hard.patterns[0].interval < default.patterns[0].interval, "hard 的墙来得更快"
+
+    # 显式指定类型就是换掉那一种（仍然是唯一的一种）
+    picked = _spec_from_args(
+        parser.parse_args(["board-control", "--obstacle-type", "small_obstacles"]))
+    assert [p.params["layout"] for p in picked.patterns] == ["small"]
+
+
+def test_board_control_refuses_more_than_one_kind() -> None:
+    """不止一种就**报错**，不静默放宽 —— 这是"板子控制时只能有一种障碍"的执行点。"""
+    from bullet_sim.cli import _spec_from_args, build_parser
+    from bullet_sim.core.errors import ConfigError
+
+    parser = build_parser()
+    for argv in (
+        ["board-control", "--obstacle-type", "small_obstacles",
+         "--obstacle-type", "wall_with_gap"],
+        ["board-control", "--level", "medium", "--obstacle-cycle", "10"],
+        ["board-control", "--bullets", "2000"],
+    ):
+        with pytest.raises(ConfigError) as err:
+            _spec_from_args(parser.parse_args(argv))
+        assert "只能有一种障碍类型" in str(err.value), str(err.value)
+
+
+def test_play_is_not_restricted_but_play_input_board_is() -> None:
+    from bullet_sim.cli import _spec_from_args, build_parser
+
+    parser = build_parser()
+    free = _spec_from_args(parser.parse_args(["play", "--level", "medium"]))
+    assert len(free.patterns) == 3, "手玩/给摄像头看的 play 不受限制"
+    assert free.meta["stage_seconds"] > 0, "play 默认分批进场"
+    on_board = _spec_from_args(parser.parse_args(["play", "--input", "board", "--level", "medium"]))
+    assert [p.params["layout"] for p in on_board.patterns] == ["wall_gap"]
+
+
+def test_play_stages_and_cycles_by_default_off() -> None:
     from bullet_sim.cli import DEFAULT_STAGE_SECONDS, _spec_from_args, build_parser
 
     assert DEFAULT_STAGE_SECONDS > 0, "给人看的命令必须有默认批次间隔"
     parser = build_parser()
-    staged = _spec_from_args(parser.parse_args(["board-control", "--level", "medium"]))
+    staged = _spec_from_args(parser.parse_args(["play", "--level", "medium"]))
     assert staged.meta["stage_seconds"] == DEFAULT_STAGE_SECONDS
     assert {s["type"] for s in staged.meta["obstacle_stages"]} == {
         "wall_with_gap", "moving_block", "small_obstacles"
@@ -523,7 +572,7 @@ def test_staging_is_off_for_headless_run_and_can_be_disabled() -> None:
     plain = _spec_from_args(parser.parse_args(["run", "--level", "medium"]))
     assert "stage_seconds" not in plain.meta, "`run` 是批处理路径，默认行为不许变"
     off = _spec_from_args(
-        parser.parse_args(["board-control", "--level", "medium", "--stage-seconds", "0"]))
+        parser.parse_args(["play", "--level", "medium", "--stage-seconds", "0"]))
     assert "stage_seconds" not in off.meta, "`--stage-seconds 0` 必须回到历史行为"
 
 
@@ -531,7 +580,7 @@ def test_stage_seconds_flag_sets_the_window() -> None:
     from bullet_sim.cli import _spec_from_args, build_parser
 
     spec = _spec_from_args(
-        build_parser().parse_args(["board-control", "--level", "hard", "--stage-seconds", "3"]))
+        build_parser().parse_args(["play", "--level", "hard", "--stage-seconds", "3"]))
     assert spec.meta["stage_seconds"] == 3.0
     times = [s["first_spawn_s"] for s in spec.meta["obstacle_stages"]]
     assert len(times) == len(set(times)), f"每种障碍必须占一个批次：{times}"
@@ -539,11 +588,11 @@ def test_stage_seconds_flag_sets_the_window() -> None:
 
 
 def test_obstacle_cycle_shows_each_type_alone() -> None:
-    """`--obstacle-cycle S`：每个类型独占 S 秒，整轮循环 —— 逐个类型验的唯一办法。"""
+    """`--obstacle-cycle S`（给 `play` 用）：每类型独占 S 秒，整轮循环。"""
     from bullet_sim.cli import _spec_from_args, build_parser
 
     spec = _spec_from_args(build_parser().parse_args(
-        ["board-control", "--level", "medium", "--obstacle-cycle", "10"]))
+        ["play", "--level", "medium", "--obstacle-cycle", "10"]))
     assert spec.meta["cycle_seconds"] == 10.0
     assert spec.meta["cycle_period_s"] == 30.0, "3 种类型 × 10 秒"
     assert [e["slot_s"] for e in spec.meta["obstacle_cycle"]] == [0.0, 10.0, 20.0]
@@ -558,7 +607,7 @@ def test_obstacle_cycle_follows_the_order_the_types_are_listed() -> None:
     from bullet_sim.cli import _spec_from_args, build_parser
 
     spec = _spec_from_args(build_parser().parse_args([
-        "board-control", "--obstacle-type", "small_obstacles",
+        "play", "--obstacle-type", "small_obstacles",
         "--obstacle-type", "wall_with_gap", "--obstacle-cycle", "6",
     ]))
     assert [e["type"] for e in spec.meta["obstacle_cycle"]] == [
@@ -573,7 +622,7 @@ def test_staging_also_follows_the_listed_order() -> None:
     from bullet_sim.cli import _spec_from_args, build_parser
 
     spec = _spec_from_args(build_parser().parse_args([
-        "board-control", "--obstacle-type", "small_obstacles",
+        "play", "--obstacle-type", "small_obstacles",
         "--obstacle-type", "wall_with_gap", "--stage-seconds", "5",
     ]))
     stages = {e["type"]: e["first_spawn_s"] for e in spec.meta["obstacle_stages"]}
@@ -583,9 +632,9 @@ def test_staging_also_follows_the_listed_order() -> None:
 def test_obstacle_cycle_is_off_by_default() -> None:
     from bullet_sim.cli import _spec_from_args, build_parser
 
-    spec = _spec_from_args(build_parser().parse_args(["board-control", "--level", "medium"]))
+    spec = _spec_from_args(build_parser().parse_args(["play", "--level", "medium"]))
     assert "cycle_seconds" not in spec.meta and "obstacle_cycle" not in spec.meta
     off = _spec_from_args(build_parser().parse_args(
-        ["board-control", "--level", "medium", "--obstacle-cycle", "0"]))
+        ["play", "--level", "medium", "--obstacle-cycle", "0"]))
     assert "cycle_seconds" not in off.meta
     assert off.meta["stage_seconds"] > 0, "0 = 关，回到分批的默认行为"

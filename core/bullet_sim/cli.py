@@ -31,6 +31,15 @@ from bullet_sim.debug_log import start as start_debug_log
 #: 墙+缺口（也正是板子侧 `gap_avoid` 唯一能可靠读出的几何）。
 DEFAULT_STAGE_SECONDS: float = 8.0
 
+#: **板子在环里时**（`board-control` / `play --input board`）默认只放的障碍类型。
+#:
+#: 板子的决策（`core/board/main.cpp` → `gap_avoid`）只对"墙 + 一个缺口"有明确
+#: 语义：墙在哪、缺口在哪、来不来得及。移动块/小障碍没有这个概念，场上多一种
+#: 障碍只会让摄像头画面更难读（实测过：三种一起上时板子的指令会恒定向一边）。
+#: 所以板子控制平台时**只放墙+缺口这一种**；难度（更快、更窄、更密）照旧由
+#: `--level` 控制，类型不会跟着变多。
+BOARD_KINDS: tuple[str, ...] = ("wall_with_gap",)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -418,17 +427,45 @@ def _spec_from_args(args: argparse.Namespace):
     否则 meta 里记的峰值描述的不是真正会跑的场景。
 
     ``--obstacle-type`` 的书写顺序就是展示顺序（用户一个个列出来，那就是他要的顺序）。
+
+    **板子在环里**（`board-control` / `play --input board`）时，场景**只能有一种**
+    障碍类型，由 `--obstacle-type` 指定（不给就是 :data:`BOARD_KINDS` = 墙+缺口）：
+    板子的决策只对那种几何有语义，场上多一种只会让画面更难读、指令更没意义。
+    给多种类型 / `--obstacle-cycle` / 多类型场景文件都**直接报错**，不静默放宽。
+    难度（更快、更窄、更密）照旧由 `--level` 控制，只是类型不会跟着变多。
     """
-    from bullet_sim.scenarios.builder import build_scenario, cycle_spec, stage_spec
+    from bullet_sim.scenarios.builder import (
+        build_scenario,
+        cycle_spec,
+        kind_order,
+        stage_spec,
+    )
     from bullet_sim.scenarios.presets import stress
     from bullet_sim.scenarios.spec import ScenarioSpec
 
     cycle = float(getattr(args, "obstacle_cycle", 0.0) or 0.0)
     stage = 0.0 if cycle > 0.0 else float(getattr(args, "stage_seconds", None) or 0.0)
     order = list(getattr(args, "obstacle_type", None) or []) or None
+    board_mode = _is_board_mode(args)
+    if board_mode:
+        if cycle > 0.0:
+            raise ConfigError(
+                "板子控制平台时只能有一种障碍类型：`--obstacle-cycle` 会让场上换类型。"
+                "要看逐个类型用 `play --obstacle-cycle S`（不带板子）。")
+        if order and len(order) > 1:
+            raise ConfigError(
+                f"板子控制平台时只能有一种障碍类型：`--obstacle-type` 只给一个，"
+                f"收到 {len(order)} 个（{', '.join(order)}）。"
+                "要看多种障碍用 `play`。")
+    kinds: tuple[str, ...] | None = None
+    if (board_mode and not order
+            and not getattr(args, "scenario", None) and not getattr(args, "bullets", None)):
+        kinds = BOARD_KINDS
     level_kwargs: dict[str, Any] = {}
     if getattr(args, "player_radius", None) is not None:
         level_kwargs["player_radius"] = float(args.player_radius)
+    if kinds is not None:
+        level_kwargs["kinds"] = kinds
     if getattr(args, "scenario", None):
         spec = ScenarioSpec.load(args.scenario)
         spec = cycle_spec(spec, cycle) if cycle > 0.0 else stage_spec(spec, stage)
@@ -455,6 +492,13 @@ def _spec_from_args(args: argparse.Namespace):
         ).spec
     if getattr(args, "action_space", None):
         spec = spec.replaced(action_space=args.action_space)
+    if board_mode:
+        present = kind_order(spec.patterns)
+        if len(present) != 1:
+            raise ConfigError(
+                f"板子控制平台时只能有一种障碍类型，这个场景有 {len(present)} 种"
+                f"（{', '.join(present) or '无'}）：换个场景文件，或显式"
+                " `--obstacle-type <一种>`；要看多种障碍用 `play`。")
     return spec
 
 
@@ -871,6 +915,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2))
     else:
         print(f"scenario        : {spec.name} (seed={spec.seed})")
+        print(f"obstacles       : {', '.join(_spec_kinds(spec)) or '?'}"
+              + ("  ← 板子在环里：只放这一种" if _is_board_mode(args) else "")
+              + (f"  ← 轮播：每种 {spec.meta['cycle_seconds']:g}s，整轮 "
+                 f"{spec.meta['cycle_period_s']:g}s" if spec.meta.get("cycle_seconds") else ""))
         print(f"steps survived  : {result['steps']}")
         print(f"return          : {result['return']:.2f}")
         print(f"collisions      : {result['collisions']}")
@@ -994,6 +1042,23 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
+def _is_board_mode(args) -> bool:
+    """板子在环里吗（`board-control` 或 `play --input board`）—— 决定场景类型数上限。"""
+    return str(getattr(args, "input", "") or "").strip().lower() == "board"
+
+
+def _spec_kinds(spec) -> list[str]:
+    """场景里**实际**有哪几种障碍类型（从 patterns 推，不看 meta）。
+
+    为什么以 patterns 为准：`--obstacle-type` 那条路（`ObstacleScenario.to_spec()`）
+    写的是 `meta['obstacle_types']`，难度那条写的是 `meta['obstacle_kinds']` ——
+    两条路的 meta 名字不一样，而"场上到底有哪几种"只有一个答案（patterns）。
+    """
+    from bullet_sim.scenarios.builder import kind_order
+
+    return kind_order(getattr(spec, "patterns", []) or [])
+
+
 def _print_play_banner(args, spec, play, env) -> None:
     """Tell the player, in the console, everything the HUD shows."""
     keys = (
@@ -1014,8 +1079,34 @@ def _print_play_banner(args, spec, play, env) -> None:
             print(f"                 {info.description}")
         except Exception:  # pragma: no cover - never block start-up
             pass
-    print(f"  bullets      : ~{spec.meta.get('target_bullet_count', '?')} target, "
-          f"capacity {env.world.state.bullets.capacity}")
+    tgt = spec.meta.get("target_bullet_count")
+    peak = spec.meta.get("measured_peak_bullets")
+    if tgt is None and peak is None:
+        print(f"  bullets      : 场景自带数量（不按难度标定）, "
+              f"capacity {env.world.state.bullets.capacity}")
+    else:
+        print(f"  bullets      : ~{tgt if tgt is not None else '?'} target, "
+              f"实测峰值 {peak if peak is not None else '?'}, "
+              f"capacity {env.world.state.bullets.capacity}")
+    kinds = ", ".join(_spec_kinds(spec)) or "?"
+    print(f"  obstacles    : {kinds}")
+    if _is_board_mode(args):
+        why = ("板子在环里 → **只放这一种**（板子的 gap_avoid 只对墙+缺口有语义；"
+               "场上多一种只会让画面更难读）")
+        print(f"                 {why}")
+        if spec.meta.get("kinds_override"):
+            print("                 换类型用 --obstacle-type <一种>（如 small_obstacles）；"
+                  "--level 只改难度（更快更窄），不会让类型变多")
+        else:
+            print("                 这一种由 --obstacle-type 指定；"
+                  "参数用 --obstacle-count/--obstacle-speed/--gap-width 等覆盖")
+    if spec.meta.get("cycle_seconds"):
+        print(f"  cycle        : 每种独占 {spec.meta['cycle_seconds']:g}s，整轮 "
+              f"{spec.meta['cycle_period_s']:g}s（同一时刻场上只有一种）")
+    elif spec.meta.get("obstacle_stages"):
+        print(f"  staged       : 开场只有第一种，之后每 "
+              f"{spec.meta.get('stage_seconds', 0):g}s 多解锁一种"
+              f"（{len(spec.meta['obstacle_stages'])} 种）")
     print(f"  collisions   : penalty event (penalty={spec.collision_penalty}, "
           f"mode={spec.collision_count_mode}) - episode continues")
     if env.world.terminate_on_collision:

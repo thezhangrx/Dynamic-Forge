@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
@@ -234,6 +234,8 @@ def stage_spec(
     seconds = float(stage_seconds)
     if seconds <= 0.0:
         return spec
+    if len(kind_order(spec.patterns, order)) < 2:
+        return spec  # 只有一种类型，分批没有意义（"第 2 种"不存在）
     patterns = stage_patterns(spec.patterns, seconds, order=order)
     first: dict[str, float] = {}
     for p in patterns:
@@ -456,6 +458,7 @@ def make_scenario(
     ensure_valid: bool = True,
     stage_seconds: float = 0.0,
     cycle_seconds: float = 0.0,
+    kinds: Sequence[str] | None = None,
     **spec_overrides: Any,
 ) -> ScenarioSpec:
     """Build a fully-specified scenario for a difficulty level or bullet count.
@@ -475,6 +478,13 @@ def make_scenario(
     also turns ``calibrate`` off by default (a per-type demo wants each type's own
     counts, not the level's object budget) — an explicit bullet count
     (``--bullets N``) or ``calibrate=True`` still calibrates.
+
+    ``kinds=(...)`` restricts **which** obstacle kinds the scene may contain,
+    keeping the level's speed/count/interval scaling.  That is how the board
+    path says "只放墙+缺口" (see ``cli.BOARD_KINDS``): the gap_avoid decision only
+    has a meaning for a wall with an opening, and a second kind on the field only
+    makes the picture harder to read.  Restricted scenes are demos too, so they
+    skip the object-budget calibration unless a bullet count is asked for.
 
     Any further keyword is forwarded verbatim to :class:`ScenarioSpec`
     (``player_speed``, ``player_x``, ``wrap``, ``cull_margin``, ...).
@@ -501,6 +511,16 @@ def make_scenario(
         duration=duration,
         bullet_count=requested,
     )
+    if kinds is not None:
+        # 只放指定的类型（例如"板子在环里时只放墙+缺口"）。难度曲线照旧决定速度 /
+        # 数量 / 间隔，改的只是**有哪些类型**。
+        wanted = tuple(str(k) for k in kinds)
+        unknown = [k for k in wanted if k not in profile.obstacle_kinds]
+        if unknown:
+            raise ConfigError(
+                f"kinds {unknown} are not in this level's vocabulary "
+                f"{list(profile.obstacle_kinds)}")
+        profile = replace(profile, obstacle_kinds=wanted)
     patterns = template_patterns(profile, field_w, field_h, player_radius=player_radius)
     base: dict[str, Any] = dict(
         name=name or f"{profile.label}_{profile.bullet_count}",
@@ -518,7 +538,8 @@ def make_scenario(
               "count_scale": profile.count_scale,
               "speed_scale": profile.speed_scale,
               "safety_count_cap": count_cap,
-              "obstacle_kinds": list(profile.obstacle_kinds)},
+              "obstacle_kinds": list(profile.obstacle_kinds),
+              **({"kinds_override": list(profile.obstacle_kinds)} if kinds is not None else {})},
     )
     base.update(spec_overrides)
     spec = ScenarioSpec(**base)
@@ -527,12 +548,13 @@ def make_scenario(
         spec = cycle_spec(spec, float(cycle_seconds))
     elif stage_seconds and float(stage_seconds) > 0.0:
         spec = stage_spec(spec, float(stage_seconds))
-    # 分开展示（轮播）是**演示 / 逐项验收**模式：每种类型就用它自己的数量定义。
-    # 按难度预算去标定会把某一档放大成一大团（例如 208 个小圆点同时涌进来），
-    # 那样反而看不清这一种类型长什么样 —— 而这正是开这个开关的目的。
+    # 分开展示（轮播）/ 只放一种（kinds）都是**演示 / 逐项验收**模式：每种类型就用
+    # 它自己的数量定义。按难度预算去标定会把某一档放大成一大团（例如 208 个小圆点
+    # 同时涌进来），那样反而看不清这一种类型长什么样 —— 而这正是开这个开关的目的。
     # 但**显式点名要多少**（`--bullets N` / `stress(N)`）仍然优先：那是明确要求。
     if calibrate is None:
-        calibrate = not (cycling and not explicit_count)
+        demo = cycling or kinds is not None
+        calibrate = not (demo and not explicit_count)
     if calibrate and profile.bullet_count > 0:
         spec, peak = calibrate_bullet_count(spec, profile.bullet_count, return_peak=True)
         spec.meta["target_bullet_count"] = profile.bullet_count

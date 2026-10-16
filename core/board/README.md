@@ -236,21 +236,21 @@ Env/bin/python -m bullet_sim board-control --port /dev/ttyUSB0
 Env/bin/python -m bullet_sim board-control --udp 9999
 ```
 
-**开场只有一种障碍**：`board-control`（和 `play`）默认 `--stage-seconds 8`，第 8 秒
-之前场上只有墙+缺口 —— 摄像头 → PL → `gap_avoid` 唯一能稳定读出的就是它。开场同时
-出现墙、移动块、小障碍时，画面里分不清"哪个是墙、哪个是目标"，控制对不对根本看不
-出来（板子侧表现就是"角色一直朝一个方向走"）。`--stage-seconds 0` 恢复"全都在场"。
-
-**想逐个类型单独验**：`--obstacle-cycle S` 让每个类型独占 S 秒档期、整轮循环，
-**同一时刻场上只有一种**障碍（板子的 `gap_avoid` 只对墙+缺口有明确语义，另外两种
-正好用来确认"没有墙时不乱发指令"）：
+**板子控制平台时，场上只有一种障碍**：`board-control`（和 `play --input board`）
+默认只放**墙+缺口**（`BOARD_KINDS`），因为板子的 `gap_avoid` 只对"墙 + 一个缺口"
+有语义 —— 墙在哪、缺口在哪、来不来得及。用 `--obstacle-type` 指定那**一种**：
 
 ```bash
-# 一条命令轮着看：墙(0-20s) → 移动块(20-40s) → 小障碍(40-60s) → 循环
-Env/bin/python -m bullet_sim board-control --stdin --level medium --obstacle-cycle 20
-# 只看一种（数量/速度用这个类型自己的定义）
-Env/bin/python -m bullet_sim board-control --stdin --obstacle-type wall_with_gap
+Env/bin/python -m bullet_sim board-control --stdin                          # 墙+缺口
+Env/bin/python -m bullet_sim board-control --stdin --obstacle-type small_obstacles
+Env/bin/python -m bullet_sim board-control --stdin --level hard             # 还是墙，但更快更窄
 ```
+
+给两种 `--obstacle-type`、或加 `--obstacle-cycle`、或用多类型的 `--scenario` 文件，
+都**直接报错**（退出码 2），不会静默放宽。为什么卡这么死：场上多一种障碍（方块、
+碎点）时，摄像头画面里分不清"哪个是墙、哪个是目标"，指令就没有意义 —— 实测症状正是
+"角色一直朝一个方向走、永不收敛"。想看多种障碍逐个类型轮播，用不带板子的
+`play --obstacle-cycle S`。
 
 **给摄像头看时顺手做两件事**：`--fullscreen`（场地铺满窗口，窗口外的桌面不会被当成
 目标）和 `--scale 2`（角色圆放大到视觉能认出的大小 —— 缩得太小时面积会低于

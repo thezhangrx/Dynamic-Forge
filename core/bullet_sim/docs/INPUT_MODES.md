@@ -166,13 +166,12 @@ python -m bullet_sim board-control --headless --stdin --steps 600 --json
 `board-control` 就是"输入源换成板子、**默认不自动停**"的 `play`
 （`--headless` 时走 `run`）：主循环只有一份，不存在第三套"什么时候停"的规矩。
 
-板子在环里时**开场只放一种障碍**（`--stage-seconds`，`play`/`board-control` 默认 8 秒）：
-第一段只有墙+缺口 —— 摄像头 → PL 几何 → `gap_avoid` 唯一能稳定读出的就是它。
-开场把墙、移动块、小障碍一次全放上去，画面里分不清"哪个是墙、哪个是目标"，
-控制对不对根本看不出来。要回到"全都在场"就加 `--stage-seconds 0`。
-要**逐个类型单独看**（同一时刻场上只有一种，整轮循环）用
-`--obstacle-cycle S`，或用 `--obstacle-type X` 一次只给一种。
-（详见根 `README.md` §9.4 / §9.5。）
+板子在环里时，场景里**只有一种**障碍类型，由 `--obstacle-type` 指定那一种
+（不给就是墙+缺口 `BOARD_KINDS`）：板子的 `gap_avoid` 只对"墙 + 一个缺口"有语义。
+给多种 `--obstacle-type` / `--obstacle-cycle` / 多类型场景文件都**报错**（退出码 2），
+不静默放宽 —— 场上多一种障碍时画面里分不清"哪个是墙、哪个是目标"，指令就没意义。
+（详见根 `README.md` §9.5。不带板子的 `play` 不受限：默认分批进场，也可
+`--obstacle-cycle S` 逐个类型轮播。）
 
 ### 3.3 `--nostop`：平台不许自己停
 
