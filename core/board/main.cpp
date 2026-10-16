@@ -477,9 +477,10 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
     //   宽 3~6 px、half_h ≤ 0，而且**每帧出现在同一个位置**。它们进决策的后果
     //   很具体：几何帧里一会儿 1 个、一会儿 6 个矩形，`gap_avoid` 找错缺口、
     //   跟踪器给墙推出一帧 188 一帧 5 的假速度，平台于是"左右乱跑"。
-    //   真正的墙：half_w ≈ 90、half_h ≈ 3（640 宽画面里横贯半场）。
-    //   这里按**绝对像素尺寸**过滤，比调阈值更不容易误伤（墙最薄也有 2 px）。
-    static const double kMinRectHalfW = 12.0;   // px（pipeline 坐标）
+    //   真正的墙：half_w ≈ 44~96、half_h ≈ 3~16（实测一帧里 3~6 个矩形，其中
+    //   一半是 12~16 px 的假货）。这里按**绝对像素尺寸**过滤：half_w < 20 的
+    //   一律不要 —— 实测真墙最窄 44，假货最大 16，中间是空的，好切。
+    static const double kMinRectHalfW = 20.0;   // px（pipeline 坐标）
     static const double kMinRectHalfH = 1.0;
     std::vector<gap_avoid::Rect> rects;
     rects.reserve(f.obstacles.size());
