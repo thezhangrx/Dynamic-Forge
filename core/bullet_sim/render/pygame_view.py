@@ -116,6 +116,7 @@ class PygameRenderer:
         wall_color: tuple[int, int, int] = WALL_COLOR,
         show_fiducials: bool = True,
         fiducial_side: float = 48.0,
+        window_timeout_s: float = 20.0,
     ) -> None:
         self.mode = mode
         self.scale = float(scale)
@@ -151,6 +152,8 @@ class PygameRenderer:
         self._font = None
         self._size = (0, 0)
         self.closed = False
+        #: 开窗最多等多久（秒）。见 `_set_mode_with_watchdog`。
+        self.window_timeout_s = float(window_timeout_s)
         self.pending_action: Any = None
         self.started_at = time.monotonic()
         self.mode_banner = ""
@@ -206,7 +209,20 @@ class PygameRenderer:
     def _ensure_init(self, world: Any) -> None:
         if self._initialized:
             return
-        pygame.init()
+        # ⚠ 整个初始化（display.init / set_mode / 字体）都可能卡在 X 里 ——
+        #   所以看门狗要罩住**整段**，不能只罩 set_mode。
+        _done = self._start_window_watchdog()
+        try:
+            self._ensure_init_body(world)
+        finally:
+            _done.set()
+
+    def _ensure_init_body(self, world: Any) -> None:
+        # ⚠ 只初始化**要用的**子系统：`pygame.init()` 会连 **mixer（音频）**一起初始化，
+        #   而跑这个仿真根本不需要声音 —— 在没有声卡的机器/容器里它只会刷一屏 ALSA 报错
+        #   （实测把真正的失败信息埋掉了），还多一个卡住的机会。
+        pygame.display.init()
+        pygame.font.init()
         pygame.display.set_caption(f"bullet_sim - {world.spec.name}")
         if self._window_size is not None:
             self._size = (max(64, int(self._window_size[0])), max(64, int(self._window_size[1])))
@@ -245,6 +261,39 @@ class PygameRenderer:
         self._initialized = True
 
     # ------------------------------------------------------------------
+    def _start_window_watchdog(self) -> Any:
+        """起一个守望线程：初始化卡住就说清怎么办，并让进程真的退出。
+
+        为什么需要：`pygame.display.init()/set_mode()` 是 C 调用，卡在 X/WSLg 里时
+        Python 的异常递不进去（**实测：发信号也进不来**，进程状态一直是 R），用户看到
+        的就是"弹窗出不来、Ctrl-C 也没用"。守望线程到点直接打印诊断并 `os._exit`。
+        """
+        import os as _os
+        import threading as _threading
+
+        done = _threading.Event()
+
+        def _watchdog() -> None:
+            if done.wait(self.window_timeout_s):
+                return
+            import sys as _sys
+            print(
+                f"✗ 等了 {self.window_timeout_s:.0f} 秒还没能把窗口初始化出来 —— "
+                "显示子系统卡住了\n"
+                "  这不是程序算不出来，是 X/WSLg 那边没响应。按顺序试：\n"
+                "    ① 关掉所有残留的窗口/进程：pgrep -af bullet_sim，然后 kill\n"
+                "    ② Windows 侧执行 `wsl --shutdown`，再重新打开 WSL\n"
+                "       （WSLg 卡住的正规解法；实测 offscreen 驱动 0.9s 就能开，只有 x11 卡）\n"
+                "    ③ 先不折腾窗口：加 --headless（无窗口跑）\n"
+                "  注意：卡在 C 调用里时 Ctrl-C 可能也进不来，退不掉就 `kill -9`。",
+                file=_sys.stderr, flush=True,
+            )
+            _os._exit(4)
+
+        th = _threading.Thread(target=_watchdog, name="window-watchdog", daemon=True)
+        th.start()
+        return done
+
     def render(self, world: Any) -> Any:
         self._ensure_init(world)
         self._pump_events()
@@ -710,9 +759,16 @@ class PygameRenderer:
         ⚠ 必须单独有这个方法：**点窗口右上角的 × 时 SDL 不一定投递 `pygame.QUIT`**
         （WSLg 上实测过），而 `--nostop` 不设步数上限 —— 那就变成"窗口没了、进程还在
         跑"（用户看到的就是卡死）。每帧问一次这个，就没有那条路。
+
+        ⚠⚠ **还没初始化时必须是 True**：窗口是在第一次 `render()` 里才创建的
+        （`_ensure_init` → `pygame.display.set_mode`）。主循环在第一次 render **之前**
+        就问这一句，那时 `pygame.display.get_init()` 还是 False —— 判成"窗口已关闭"
+        就会**当场退出、窗口根本不开**（这个回归真发生过：用户看到的就是"弹窗不出来"）。
         """
+        if self.closed or not self._initialized:
+            return not self.closed
         try:
-            return bool(pygame.display.get_init()) and not self.closed
+            return bool(pygame.display.get_init())
         except Exception:
             return False
 

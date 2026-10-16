@@ -676,6 +676,34 @@ def cmd_scenario(args: argparse.Namespace) -> int:
     return 0
 
 
+def _probe_display(timeout_s: float = 6.0) -> tuple[bool, str]:
+    """**开窗口之前**先在一个子进程里试一次开窗（能不能开、会不会卡）。
+
+    为什么必须放在子进程里：`pygame.display.set_mode()` 卡在 X/WSLg 里时是**握着 GIL
+    的 C 调用** —— 同进程里的看门狗线程等不到 GIL、信号处理器也递不进去（实测发
+    SIGTERM 后进程状态一直是 R）。只有**子进程**能被 `timeout` 杀掉，于是"静默卡死"
+    才能变成"6 秒后一句能照做的诊断"。
+
+    返回 ``(ok, 说明)``。
+    """
+    import subprocess
+    code = (
+        "import pygame;"
+        "pygame.display.init();"
+        "pygame.display.set_mode((64, 64));"
+        "print('ok')"
+    )
+    try:
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                           text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return False, "超时（显示子系统没响应）"
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout or "").strip().splitlines()
+        return False, (tail[-1] if tail else f"退出码 {r.returncode}")
+    return "ok" in r.stdout, "ok"
+
+
 def _run_steps(args: argparse.Namespace, spec: Any) -> int | None:
     """无窗口跑的步数；`None` = 一直跑（配合 `stop_on_done=False`）。
 
@@ -1038,6 +1066,27 @@ def cmd_play(args: argparse.Namespace) -> int:
             pass
         env.close()
         return 2
+
+    # ⚠ 开窗口之前先探一次（**放在输入源打开之后**：传输错误优先报，那更常见也更该先修）。
+    #   卡在 `set_mode` 的 C 调用里时握着 GIL —— 同进程的看门狗线程等不到 GIL、信号也
+    #   递不进去（实测发 SIGTERM 后进程状态一直是 R），只有子进程能被 timeout 杀掉。
+    #   见 `_probe_display`。
+    if not getattr(args, "headless", False):
+        ok, why = _probe_display()
+        if not ok:
+            print(
+                f"✗ 开不了窗口：{why}\n"
+                "  窗口是仿真器当「平台」用的必需品（相机要拍它），但显示子系统现在不响应。\n"
+                "  这不是程序算不出来 —— 实测同一个 pygame：offscreen 驱动 0.9s 就能开、\n"
+                "  x11（WSLg）卡住，说明是 WSLg 那边的问题。按顺序试：\n"
+                "    ① 清掉残留窗口/进程：pgrep -af bullet_sim，然后 kill（退不掉就 kill -9）\n"
+                "    ② Windows 侧执行 `wsl --shutdown`，再重新打开 WSL（WSLg 卡住的正规解法）\n"
+                "    ③ 先不折腾窗口：加 --headless（板子照旧驱动仿真，只是没有画面）\n"
+                "    ④ 或者在 Windows 上直接跑（原生窗口，不经过 WSLg）",
+                file=sys.stderr)
+            env.close()
+            return 4
+
     from bullet_sim.action import Action
 
     last_action = Action.zero()
@@ -1066,9 +1115,15 @@ def cmd_play(args: argparse.Namespace) -> int:
     #   最后一个 `signal.signal()` 生效，所以这里装在 renderer 之后就能赢过 SDL。
     import signal as _signal
 
-    _stop = {"flag": False}
+    _stop: dict[str, Any] = {"flag": False, "n": 0}
 
     def _on_signal(signum, frame):          # pragma: no cover - 真信号路径
+        _stop["n"] = _stop.get("n", 0) + 1
+        if _stop["n"] >= 2:
+            # 连按两次 = 强制退出。卡在 C 调用（如 set_mode/event.get）里时，
+            # 第一次信号的异常要等调用返回才递得进去 —— 那就再给一次机会直接走。
+            import os as _os
+            _os._exit(130)
         _stop["flag"] = True
         raise KeyboardInterrupt             # 让 sleep/阻塞调用立刻中断
 
