@@ -77,6 +77,20 @@ struct Args {
     //: 标记周围还要额外留多少（场地单位）才算"这是标记不是角色"。
     //: 相机有透视/量化误差，标记的留白边也比黑边外沿大一圈（48 → 64）。
     double fiducial_slack = 12.0;
+    //: 逐像素分类的 7 个阈值**覆盖**（负数 = 用 C 参考模型/Python 真值的默认值）。
+    //:
+    //: 为什么要有这个：判据是**绝对阈值**（`r-b>40` 这类），而相机拍屏幕会把
+    //: 橙墙洗成近中性（实测 r-b 只剩 20~57）、把黑底抬成中灰。平台上只有橙/白/黑
+    //: 三种颜色，所以按真实相机**放宽/收紧**这几个数就能救回来 —— 不用重编位流，
+    //: 也不动场景（墙色、角色大小、场地尺寸全是契约）。
+    int ov_wall_rb = -1, ov_wall_min_r = -1, ov_wall_min_g = -1;
+    int ov_bright_min = -1, ov_bright_spread = -1;
+    int ov_green_gm = -1, ov_green_min = -1;
+    bool vision_calibrated() const {
+        return ov_wall_rb >= 0 || ov_wall_min_r >= 0 || ov_wall_min_g >= 0 ||
+               ov_bright_min >= 0 || ov_bright_spread >= 0 ||
+               ov_green_gm >= 0 || ov_green_min >= 0;
+    }
     // 键盘桥：决策算出的速度 → 动作号 → "@MOVE <n>\n" → 板子控制台 TX。
     // RP2040 的 GP1 就接在控制台 TX 上（见 core/rp2040_keyboard/README.md），
     // 它从共享的控制台流里挑出带 @MOVE 前缀的行。空串 = 不发。
@@ -143,6 +157,14 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--fiducial-side")   a.fiducial_side = std::atof(next());
         else if (k == "--fiducial-margin") a.fiducial_margin = std::atof(next());
         else if (k == "--fiducial-slack")  a.fiducial_slack = std::atof(next());
+        // 分类阈值覆盖（--wall-rb 等；不给就用默认值）
+        else if (k == "--wall-rb")        a.ov_wall_rb = std::atoi(next());
+        else if (k == "--wall-min-r")     a.ov_wall_min_r = std::atoi(next());
+        else if (k == "--wall-min-g")     a.ov_wall_min_g = std::atoi(next());
+        else if (k == "--bright-min")     a.ov_bright_min = std::atoi(next());
+        else if (k == "--bright-spread")  a.ov_bright_spread = std::atoi(next());
+        else if (k == "--green-gm")       a.ov_green_gm = std::atoi(next());
+        else if (k == "--green-min")      a.ov_green_min = std::atoi(next());
         else if (k == "--ppm")          a.ppm_file = next();
         else if (k == "--via-pl")       a.via_pl = true;
         else if (k == "--stdin-rgb")    a.stdin_rgb = true;
@@ -191,6 +213,15 @@ Args parse_args(int argc, char** argv) {
                 "  --via-pl             配上 --ppm/--ppm-dir 时，把像素**推进 PL**、\n"
                 "                       几何帧由 PL 产出（真摄像头走 FPGA 加速就走这条）。\n"
                 "                       不加则是在 PS 上跑黄金模型。\n"
+                "  --wall-rb N          覆盖「墙」的 R-B 下限（默认 40）。相机把橙墙洗成\n"
+                "                       近中性时（实测 r-b 只剩 20~57）把它放宽到 20 左右；\n"
+                "                       平台上只有橙/白/黑三种颜色，放宽不会引入别的颜色。\n"
+                "  --wall-min-r N       覆盖「墙」的 R 下限（默认 110）\n"
+                "  --wall-min-g N       覆盖「墙」的 G 下限（默认 60）\n"
+                "  --bright-min N       覆盖「亮（角色）」的 min(RGB) 下限（默认 195）\n"
+                "  --bright-spread N    覆盖「亮」的 max-min 上限（默认 45）\n"
+                "  --green-gm N         覆盖「绿」的 G-max(R,B) 下限（默认 10）\n"
+                "  --green-min N        覆盖「绿」的 G 下限（默认 90）\n"
                 "  --verify-both        同一张图两条路都跑，比对几何帧是否逐字节相同\n"
                 "                       （真硅上验「PL 吃真图」，与 tb_axi --fifo 同一性质）。\n",
                 argv[0], argv[0]);
@@ -201,6 +232,23 @@ Args parse_args(int argc, char** argv) {
         }
     }
     return a;
+}
+
+
+/// 逐像素分类的**有效阈值**：C 参考模型/Python 真值的默认值 + 命令行覆盖。
+///
+/// 为什么集中在一处：写寄存器（`configure`）和 `--verify-both` 的配置对账必须
+/// 用**同一个**来源，否则标定过的阈值会被那条对账判成"不一致"（它原本只比默认值）。
+VisionParams effective_vision_params(const Args& a) {
+    VisionParams p;
+    if (a.ov_wall_rb >= 0)       p.wall_rb = a.ov_wall_rb;
+    if (a.ov_wall_min_r >= 0)    p.wall_min_r = a.ov_wall_min_r;
+    if (a.ov_wall_min_g >= 0)    p.wall_min_g = a.ov_wall_min_g;
+    if (a.ov_bright_min >= 0)    p.bright_min = a.ov_bright_min;
+    if (a.ov_bright_spread >= 0) p.bright_spread = a.ov_bright_spread;
+    if (a.ov_green_gm >= 0)      p.green_gm = a.ov_green_gm;
+    if (a.ov_green_min >= 0)     p.green_min = a.ov_green_min;
+    return p;
 }
 
 // ---------------------------------------------------------------------------
@@ -725,9 +773,16 @@ int main(int argc, char** argv) {
         std::printf("自检：通过（配置寄存器读写回一致）\n");
 
         // ---- 配置 --------------------------------------------------------
-        VisionParams params;      // 默认值 = C 参考模型 / Python 真值
+        const VisionParams params = effective_vision_params(args);
         drv->configure(params);
-        std::printf("配置：已写入 %d 个寄存器（阈值用默认值）\n", (int)kCfgCount);
+        if (args.vision_calibrated()) {
+            std::printf("配置：已写入 %d 个寄存器（**标定过的阈值**：wall_rb=%d "
+                        "wall_min_r=%d wall_min_g=%d bright_min=%d bright_spread=%d）\n",
+                        (int)kCfgCount, params.wall_rb, params.wall_min_r,
+                        params.wall_min_g, params.bright_min, params.bright_spread);
+        } else {
+            std::printf("配置：已写入 %d 个寄存器（阈值用默认值）\n", (int)kCfgCount);
+        }
     }
 
     // ---- 键盘桥：动作行发到板子控制台 TX（RP2040 就听这根线）--------------
@@ -936,15 +991,14 @@ int main(int argc, char** argv) {
         // 写进去的是 C++ 的 `VisionParams`。两者只要有一项不同，PL 与模型的
         // 判据就会不同 → 几何帧"个数对、坐标不对"，且**完全不报错**。
         {
-            VrRefParams rp;
-            vr_ref_default_params(&rp);
+            // ⚠ 比的是**有效阈值**（默认值或命令行标定过的），不是写死的默认值：
+            //   这条对账要抓的是"结构体 → 寄存器下标映射"的错位，而不是标定本身。
+            const VisionParams eff = effective_vision_params(args);
+            const std::vector<int32_t> regs = eff.to_regs();
             const int32_t want[21] = {
-                rp.wall_rb, rp.wall_min_r, rp.wall_min_g, rp.bright_min,
-                rp.bright_spread, rp.green_gm, rp.green_min, rp.band_row_pct,
-                rp.band_join_rows, rp.band_min_rows, rp.field_col_min,
-                rp.wall_col_pct, rp.wall_col_min, rp.edge_min, rp.edge_min_cols,
-                rp.min_seg_px, rp.min_gap_px, rp.player_min_area,
-                rp.player_max_area, rp.player_min_fill_pct, rp.player_max_aspect_pct,
+                regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6],
+                regs[7], regs[8], regs[9], regs[10], regs[11], regs[12], regs[13],
+                regs[14], regs[15], regs[16], regs[17], regs[18], regs[19], regs[20],
             };
             const char* nm[21] = {
                 "wall_rb", "wall_min_r", "wall_min_g", "bright_min", "bright_spread",
