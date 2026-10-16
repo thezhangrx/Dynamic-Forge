@@ -82,6 +82,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-alive", action="store_true",
                    help="deprecated alias: collisions never stop the run by default now")
     p.add_argument("--steps", type=int, default=None)
+    p.add_argument("--nostop", action="store_true",
+                   help="**不许自己停**：不看回合步数、也不因 terminated/truncated 结束"
+                        "（不设 --steps 时一直跑，Ctrl-C 停）")
+    p.add_argument("--port", type=str, default=None, help="板子信号来自串口（--input board）")
+    p.add_argument("--baud", type=int, default=115200)
+    p.add_argument("--udp", type=int, default=None, metavar="PORT",
+                   help="板子信号来自 UDP（--input board）")
+    p.add_argument("--stdin", dest="use_stdin", action="store_true",
+                   help="板子信号来自标准输入（--input board）")
+    p.add_argument("--hold-ms", type=int, default=500, help="断流多久回中（默认 500ms）")
     p.add_argument("--json", action="store_true")
 
     # -- record ----------------------------------------------------------
@@ -116,11 +126,46 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- play ------------------------------------------------------------
     p = sub.add_parser("play", help="interactive / visual run (requires pygame)")
+    _add_play_args(p)
+
+        # -- board-control ---------------------------------------------------
+    p = sub.add_parser(
+        "board-control",
+        help="板子控制平台：板子的 @MOVE n → 仿真动作，**默认不自动停**"
+             "（传输：--port 串口 / --udp 端口 / --stdin 管道）",
+    )
+    _add_play_args(p, input_default="board")
+    p.set_defaults(nostop=True)     # 这个子命令的默认就是"一直跑"
+
+# -- autoplay --------------------------------------------------------
+    p = sub.add_parser(
+        "autoplay",
+        help="headless evaluation of the autonomous controllers (no window)",
+    )
+    _add_scenario_args(p)
+    p.add_argument("--controllers", nargs="*", default=None,
+                   help="subset of idle|random|repulsion|threat|planner")
+    p.add_argument("--steps", type=int, default=1200)
+    p.add_argument("--seeds", nargs="*", type=int, default=None,
+                   help="seeds to average over (default: the scenario seed only)")
+    p.add_argument("--json", action="store_true")
+
+    # -- info ------------------------------------------------------------
+    sub.add_parser("info", help="print platform, protocol and dataset schema information")
+    return parser
+
+
+def _add_play_args(p: argparse.ArgumentParser, *, input_default: str = "manual") -> None:
+    """`play` 与 `board-control` **共用**的一组参数。
+
+    共用是必须的：`board-control` 就是"输入源换成板子、默认不自动停"的 `play`；
+    两边各写一份参数迟早会分家（比如新加一个 `--danger` 只加在一边）。
+    """
     _add_scenario_args(p)
     p.add_argument("--controller", default="stay")
     p.add_argument(
         "--input",
-        default="manual",
+        default=input_default,
         help="control mode: manual|auto|model|random|scripted|null|board|controller",
     )
     p.add_argument("--auto", default="threat",
@@ -173,24 +218,30 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: per_contact)")
     p.add_argument("--keep-alive", action="store_true",
                    help="deprecated alias: collisions never stop the run by default now")
+
+    # -- 「平台不许自己停」与板子输入 ------------------------------------
+    p.add_argument("--nostop", action="store_true",
+                   help="**跑起来就不自动停**：不看回合步数上限、也不因 terminated/truncated "
+                        "结束（只由 Ctrl-C / 关窗口停）。板子控制平台时用这个")
+    p.add_argument("--port", type=str, default=None,
+                   help="板子信号来自串口（如 /dev/ttyUSB0 / COM3）")
+    p.add_argument("--baud", type=int, default=115200, help="串口波特率（默认 115200）")
+    p.add_argument("--udp", type=int, default=None, metavar="PORT",
+                   help="板子信号来自 UDP（板子侧 --keyboard-dev udp://本机IP:PORT）")
+    p.add_argument("--stdin", dest="use_stdin", action="store_true",
+                   help="板子信号来自标准输入（ssh 板子 '... --keyboard-dev stdout' | ...）")
+    p.add_argument("--hold-ms", type=int, default=500,
+                   help="断流多久回中（默认 500ms，与键盘桥/看门狗一致）")
+    p.add_argument("--headless", action="store_true",
+                   help="不开窗口、只跑（给无显示的机器/自测用）")
+    # 这两个是 `--headless` 时才用得上的（headless 走的是 run 那条路）：
+    # `--steps` 只是 `--max-steps` 更顺手的写法（同一个 dest），`--json` 出报告。
+    p.add_argument("--steps", type=int, default=None, dest="max_steps",
+                   help="同 --max-steps（--headless 时更顺手）")
+    p.add_argument("--json", action="store_true", help="--headless 时输出 JSON 报告")
+
+
     p.add_argument("--quiet", action="store_true", help="do not print the start-up banner")
-
-    # -- autoplay --------------------------------------------------------
-    p = sub.add_parser(
-        "autoplay",
-        help="headless evaluation of the autonomous controllers (no window)",
-    )
-    _add_scenario_args(p)
-    p.add_argument("--controllers", nargs="*", default=None,
-                   help="subset of idle|random|repulsion|threat|planner")
-    p.add_argument("--steps", type=int, default=1200)
-    p.add_argument("--seeds", nargs="*", type=int, default=None,
-                   help="seeds to average over (default: the scenario seed only)")
-    p.add_argument("--json", action="store_true")
-
-    # -- info ------------------------------------------------------------
-    sub.add_parser("info", help="print platform, protocol and dataset schema information")
-    return parser
 
 
 def _add_scenario_args(p: argparse.ArgumentParser) -> None:
@@ -625,6 +676,52 @@ def cmd_scenario(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_steps(args: argparse.Namespace, spec: Any) -> int | None:
+    """无窗口跑的步数；`None` = 一直跑（配合 `stop_on_done=False`）。
+
+    参数名要兼容两条调用路：`run` 用 `--steps`，`board-control`（复用 play 的参数）
+    用 `--max-steps`/`--max-seconds`。显式给的步数**永远优先于** `--nostop`。
+    """
+    steps = getattr(args, "steps", None)
+    if steps is None:
+        steps = getattr(args, "max_steps", None)
+    secs = getattr(args, "max_seconds", None)
+    if secs is not None:
+        by_time = int(round(float(secs) / spec.dt))
+        steps = by_time if steps is None else min(int(steps), by_time)
+    return None if steps is None else int(steps)
+
+
+def _board_source_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """把 CLI 上的传输参数收成给 `make_play_source(board=...)` 的字典。
+
+    一个传输都不给就直接报错：让它默默用占位适配器"拒绝产出"的话，用户只会看到
+    "角色一动不动"，然后去怀疑板子 —— 这是最浪费时间的一种失败。
+    """
+    hold_s = max(0.0, float(getattr(args, "hold_ms", 500)) / 1000.0)
+    if getattr(args, "port", None):
+        return {"port": args.port, "baud": int(getattr(args, "baud", 115200)),
+                "hold_s": hold_s}
+    if getattr(args, "udp", None) is not None:
+        return {"udp": int(args.udp), "hold_s": hold_s}
+    if getattr(args, "use_stdin", False):
+        return {"stdin": True, "hold_s": hold_s}
+    raise ValueError("板子输入要指定传输：--port <串口> / --udp <端口> / --stdin")
+
+
+def cmd_board_control(args: argparse.Namespace) -> int:
+    """板子控制平台：板子的 `@MOVE n` → 仿真里的动作，**默认不自动停**。
+
+    实现上就是 `play`（`--headless` 时是 `run`）换个输入源 —— **刻意不做第三个主循环**：
+    "什么时候停、怎么收尾"的规矩只有一份，两处各写一份迟早分家。
+    """
+    args.input = "board"
+    args.nostop = True              # 这个子命令的默认；显式 --max-steps 仍然优先
+    if getattr(args, "headless", False):
+        return cmd_run(args)
+    return cmd_play(args)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     from bullet_sim.interface.controller import controller_from
     from bullet_sim.simulator.env import BulletHellEnv
@@ -650,16 +747,20 @@ def cmd_run(args: argparse.Namespace) -> int:
             play = make_play_source(
                 args.input, env=env, auto=args.auto, model=args.model,
                 seed=args.seed, switchable=False,
+                board=(_board_source_kwargs(args) if args.input == "board" else None),
             )
         except Exception as exc:
             print(f"cannot start input mode {args.input!r}: {exc}", file=sys.stderr)
             env.close()
             return 2
-        result = env.run(input_source=play.source, steps=args.steps, seed=args.seed)
+        result = env.run(input_source=play.source, steps=_run_steps(args, spec),
+                         seed=args.seed,
+                         stop_on_done=not bool(getattr(args, "nostop", False)))
     else:
         ctrl = controller_from(_controller(args.controller, env.action_space, args.seed),
                                space=env.action_space, seed=args.seed)
-        result = env.run(ctrl, steps=args.steps, seed=args.seed)
+        result = env.run(ctrl, steps=_run_steps(args, spec), seed=args.seed,
+                         stop_on_done=not bool(getattr(args, "nostop", False)))
     env.close()
     if args.json:
         payload = {k: v for k, v in result.items() if k != "final_info"}
@@ -857,6 +958,7 @@ def cmd_play(args: argparse.Namespace) -> int:
     mode = "manual" if args.interactive else args.input
     switchable = not args.no_switch
     try:
+        board_kw = _board_source_kwargs(args) if mode == "board" else None
         play = make_play_source(
             mode,
             env=env,
@@ -865,6 +967,7 @@ def cmd_play(args: argparse.Namespace) -> int:
             controller=_controller(args.controller, env.action_space, args.seed),
             seed=args.seed,
             switchable=switchable,
+            board=board_kw,
         )
     except Exception as exc:
         print(f"cannot start input mode {mode!r}: {exc}", file=sys.stderr)
@@ -911,16 +1014,25 @@ def cmd_play(args: argparse.Namespace) -> int:
     last_action = Action.zero()
     sim_per_frame = max(1, int(round(args.sim_speed / args.render_fps / spec.dt)))
     frame_dt = 1.0 / args.render_fps
-    step_limit = args.max_steps if args.max_steps else spec.total_steps
+    nostop = bool(getattr(args, "nostop", False))
+    # 「不许自己停」= ① 不设回合步数上限（除非显式给了 --max-steps/--max-seconds，
+    # 显式永远优先）② 不因 terminated/truncated 结束。见 README 的 board-control 一节。
+    if args.max_steps:
+        step_limit = args.max_steps
+    elif nostop:
+        step_limit = None
+    else:
+        step_limit = spec.total_steps
     if args.max_seconds is not None:
-        step_limit = min(step_limit, int(round(args.max_seconds / spec.dt)))
+        limit_s = int(round(args.max_seconds / spec.dt))
+        step_limit = limit_s if step_limit is None else min(step_limit, limit_s)
     steps_done = 0
     frame_index = 0
     terminated = truncated = False
     from bullet_sim.prediction.danger_field import compute_danger_field
 
     try:
-        while steps_done < step_limit:
+        while step_limit is None or steps_done < step_limit:
             if callable(getattr(source, "poll_observation", None)):
                 last_action = source.poll_observation(obs, info)
             else:
@@ -931,11 +1043,11 @@ def cmd_play(args: argparse.Namespace) -> int:
                 last_action, env.world.codec, float(env.world.player[P_SPEED])
             )
             for _ in range(sim_per_frame):
-                if steps_done >= step_limit:
+                if step_limit is not None and steps_done >= step_limit:
                     break
                 obs, _r, terminated, truncated, info = env.step(raw)
                 steps_done += 1
-                if terminated or truncated:
+                if (terminated or truncated) and not nostop:
                     break
             if args.danger and frame_index % max(1, args.danger_every) == 0:
                 try:
@@ -947,7 +1059,7 @@ def cmd_play(args: argparse.Namespace) -> int:
                     renderer.danger = None
             frame_index += 1
             renderer.render(env.world)
-            if renderer.closed or terminated or truncated:
+            if renderer.closed or ((terminated or truncated) and not nostop):
                 break
             time.sleep(frame_dt)
     except KeyboardInterrupt:
@@ -1074,6 +1186,7 @@ _COMMANDS = {
     "replay": cmd_replay,
     "benchmark": cmd_benchmark,
     "play": cmd_play,
+    "board-control": cmd_board_control,
     "autoplay": cmd_autoplay,
     "info": cmd_info,
 }

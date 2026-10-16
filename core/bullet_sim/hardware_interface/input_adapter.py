@@ -250,7 +250,20 @@ class HardwareInputSource:
 
 
 def make_hardware_input_adapter(kind: str = "placeholder", **kwargs: Any) -> HardwareInputAdapter:
-    """Factory: ``placeholder`` (default, refuses) | ``loopback`` | ``recorded``."""
+    """Factory.
+
+    * ``placeholder`` / ``tbd`` —— 占位，拒绝产出（协议未定时用）；
+    * ``loopback`` / ``recorded`` —— 测试用；
+    * ``serial`` / ``udp`` / ``stdin`` / ``board``(自动) —— **真板子**那条路，
+      见 `board_link.py`（`@MOVE n` 协议已定，不再是 TBD）。
+    """
+    # 先看真板子的那几种（它们住在 board_link.py 里，避免这个文件重新变成大杂烩）
+    from bullet_sim.hardware_interface.board_link import ADAPTERS as _BOARD_ADAPTERS
+    from bullet_sim.hardware_interface.board_link import make_board_adapter
+
+    if str(kind).lower() in set(_BOARD_ADAPTERS) | {"auto", "board", "hardware", "fpga"}:
+        return make_board_adapter(kind, **kwargs)
+
     table = {
         "placeholder": PlaceholderHardwareInputAdapter,
         "tbd": PlaceholderHardwareInputAdapter,
@@ -268,7 +281,15 @@ def make_hardware_input_adapter(kind: str = "placeholder", **kwargs: Any) -> Har
 
 
 def make_hardware_input_source(**kwargs: Any) -> HardwareInputSource:
-    kind = kwargs.pop("adapter", kwargs.pop("kind", "placeholder"))
+    """建一个板子输入源。
+
+    `kind` 没给时按**参数**猜：给了 `port`/`udp`/`stdin` 就是真板子（`auto`），
+    什么都没给才是 `placeholder`（保持旧行为：拒绝产出，而不是猜一个协议）。
+    """
+    kind = kwargs.pop("adapter", kwargs.pop("kind", None))
+    if kind is None:
+        boardish = any(kwargs.get(k) is not None for k in ("port", "udp", "fd"))
+        kind = "auto" if (boardish or kwargs.get("stdin")) else "placeholder"
     return HardwareInputSource(make_hardware_input_adapter(kind, **kwargs))
 
 

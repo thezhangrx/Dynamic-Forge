@@ -290,13 +290,18 @@ class BulletHellEnv:
         # device sources are driven by ``poll(dt)``.
         needs_observation = callable(getattr(source, "poll_observation", None))
         last_action = Action.zero()
-        n = int(steps) if steps is not None else self.spec.total_steps
+        # 「一直跑」：不给步数、又不许因 done 停 —— 那就是跑到 Ctrl-C/被杀为止。
+        # 这是 `--nostop` 的实现口径（板子控制平台时用），不是默认行为。
+        unlimited = steps is None and not stop_on_done
+        n = None if unlimited else (int(steps) if steps is not None else self.spec.total_steps)
         rewards: list[float] = []
         collision_events = 0
         terminated = False
         truncated = False
         info = self._last_info
-        for _ in range(n):
+        import itertools
+
+        for _ in (itertools.count() if unlimited else range(int(n))):
             if needs_observation:
                 action = source.poll_observation(obs, info)
             else:

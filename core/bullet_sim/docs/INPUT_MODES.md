@@ -130,88 +130,71 @@ env.run(input_source=sw, steps=600)
 
 ---
 
-## 3. 模式 C：开发板操纵（当前为占位）
+## 3. 模式 C：开发板操纵（**协议已定并已实现**）
 
-### 3.1 契约
+### 3.1 协议（已经不是 TBD）
 
-```python
-class HardwareInputAdapter(ABC):
-    transport: str = HARDWARE_INPUT_INTERFACE_TBD
+板子算完决策就把动作号打到控制台/stdout/UDP：**一行一个** `@MOVE <n>\n`，`n∈0..8`。
+定义在 `core/board/action_codec.hpp`（C++ 生产者），规矩与键盘桥完全一致：
 
-    @abstractmethod
-    def open(self) -> None: ...
-    @abstractmethod
-    def close(self) -> None: ...
-    @abstractmethod
-    def read_payload(self) -> Any: ...        # 从板卡读一帧原始负载
-    @abstractmethod
-    def decode_payload(self, payload) -> Action: ...
-    def poll(self, dt) -> Action | None: ...  # read + decode
+* 只认**行首**就是 `@MOVE ` 的行（这条线上混着内核/程序日志）；
+* 前缀后必须是 0..8 的整数，否则**静默丢弃**；
+* **断流回中**（默认 500 ms）—— 不放的话板子一断，角色会一直朝最后那个方向飞。
+
+解析规则在 `bullet_sim/hardware_interface/board_link.py`；它与
+`core/rp2040_keyboard/console_relay.py:parse_moves` 由测试逐批对账
+（`tests/test_board_link.py`），差异一处都算失败。
+
+### 3.2 用法：一条命令让**仿真器当平台**
+
+```bash
+# 串口（板子控制台 / RP2040 的 USB CDC）
+python -m bullet_sim board-control --port /dev/ttyUSB0
+
+# SSH 管道（推荐：不占控制台、不用 usbipd、不动防火墙）
+ssh -i <key> root@192.168.137.242 \
+    'cd /root/tools && ./cam_live.sh --frames 0 --via-pl --keyboard-dev stdout' \
+  | python -m bullet_sim board-control --stdin
+
+# UDP（板子 --keyboard-dev udp://<本机IP>:9999）
+python -m bullet_sim board-control --udp 9999
+
+# 无窗口（自测 / 无显示的机器）
+python -m bullet_sim board-control --headless --stdin --steps 600 --json
 ```
 
-### 3.2 明确留白的内容
+`board-control` 就是"输入源换成板子、**默认不自动停**"的 `play`
+（`--headless` 时走 `run`）：主循环只有一份，不存在第三套"什么时候停"的规矩。
 
-**全部集中在 `hardware_interface/tbd.py`，默认值一律 `None`，不会被任何代码猜测。**
+### 3.3 `--nostop`：平台不许自己停
 
-`PlannedTransport`：`kind`（UART/SPI/USB/GPIO/TCP/共享内存/MMIO/PCIe/其它）、
-`baud_rate`、`byte_order`、`packet_bytes`、`register_base`、`payload_format`、
-`endpoint`、`handshake`、`timeout_ms`。
+| 行为 | 默认 | `--nostop`（`board-control` 的默认） |
+|---|---|---|
+| 回合步数上限（`spec.total_steps`） | 到点就停 | **不设上限**（一直跑，Ctrl-C 停） |
+| `terminated` / `truncated` | 结束本轮 | **忽略**，继续跑 |
+| 碰撞 | 本来就是惩罚事件、不终止（`--collision-terminates` 才终止） | 同上 |
+| 显式 `--max-steps` / `--max-seconds` | 生效 | **仍然生效**（显式永远优先） |
 
-`ActionFrameFormat`：`fields`、`bits_per_field`、`scale`、`offset`、`semantics`。
+实测对照（回合约 60 步，要求跑 120 步）：`board-control` → `ran 120 steps
+truncated=True`；`play --input board`（不带 `--nostop`）→ `ran 60 steps`。
 
-未配置时：
+### 3.4 为什么这条链路重要：绕开"平台收不收合成按键"这个未知
 
-```python
->>> PlaceholderHardwareInputAdapter().open()
-HardwareInterfaceNotConfigured: [HARDWARE_INPUT_INTERFACE_TBD] board input is not configured yet
->>> adapter.read_payload()
-HardwareInterfaceNotConfigured: [HARDWARE_INPUT_INTERFACE_TBD] no transport is configured ...
-```
+真实比赛平台吃不吃软件合成按键（SendInput）一直是链路上唯一没法离线验证的一环。
+把**仿真器当平台**之后，板子的决策直接用 `@MOVE n` 驱动仿真，**不需要键盘注入**，
+于是"板子→平台"这一段可以现在就闭环验证；真实平台那条路留着按需再验。
 
-**它拒绝返回动作，而不是编造一个。** 这是有意为之：答辩时"我们还没有确定板卡协议"
-是诚实且正确的状态，"我们猜了一个"才是风险。
+### 3.5 怎么验（不需要板子）
 
-### 3.3 拿到板卡后要做的三件事
+`tests/test_board_link.py`（17 条）：解析器与键盘桥逐批对账、stdin/UDP 传输、
+**看门狗回中**、CLI 把板子信号喂进仿真、以及 `--nostop` 真的跑过回合终点
+（对照组用不带 `--nostop` 的 `run`）。都给的是假信号（管道 / 本地 socket），
+所以 CI 里也能跑。
 
-1. 在 `hardware_interface/tbd.py` 里把 `PlannedTransport` / `ActionFrameFormat`
-   填成真实值（或新建一个模块，不修改 placeholder 的默认值）；
-2. 实现一个 `HardwareInputAdapter` 子类：
-
-```python
-class MyBoardAdapter(HardwareInputAdapter):
-    transport = "uart"                       # 或实际选择
-    def open(self):
-        self.planned.require("kind", "baud_rate", "payload_format", "byte_order")
-        self._port = ...                     # 只在这里出现真实通信代码
-        self._open = True
-    def read_payload(self):
-        return self._port.read(self.planned.packet_bytes)   # 没新数据返回 None
-    def decode_payload(self, payload) -> Action:
-        ...                                  # 按真实帧格式解析成 Action
-```
-
-3. 接进仿真，**不改任何环境逻辑**：
-
-```python
-env.run(input_source=HardwareInputSource(MyBoardAdapter(...)))
-```
-
-### 3.4 今天可以验证的链路
-
-在真实板卡到来前，用 loopback harness 验证
-`Adapter -> Action -> World.step` 这条链路是通的：
-
-```python
-from bullet_sim.hardware_interface import LoopbackHardwareInputAdapter, HardwareInputSource
-adapter = LoopbackHardwareInputAdapter()
-adapter.hold(Action.from_discrete("up_left"))
-env.run(input_source=HardwareInputSource(adapter), steps=1000)
-```
-
-`LoopbackHardwareInputAdapter` / `RecordedHardwareInputAdapter` **不是协议猜测**，
-它们是测试夹具，`planned.kind` 保持 `None`。
-
----
+> 历史说明：`tbd.py` 里的 `HARDWARE_INPUT_INTERFACE_TBD` 与
+> `PlaceholderHardwareInputAdapter` **保留着** —— 当**没有**给任何传输参数时，
+> 它仍然是默认（拒绝产出，而不是猜一个协议）。协议未定那段时间的记录见 §3.1 的
+> 实现史与 `git log`。
 
 ## 4. 状态上行（Simulator → CPU → FPGA）
 

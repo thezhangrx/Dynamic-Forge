@@ -77,6 +77,7 @@ def make_play_source(
     actions: Any = None,
     seed: int = 0,
     switchable: bool = True,
+    board: dict[str, Any] | None = None,
 ) -> PlaySource:
     """Resolve ``mode`` into a ready-to-use ``ActionSource``.
 
@@ -130,7 +131,11 @@ def make_play_source(
     if key == "null":
         return PlaySource(NullActionSource(), "null")
 
-    # random / board / anything else that source_from already understands
+    if key == "board":
+        # 板子输入：传输参数由 CLI 收好（--port / --udp / --stdin），见 board_link.py
+        return PlaySource(source_from("board", **(board or {})), "board")
+
+    # random / anything else that source_from already understands
     src = source_from(key, seed=seed)
     ctrl = getattr(src, "provider", None)
     return PlaySource(src, key, controller=ctrl)
