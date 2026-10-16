@@ -367,3 +367,23 @@ def test_pix_overflow_tool_is_hardware_safe() -> None:
     assert "return fails ? 1 : 0" in c, "断言不成立时必须用非零退出码报告"
     assert "*(volatile" not in c or "*ctl = 0x0u" in c, \
         "收尾要把像素源切回 din_*（0），否则后续 run_frame 会以为还有像素"
+
+
+def test_soak_tools_are_read_only_and_wait_for_the_app() -> None:
+    """长跑工具的两条硬约束：采样只读、等程序出现（别固定 sleep）。"""
+    sh = (TOOLS / "soak_loop.sh").read_text(encoding="utf-8")
+    assert "pidof vision_board_devmem" in sh, "要按进程名找 PID"
+    assert "for _ in $(seq 1 60)" in sh, \
+        "必须**轮询**等程序出现：相机热身要几秒，固定 sleep 会白跑一整轮（踩过）"
+    assert "pkill -INT -x" in sh, "停程序按进程名精确匹配（不用 -f）"
+    assert "kill -9" not in sh and "killall" not in sh, "绝不用 -9"
+    c = (TOOLS / "soak_sampler.c").read_text(encoding="utf-8")
+    assert "OFF_PIXSTAT" in c and "OFF_CTRL" in c and "OFF_FLEN" in c
+    # 采样器只能读。⚠ 要排除**指针声明行**（`volatile uint32_t *ctrl = ...` 里也含
+    # `*ctrl =`，按字面查会把声明判成写 —— 这条断言第一次就是这么误报的）。
+    body = "\n".join(ln for ln in c.splitlines() if "volatile uint32_t *" not in ln)
+    for bad in ("*ctrl =", "*pstat =", "*flen ="):
+        assert bad not in body, f"采样器不该写寄存器（发现 {bad}）"
+    assert "uint32_t c = *ctrl" in c, "采样器应当只读这三个寄存器"
+    assert "read_frame" not in sh, \
+        "别拿 read_frame 顶替采样：它会写 CTRL 启动一整帧，搅乱正在跑的闭环"
