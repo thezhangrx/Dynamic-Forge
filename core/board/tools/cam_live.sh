@@ -127,13 +127,21 @@ fi
 #     平台于是把角色丢在那儿不动（或偶尔误检一下就往一边推）。
 #   * 墙在屏幕上 (240,160,48)，相机里 r-b 只剩 20~57（PL 判墙要 >40），
 #     又亮又橙的墙被洗成白的 → 墙段消失、缺口无从谈起。
-#   * `saturation` 拉到 100（最大）+ `brightness` 压到 80 之后（实测）：
-#     角色稳定检出（填充度 74~76%，4/4 帧）、墙恢复成橙色（2 段墙 + 缺口）。
+#   * `saturation` 拉到 100（最大）+ `brightness` 压到 70~80 之后（实测）：
+#     角色稳定检出（填充度 74~76%）、墙恢复成橙色 —— 但**墙的判定在实时链路里
+#     卡在阈值上**（见下面 2.5 的实测表），5 个单位的 brightness 就能让它翻面。
 #   * ⚠ 手动曝光在这颗 sensor 上是坏的：`exposure_auto=1` + 10…2500 全部过曝
 #     （画面均值 253），所以只能靠 brightness/saturation 调，曝光留给自动。
 # 需要时用 CAM_BRIGHTNESS / CAM_SATURATION 覆盖；`CAM_BRIGHTNESS=128` 回到旧行为。
+# ⚠ 2026-10-17 实测（真板子 + 全屏仿真窗口 + 原样场景，120 帧/档，看的是**板子自己的
+#   几何帧**里 half_w>=20 的墙段个数）—— 墙的判定**卡在阈值上**，5 个单位就翻面：
+#       brightness  50  60  70  75  80  90 100
+#       有墙的帧     12   8  44   0  ~2   3   3   （/120）
+#       有角色的帧  117 104  77 120 ~120  92 120
+#   所以默认取 70（唯一能让墙稳定出现的一档）；**这只是权宜**：真正该做的是在 PS 侧
+#   做一次像素预调理（提色度 + 压高光）再推给 PL，让墙不再靠曝光"刚好"过阈值。
 CAM_SATURATION=${CAM_SATURATION:-100}
-CAM_BRIGHTNESS=${CAM_BRIGHTNESS:-80}
+CAM_BRIGHTNESS=${CAM_BRIGHTNESS:-70}
 v4l2-ctl -d "$DEV" -c saturation=$CAM_SATURATION -c brightness=$CAM_BRIGHTNESS >/dev/null 2>&1 \
     && echo "[cam_live] 颜色: saturation=$CAM_SATURATION brightness=$CAM_BRIGHTNESS（拍屏幕时必需，见脚本注释）"
 
