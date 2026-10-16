@@ -387,3 +387,18 @@ def test_soak_tools_are_read_only_and_wait_for_the_app() -> None:
     assert "uint32_t c = *ctrl" in c, "采样器应当只读这三个寄存器"
     assert "read_frame" not in sh, \
         "别拿 read_frame 顶替采样：它会写 CTRL 启动一整帧，搅乱正在跑的闭环"
+
+
+def test_cam_live_never_crops_horizontally() -> None:
+    """相机宽度与流水线不同时必须**缩放**，不能裁 —— 裁掉的是半个视野。
+
+    `crop=640:360:0:Y` 对 640x480 是对的（裁中间几行、视野不变）；但如果换成
+    1280x720，同一条 crop 会把 1280 宽的画面**只取左半边**：右半场的平台看不见，
+    而且不报错，只表现为"检测不到东西"。所以 VF 的选择必须带上宽度的判断。
+    """
+    sh = (TOOLS / "cam_live.sh").read_text(encoding="utf-8")
+    code = "\n".join(ln for ln in sh.splitlines() if not ln.lstrip().startswith("#"))
+    assert 'CAM_W" -eq "$PIPE_W"' in code, \
+        "裁之前必须判断宽度相同（否则宽度不同时会把画面裁掉一半）"
+    assert "scale=${PIPE_W}:${PIPE_H}" in code, "宽度不同时要走缩放"
+    assert "crop=${PIPE_W}:${PIPE_H}:0:" in code, "宽度相同时才裁中间几行"
