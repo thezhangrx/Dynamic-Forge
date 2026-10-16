@@ -152,12 +152,17 @@ def _vision_top_reset_defaults() -> dict[str, int]:
 # ---------------------------------------------------------------------------
 # C 工具里的宏名 → vision_axi.v 的 localparam 名
 OFF_PAIRS = {
-    "OFF_CTRL":   "ADDR_CTRL",
-    "OFF_FLEN":   "ADDR_FLEN",
-    "OFF_FRAME":  "ADDR_FRAME",
-    "OFF_SEQ":    "ADDR_SEQ",
-    "OFF_STAMP0": "ADDR_STAMP0",
-    "OFF_STAMP1": "ADDR_STAMP1",
+    "OFF_CTRL":     "ADDR_CTRL",
+    "OFF_FLEN":     "ADDR_FLEN",
+    "OFF_FRAME":    "ADDR_FRAME",
+    "OFF_SEQ":      "ADDR_SEQ",
+    "OFF_STAMP0":   "ADDR_STAMP0",
+    "OFF_STAMP1":   "ADDR_STAMP1",
+    # 像素通路（PS 推像素那条）：`tools/pix_overflow.c` 只用这三个，
+    # 而它要在真芯片上灌满 FIFO —— 偏移漂了会去写别的寄存器，且不报错。
+    "OFF_PIXPUSH":  "ADDR_PIXPUSH",
+    "OFF_PIXSTAT":  "ADDR_PIXSTAT",
+    "OFF_PIXCTL":   "ADDR_PIXCTL",
 }
 
 
@@ -345,3 +350,20 @@ def test_run_loop_is_safe_and_self_restarting() -> None:
     assert "--probe" in sh, "开跑前必须先自检注入器（否则按键可能全打空）"
     assert "focus" in sh.lower() or "焦点" in sh, "必须提醒/报出焦点窗口"
     assert "data/fpga/loop_logs" in sh, "全程日志要落到 data/ 下"
+
+
+def test_pix_overflow_tool_is_hardware_safe() -> None:
+    """强制触发像素 FIFO 溢出的工具：只准碰像素寄存器，且必须能自证失败。
+
+    它要在**真芯片**上灌满 FIFO，所以"别碰不该碰的寄存器"是硬要求：写 CTRL 的
+    start 位会把流水线搅起来、写配置寄存器会把阈值弄乱。
+    """
+    c = (TOOLS / "pix_overflow.c").read_text(encoding="utf-8")
+    for off in ("OFF_PIXPUSH", "OFF_PIXSTAT", "OFF_PIXCTL"):
+        assert off in c, f"缺少 {off}"
+    assert "0x0C0" not in c and "OFF_CTRL" not in c, \
+        "不准碰 CTRL（start 位会把流水线搅起来）"
+    assert "0x000" not in c and "kOffConfig" not in c, "不准碰配置寄存器"
+    assert "return fails ? 1 : 0" in c, "断言不成立时必须用非零退出码报告"
+    assert "*(volatile" not in c or "*ctl = 0x0u" in c, \
+        "收尾要把像素源切回 din_*（0），否则后续 run_frame 会以为还有像素"

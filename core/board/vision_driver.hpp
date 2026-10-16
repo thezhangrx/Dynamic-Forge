@@ -181,6 +181,18 @@ public:
     //: 读 PIXSTAT：``[15:0]`` 还在缓冲的字节数，``[16]`` 溢出（粘滞），``[17]`` 还在放。
     uint32_t pixel_status() const;
 
+    //: 上一帧 `run_frame_push()` 推像素时**像素 FIFO 溢出**了吗？
+    //:
+    //: 为什么必须让调用方看见：溢出意味着 PL 收到的像素**不完整**，而产出的几何帧
+    //: 依然是"自洽的"（CRC 按实际产出算、长度也对）—— 校验**过得去**，几何却是错的。
+    //: 拿它去决策就是"合法但错"的动作，最难查。所以调用方应当把这一帧**当坏帧丢掉**，
+    //: 而不是只用它不打日志。
+    //:
+    //: 每帧 `run_frame_push()` 开头会 flush（粘滞位随之清零），所以这是**本帧**的状态。
+    bool last_push_overflowed() const { return last_push_overflowed_; }
+    //: 溢出的那一帧里 FIFO 还剩多少字节（诊断用，0 表示不适用）。
+    uint32_t last_push_buffered() const { return last_push_buffered_; }
+
     //: 把一帧 RGB（连续三元组，``w*h*3`` 字节，就是 PPM 的像素区）推进 PL，
     //: 然后取回几何帧字节。**调用方负责先 :meth:`set_pixel_source` 与
     //: :meth:`flush_pixels`。** 返回前会把像素源切回外部。
@@ -218,6 +230,8 @@ private:
     std::vector<uint8_t> finish_frame(int timeout_ms);
 
     FrameTiming timing_;
+    bool last_push_overflowed_ = false;
+    uint32_t last_push_buffered_ = 0;
 };
 
 }   // namespace vision_board

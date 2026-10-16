@@ -40,8 +40,11 @@ class FakePl final : public RegIo {
 public:
     //: 要"产出"的几何帧字节。
     std::vector<uint8_t> frame;
+    //: 读 PIXSTAT 时回什么：bit16 = 像素 FIFO 溢出粘滞位，低 16 位 = 剩余字节数。
+    uint32_t pixstat = 0;
 
     uint32_t read(uint32_t off) const override {
+        if ((off & 0xFFFu) == kOffPixStat) return pixstat;   // 像素 FIFO 状态由测试摆
         // CTRL 的读有副作用：模拟"帧算完了"。真硬件里这是异步的，
         // 驱动靠轮询等它 —— 这里用"第一次读报忙、第二次读报完"来还原那个时序。
         if ((off & 0xFFFu) == kOffCtrl && started_) {
@@ -197,6 +200,32 @@ int main() {
             threw = true;
         }
         CHECK(threw, "FLEN = 0 时必须抛，不能返回空帧当成功");
+    }
+
+    // ---- 8) 像素 FIFO 溢出必须被调用方**看见**（而不是只打一行日志）--------
+    //
+    // 为什么这条重要：溢出时 PL 收到的像素不完整，但产出的几何帧依然"自洽"
+    // （CRC 按实际产出算、长度也对）—— 校验过得去、几何是错的。调用方若不知道，
+    // 就会拿一张残缺图去决策并发动作（静默错的一类）。
+    {
+        FakePl pl;
+        pl.frame = make_frame(/*seq=*/1, /*stamp_ns=*/0);
+        VisionDriver drv(pl);
+        const std::vector<uint8_t> rgb(64u * 4u * 4u, 0x80u);   // 4 的倍数即可
+        (void)drv.run_frame_push(rgb.data(), rgb.size(), 1, 0, /*timeout_ms=*/200);
+        CHECK(!drv.last_push_overflowed(), "正常情况下不该报溢出");
+    }
+    {
+        FakePl pl;
+        pl.frame = make_frame(/*seq=*/1, /*stamp_ns=*/0);
+        pl.pixstat = (1u << 16) | 12345u;          // 粘滞位置起 + 还剩 12345 字节
+        VisionDriver drv(pl);
+        const std::vector<uint8_t> rgb(64u * 4u * 4u, 0x80u);
+        (void)drv.run_frame_push(rgb.data(), rgb.size(), 1, 0, /*timeout_ms=*/200);
+        CHECK(drv.last_push_overflowed(),
+              "PIXSTAT 的溢出位必须暴露给调用方（否则只能靠人看日志）");
+        CHECK(drv.last_push_buffered() == 12345u,
+              "剩余字节数也要带出来，便于定位");
     }
 
     std::printf("比对项 %d，不符 %d\n", g_checks, g_fail);

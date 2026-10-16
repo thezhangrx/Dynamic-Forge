@@ -727,6 +727,15 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "第 %d 帧：PL 推像素失败：%s\n", i, e.what());
                 ++bad; continue;
             }
+            if (drv->last_push_overflowed()) {
+                // 像素没喂全 → 几何帧"自洽但错"（CRC 会过）→ **丢掉这一帧**，
+                // 不能拿它去决策：对账也就没有意义了。
+                std::fprintf(stderr,
+                             "第 %d 帧：像素 FIFO 溢出（缓冲 %u 字节），几何不可信，"
+                             "本帧丢弃（不对账、不决策）\n",
+                             i, drv->last_push_buffered());
+                ++bad; continue;
+            }
             ++cmp_total;
             if (bytes.size() != bytes_ref.size()) {
                 ++cmp_bad;
@@ -753,6 +762,15 @@ int main(int argc, char** argv) {
                                             args.timeout_ms);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "第 %d 帧失败（推像素）：%s\n", i, e.what());
+                ++bad; continue;
+            }
+            if (drv->last_push_overflowed()) {
+                // 见上面那条：像素没喂全时几何"自洽但错"，必须当坏帧丢掉，
+                // 否则会拿一张残缺图去决策并发动作 —— 静默错的一类。
+                std::fprintf(stderr,
+                             "第 %d 帧：像素 FIFO 溢出（缓冲 %u 字节），几何不可信，"
+                             "本帧丢弃（不决策、不发动作）\n",
+                             i, drv->last_push_buffered());
                 ++bad; continue;
             }
         } else if (ref) {

@@ -149,11 +149,13 @@ std::vector<uint8_t> VisionDriver::run_frame_push(const uint8_t* rgb, size_t byt
     timing_.push_ms = std::chrono::duration<double, std::milli>(t_push1 - t_push0).count();
 
     const uint32_t st = pixel_status();
-    if (st & (1u << 16)) {
-        // 不抛异常：溢出后帧内容仍然可能是"合法的但错的"，交给上面的判据。
-        // 但一定要让调用方看见（这是最难查的一类失败）。
-        std::fprintf(stderr, "⚠ 像素 FIFO 溢出（缓冲 %u 字节）—— 这一帧不可信\n",
-                     st & 0xFFFFu);
+    last_push_overflowed_ = (st & (1u << 16)) != 0u;
+    last_push_buffered_ = (st & 0xFFFFu);
+    if (last_push_overflowed_) {
+        // 不抛异常：帧内容可能"合法但错"（CRC 按实际产出算，校验过得去），
+        // 交给调用方决定。但状态一定要暴露出去 —— 死在这类失败上最难查。
+        std::fprintf(stderr, "⚠ 像素 FIFO 溢出（缓冲 %u 字节）—— 这一帧不可信，"
+                             "调用方应当把本帧丢弃\n", last_push_buffered_);
     }
 
     // 把像素源切回去，免得后续 :meth:`run_frame` 以为还有像素进来

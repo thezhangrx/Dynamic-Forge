@@ -70,3 +70,24 @@ def test_icraft_backend_is_separate_translation_unit() -> None:
     icraft = BOARD / "vision_driver_icraft.cpp"
     assert icraft.exists(), "缺少 icraft 后端实现"
     assert "icraft-xrt" in icraft.read_text(encoding="utf-8")
+
+
+def test_main_drops_frames_with_pixel_fifo_overflow() -> None:
+    """像素 FIFO 溢出时，`main.cpp` 必须**丢掉这一帧**，不能只用日志提醒。
+
+    为什么单独立一条：溢出时几何帧是"自洽但错"的（CRC 按 PL 实际产出算、长度也对），
+    所以线协议校验**过得去**。如果只是打一行警告、继续拿它决策，就会发出一个
+    "合法但错"的动作 —— 这类失败最难查。两处调用点（`--verify-both` 与普通
+    `--via-pl`）都要有。
+    """
+    src = (BOARD / "main.cpp").read_text(encoding="utf-8")
+    assert src.count("last_push_overflowed()") == 2, \
+        "两处 run_frame_push 调用点都要检查溢出"
+    assert src.count("++bad; continue;") >= 4, "溢出帧要计入 bad 并跳过本帧"
+    # 驱动必须真的把状态暴露出来（而不是只有一句 fprintf）
+    hpp = (BOARD / "vision_driver.hpp").read_text(encoding="utf-8")
+    assert "bool last_push_overflowed() const" in hpp
+    assert "last_push_buffered() const" in hpp
+    cpp = (BOARD / "vision_driver.cpp").read_text(encoding="utf-8")
+    assert "last_push_overflowed_ = (st & (1u << 16)) != 0u" in cpp, \
+        "溢出状态要从 PIXSTAT 的 bit16 取（粘滞位）"

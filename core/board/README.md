@@ -352,4 +352,5 @@ ffmpeg -f v4l2 -i /dev/video0 -frames:v 1 -pix_fmt rgb24 /root/cam.ppm
 | 5 | ~~上板实测~~ | ✅ 已完成（2026-10-15）：自检通过、8 帧全解码、决策 8 帧、**72～77 帧/秒**；键盘行串口实收。见 `core/fpga/docs/板上验证.md` §4/§6 |
 | 6 | **RP2040 那一端** | 板子侧已验（串口实收 `@MOVE n`）；RP2040 要刷 CircuitPython + 拷 `adafruit_hid` + 接两根线。见 `core/rp2040_keyboard/README.md` |
 | 7 | ~~动作怎么送到 PC（零接线）~~ | ✅ 已完成：`--keyboard-dev stdout` + SSH 管道 + `pc_key_driver.py --stdin`，真机验过 |
+| 7.5 | ~~像素 FIFO 溢出路径~~ | ✅ 三层都验了：RTL 行为（协同仿真 `tb_axi --fifo`）、**真芯片粘滞位与 flush 恢复**（`tools/pix_overflow.c`：盲写 8 KB 内不丢、16 KB 时置位）、**应用层丢帧**（驱动暴露 `last_push_overflowed()`，`main.cpp` 两处调用点把溢出帧计入 bad 并跳过决策）——溢出帧的几何是"自洽但错"（CRC 会过），只打日志就决策是最难查的一类错 |
 | 8 | **平台收不收合成按键** | 唯一还没验的一环，只能人眼判：`pc_key_driver.py --press 1,2,3,4 --arm --delay-s 5`（先把平台窗口点成焦点），有方向动了就说明 C 路成立、RP2040 不用买 |
