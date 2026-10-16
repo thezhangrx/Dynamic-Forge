@@ -245,6 +245,11 @@ class HardwareInputSource:
             return None
         return action
 
+    def hud_line(self, now: float | None = None) -> str | None:
+        """把适配器的"链路状态"一行透出去（渲染器只认这个方法名，不认板子）。"""
+        fn = getattr(self.adapter, "hud_line", None)
+        return fn(now) if callable(fn) else None
+
     def describe(self) -> dict[str, Any]:
         return {"name": self.name, "adapter": self.adapter.describe()}
 

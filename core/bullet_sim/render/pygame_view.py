@@ -542,12 +542,25 @@ class PygameRenderer:
             active = getattr(source, "active", None)
             held = getattr(active, "pressed_keys", None)
         help_text = "[TAB] manual/auto   [H] hud   [ESC] quit"
+        extra = [help_text + (f"   held={sorted(held)}" if held else "")]
+        # 任何输入源都能补一行自己的状态（板子链路用它显示"有没有收到信号"）。
+        # 渲染器只认 `hud_line()` 这个方法名，不认识"开发板"这个概念。
+        for cand in (source, getattr(source, "adapter", None)):
+            fn = getattr(cand, "hud_line", None)
+            if callable(fn):
+                try:
+                    line = fn()
+                except Exception:
+                    line = None
+                if line:
+                    extra.insert(0, str(line))
+                break
         lines = hud_lines(
             world,
             fps=fps,
             source=source,
             controller=self._active_controller(),
-            extra=[help_text + (f"   held={sorted(held)}" if held else "")],
+            extra=extra,
         )
         y = 4
         for line in lines:
@@ -690,6 +703,18 @@ class PygameRenderer:
         }
         name = mapping.get(key)
         return DISCRETE_ACTION_INDEX.get(name, 0) if name else None
+
+    def alive(self) -> bool:
+        """窗口还活着吗？
+
+        ⚠ 必须单独有这个方法：**点窗口右上角的 × 时 SDL 不一定投递 `pygame.QUIT`**
+        （WSLg 上实测过），而 `--nostop` 不设步数上限 —— 那就变成"窗口没了、进程还在
+        跑"（用户看到的就是卡死）。每帧问一次这个，就没有那条路。
+        """
+        try:
+            return bool(pygame.display.get_init()) and not self.closed
+        except Exception:
+            return False
 
     def close(self) -> None:
         if self._initialized:

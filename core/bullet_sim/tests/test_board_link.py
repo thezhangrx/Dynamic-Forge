@@ -276,3 +276,115 @@ def test_cli_missing_serial_port_explains_itself() -> None:
     assert "打不开串口" in msg, msg
     assert "--stdin" in msg and "--udp" in msg, f"要给两条替代路：\n{msg}"
     assert "usbipd" in msg, f"WSL 里要给 usbipd 的提示：\n{msg}"
+
+
+# ---------------------------------------------------------------------------
+# 5) 看得见：链路状态一行 + 没信号要自己提醒
+# ---------------------------------------------------------------------------
+def test_hud_line_shows_whether_the_board_is_talking() -> None:
+    """`hud_line()` 是"板子到底有没有在发"的唯一直接证据。
+
+    为什么必须钉：板子静默时，画面和"板子在发 stay"**长得一模一样**，
+    没有这一行就只能盯着不动的角色猜。用户已经这么猜过一次了。
+    """
+    ad = UdpBoardAdapter(port=0, hold_s=0.05)
+    ad.open()
+    try:
+        assert "还没收到任何动作行" in ad.hud_line(), ad.hud_line()
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sk.sendto(b"@MOVE 1\n", ("127.0.0.1", ad.port))
+        _drain(ad, 1)
+        line = ad.hud_line()
+        assert "1 行" in line and "-1.00" in line, line
+        time.sleep(0.08)
+        assert "断流中" in ad.hud_line(), ad.hud_line()
+        sk.close()
+    finally:
+        ad.close()
+
+
+def test_adapter_warns_once_when_nothing_arrives(capsys) -> None:
+    """3 秒没有**任何**动作行就提醒一次（提醒里要给出三条排查方向）。"""
+    ad = UdpBoardAdapter(port=0, hold_s=0.05, warn_after_s=0.05)
+    ad.open()
+    try:
+        time.sleep(0.08)               # ⚠ 要真的等过阈值：poll 本身是微秒级，
+        ad.poll(0.01)                  #   光靠多 poll 几次时间根本不会过去（这条一开始就这么错的）
+        err = capsys.readouterr().err
+        assert "没收到任何 @MOVE 行" in err, err
+        for token in ("--keyboard-dev stdout", "--stdin", "--udp"):
+            assert token in err, f"提醒里应当给出排查方向 {token}：\n{err}"
+        # 提醒过之后继续轮询：不能刷屏（**不要**重置那个标志 —— 那等于主动让它再提醒）
+        for _ in range(20):
+            ad.poll(0.01)
+        assert capsys.readouterr().err == "", "只该提醒一次，不能刷屏"
+    finally:
+        ad.close()
+
+
+def test_renderer_reports_when_the_window_is_gone() -> None:
+    """窗口没了必须能问出来（`alive()`）——这是"关窗卡死"的兜底。
+
+    实测（WSLg）：点窗口右上角的 × 时 SDL **不一定**投递 `pygame.QUIT`，
+    而 `--nostop` 不设步数上限，唯一出口就是那个事件 —— 收不到就变成
+    "窗口没了、进程还在跑"。所以每帧问一次 `alive()`。
+    """
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    import pygame
+    from bullet_sim.render.base import make_renderer
+    from bullet_sim.simulator.env import BulletHellEnv
+    from bullet_sim.tests.helpers import blank_spec
+
+    env = BulletHellEnv(blank_spec(), seed=0)
+    env.reset(seed=0)
+    r = make_renderer("human", scale=1.0, interactive=False, input_source=None)
+    try:
+        r.render(env.world)
+        assert r.alive() is True
+        pygame.display.quit()                  # 等价于"显示没了"
+        assert r.alive() is False, "显示销毁后 alive() 必须为 False"
+    finally:
+        r.close()
+        env.close()
+
+
+def test_play_loop_checks_liveness_and_survives_render_errors() -> None:
+    """主循环必须①每帧判活②渲染失败也退 —— 两条都不能只在真机上才发现。"""
+    src = (ROOT / "core" / "bullet_sim" / "cli.py").read_text(encoding="utf-8")
+    assert 'getattr(renderer, "alive", None)' in src, "每帧要问 renderer.alive()"
+    assert "渲染失败（窗口多半已经关掉）" in src, "渲染异常要退而不是崩/卡"
+    # 退出方式要在一开始就说清楚（--nostop 自己不会停）
+    assert "ESC" in src and "Ctrl-C" in src
+
+
+# ---------------------------------------------------------------------------
+# 6) 「一直跑」必须能被**干净停掉**（用户实际踩到的"卡死"）
+# ---------------------------------------------------------------------------
+def test_nostop_run_can_be_stopped_cleanly() -> None:
+    """`--nostop`（不设步数上限）下，收到终止信号必须**收尾并出汇总**，不能装死。
+
+    为什么用 SIGTERM 而不是 SIGINT：**shell 用 `&` 起的后台作业会忽略 SIGINT**
+    （POSIX 规定），`kill -INT` 对谁都无效 —— 拿它测会得出"程序卡死"的错误结论
+    （我第一版就是这么误判的）。两者走的是同一个处理函数，SIGTERM 能测。
+    """
+    p = subprocess.Popen(
+        [sys.executable, "-m", "bullet_sim", "board-control", "--headless",
+         "--stdin", "--nostop", "--quiet", "--json"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cwd=str(ROOT), text=False,
+    )
+    try:
+        p.stdin.write(b"@MOVE 1\n")
+        p.stdin.flush()
+        time.sleep(3.0)
+        assert p.poll() is None, "`--nostop` 不该自己退出"
+        p.terminate()                       # SIGTERM
+        out, _ = p.communicate(timeout=10)
+    finally:
+        if p.poll() is None:
+            p.kill()
+    text = out.decode("utf-8", "replace")
+    assert p.returncode == 0, f"应当干净退出，实际 rc={p.returncode}\n{text}"
+    payload = json.loads(text)
+    assert payload["interrupted"] is True, f"应当标记 interrupted：{text}"
+    assert payload["steps"] > 0, "收尾时要返回已经跑出来的统计"

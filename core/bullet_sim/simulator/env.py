@@ -301,21 +301,28 @@ class BulletHellEnv:
         info = self._last_info
         import itertools
 
-        for _ in (itertools.count() if unlimited else range(int(n))):
-            if needs_observation:
-                action = source.poll_observation(obs, info)
-            else:
-                polled = source.poll(self.spec.dt)
-                action = polled if polled is not None else last_action
-            last_action = action
-            raw = action_to_codec_input(
-                action, self.world.codec, float(self.world.player[P_SPEED])
-            )
-            obs, reward, terminated, truncated, info = self.step(raw)
-            rewards.append(float(reward))
-            collision_events += int(info["collision_events"])
-            if stop_on_done and (terminated or truncated):
-                break
+        _interrupted = False
+        try:
+            for _ in (itertools.count() if unlimited else range(int(n))):
+                if needs_observation:
+                    action = source.poll_observation(obs, info)
+                else:
+                    polled = source.poll(self.spec.dt)
+                    action = polled if polled is not None else last_action
+                last_action = action
+                raw = action_to_codec_input(
+                    action, self.world.codec, float(self.world.player[P_SPEED])
+                )
+                obs, reward, terminated, truncated, info = self.step(raw)
+                rewards.append(float(reward))
+                collision_events += int(info["collision_events"])
+                if stop_on_done and (terminated or truncated):
+                    break
+        except KeyboardInterrupt:
+            # 「一直跑」（steps=None + stop_on_done=False）时 Ctrl-C 是**正常出口**：
+            # 收尾并把已经跑出来的统计返回，调用方还能打印汇总。以前异常直接穿过去，
+            # `source.close()` 不执行、汇总也没了 —— 看起来就像"卡死"。
+            _interrupted = True
         source.close()
         metrics = self.world.episode_metrics()
         return {
@@ -334,6 +341,7 @@ class BulletHellEnv:
             "state_hash": self.world.state_hash(),
             "terminated": bool(terminated),
             "truncated": bool(truncated),
+            "interrupted": bool(_interrupted),
             "final_info": info,
             "input_source": getattr(source, "name", type(source).__name__),
             "input_mode": getattr(source, "mode", getattr(source, "name", "?")),

@@ -94,7 +94,9 @@ class BoardInputAdapter(HardwareInputAdapter):
 
     transport = "board"
 
-    def __init__(self, *, hold_s: float = DEFAULT_HOLD_S, **kwargs: Any) -> None:
+    def __init__(self, *, hold_s: float = DEFAULT_HOLD_S,
+                 warn_after_s: float = 3.0, quiet: bool = False,
+                 **kwargs: Any) -> None:
         # ⚠ CLI 会把一堆通用参数一起塞进来（stdin/udp/port/seed/...），只把基类认识的
         #   传下去 —— 否则一句 "unexpected keyword argument 'stdin'" 就会把整次演示
         #   卡在启动阶段，而错误信息看上去跟"板子没信号"毫无关系。
@@ -102,6 +104,13 @@ class BoardInputAdapter(HardwareInputAdapter):
         # ⚠ 这里**不再**走 `PlannedTransport.require()`：协议已经定了，不是占位。
         super().__init__(**base)
         self.hold_s = float(hold_s)
+        #: 打开后多少秒还没收到**任何**动作行就提醒一次（0 = 不提醒）。
+        #: 为什么要有：板子静默时画面和"板子在发 stay"**长得一模一样**，
+        #: 没有这句话人只能盯着不动的角色猜（已经这么猜过一次了）。
+        self.warn_after_s = float(warn_after_s)
+        self.quiet = bool(quiet)
+        self._warned_no_signal = False
+        self._opened_t = 0.0
         self._buf = bytearray()
         self._pending: list[int] = []
         self._last_action: Action = Action.zero()
@@ -127,6 +136,8 @@ class BoardInputAdapter(HardwareInputAdapter):
         self._pending.clear()
         self._last_action = Action.zero()
         self._last_line_t = time.monotonic()      # 刚打开时不该立刻判成"断流"
+        self._opened_t = self._last_line_t
+        self._warned_no_signal = False
         self._open = True
 
     def close(self) -> None:
@@ -151,9 +162,24 @@ class BoardInputAdapter(HardwareInputAdapter):
         """动作号 → ``Action``（走仿真现成的离散解码，不另立一张表）。"""
         return coerce_action(int(payload))
 
+    def _warn_if_silent(self) -> None:
+        if (self.quiet or self._warned_no_signal or self.warn_after_s <= 0
+                or self.n_actions > 0 or not self._open):
+            return
+        if time.monotonic() - self._opened_t < self.warn_after_s:
+            return
+        self._warned_no_signal = True
+        import sys as _sys
+        print(f"⚠ 已经 {self.warn_after_s:.0f} 秒没收到任何 @MOVE 行 —— 板子可能在静默。查：\n"
+              f"    ① 板子上那条命令真的在跑吗（要看得到 --keyboard-dev stdout）\n"
+              f"    ② 传输选对了吗（--stdin / --udp / --port）\n"
+              f"    ③ 看门狗是不是把它回中了（断流超过 {self.hold_s:.2f}s）",
+              file=_sys.stderr)
+
     def poll(self, dt: float) -> Action | None:
         """读 + 解码；**没有新动作但断流时返回"回中"**（看门狗）。"""
         action = super().poll(dt)
+        self._warn_if_silent()
         if action is not None:
             self._last_action = action
             return action
@@ -163,6 +189,22 @@ class BoardInputAdapter(HardwareInputAdapter):
                 self.n_holds += 1
                 return self._last_action
         return None
+
+    def hud_line(self, now: float | None = None) -> str:
+        """给屏幕 HUD 用的一行"板子链路状态"。
+
+        为什么必须有：板子没在发信号时，**画面和"板子在发 stay"长得一模一样** ——
+        没有这一行，人就只能盯着不动的角色猜（已经这么猜过一次了）。
+        """
+        t = time.monotonic() if now is None else now
+        age = (t - self._last_line_t) if self._last_line_t else float("inf")
+        if self.n_actions == 0:
+            return f"board     : **还没收到任何动作行**（{age:.1f}s）"
+        d = self._last_action.direction
+        who = "stay" if (d[0] == 0.0 and d[1] == 0.0) else f"({d[0]:+.2f},{d[1]:+.2f})"
+        tag = "  ⚠断流中" if age > self.hold_s else ""
+        return (f"board     : {self.n_actions} 行  最后 {who}  {age:.2f}s 前"
+                f"  回中 {self.n_holds} 次{tag}")
 
     def describe(self) -> dict[str, Any]:
         data = super().describe()

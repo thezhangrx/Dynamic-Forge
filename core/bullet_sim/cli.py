@@ -740,6 +740,19 @@ def cmd_run(args: argparse.Namespace) -> int:
         codec=args.action_space or "action",
         **_collision_kwargs(args, spec),
     )
+    # 「一直跑」的无窗口路径也要能被干净停掉：不装处理函数的话 SIGTERM 是硬杀，
+    # 既不收尾（source.close()）也不出汇总。装成 KeyboardInterrupt，`env.run` 里
+    # 已经有对应的 except（它会收尾并返回已有统计）。
+    import signal as _signal
+    _prev = {}
+    def _on_signal(signum, frame):          # pragma: no cover - 真信号路径
+        raise KeyboardInterrupt
+    for _sig in (_signal.SIGINT, _signal.SIGTERM):
+        try:
+            _prev[_sig] = _signal.signal(_sig, _on_signal)
+        except (ValueError, OSError):
+            pass
+
     if getattr(args, "input", None):
         from bullet_sim.ai import make_play_source
 
@@ -762,6 +775,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         result = env.run(ctrl, steps=_run_steps(args, spec), seed=args.seed,
                          stop_on_done=not bool(getattr(args, "nostop", False)))
     env.close()
+    for _sig, _h in _prev.items():
+        try:
+            _signal.signal(_sig, _h)
+        except (ValueError, OSError):
+            pass
     if args.json:
         payload = {k: v for k, v in result.items() if k != "final_info"}
         payload["final_bullet_count"] = result["bullet_count"]
@@ -1042,8 +1060,36 @@ def cmd_play(args: argparse.Namespace) -> int:
     terminated = truncated = False
     from bullet_sim.prediction.danger_field import compute_danger_field
 
+    # ⚠ **必须自己装信号处理，而且要装在 pygame 初始化之后**：SDL2 会接管
+    #   SIGINT/SIGTERM 并把它翻译成 SDL_QUIT 事件，而在 WSLg/某些驱动下那个事件
+    #   到不了 `pygame.event.get()` —— 实测发 SIGINT 后进程状态一直是 R、8 秒都不退。
+    #   最后一个 `signal.signal()` 生效，所以这里装在 renderer 之后就能赢过 SDL。
+    import signal as _signal
+
+    _stop = {"flag": False}
+
+    def _on_signal(signum, frame):          # pragma: no cover - 真信号路径
+        _stop["flag"] = True
+        raise KeyboardInterrupt             # 让 sleep/阻塞调用立刻中断
+
+    _prev_handlers = {}
+    for _sig in (_signal.SIGINT, _signal.SIGTERM):
+        try:
+            _prev_handlers[_sig] = _signal.signal(_sig, _on_signal)
+        except (ValueError, OSError):       # 非主线程等场合
+            pass
+
+    # 退出方式要在一开始就说清楚：`--nostop` 不设步数上限，出口只有这几个。
+    if not args.quiet:
+        print("  退出: 窗口里按 ESC，或关窗口；终端里 Ctrl-C。"
+              "（--nostop 不设回合上限，所以自己不会停）", file=sys.stderr)
+        if mode == "board":
+            print("  等待板子信号 @MOVE n …（窗口标题栏不要最小化；"
+                  "HUD 里 board 那行会显示收到多少行）", file=sys.stderr)
+
     try:
-        while step_limit is None or steps_done < step_limit:
+        while (_stop["flag"] is False
+               and (step_limit is None or steps_done < step_limit)):
             if callable(getattr(source, "poll_observation", None)):
                 last_action = source.poll_observation(obs, info)
             else:
@@ -1069,13 +1115,29 @@ def cmd_play(args: argparse.Namespace) -> int:
                 except Exception:  # pragma: no cover - overlay must never break the loop
                     renderer.danger = None
             frame_index += 1
-            renderer.render(env.world)
+            # ⚠ 窗口被关掉时 SDL 不一定投递 pygame.QUIT（WSLg 上实测过），
+            #   而 `--nostop` 不设步数上限 —— 那就变成"窗口没了、进程还在跑"（卡死）。
+            #   所以每一帧都判一次显示是否还活着，渲染失败也直接退。
+            alive = getattr(renderer, "alive", None)
+            if callable(alive) and not alive():
+                print("窗口已关闭（显示子系统已退出），收工", file=sys.stderr)
+                break
+            try:
+                renderer.render(env.world)
+            except Exception as exc:
+                print(f"渲染失败（窗口多半已经关掉）：{exc}", file=sys.stderr)
+                break
             if renderer.closed or ((terminated or truncated) and not nostop):
                 break
             time.sleep(frame_dt)
     except KeyboardInterrupt:
         pass
     finally:
+        for _sig, _h in _prev_handlers.items():
+            try:
+                _signal.signal(_sig, _h)
+            except (ValueError, OSError):
+                pass
         source.close()
         renderer.close()
         env.close()
@@ -1089,6 +1151,10 @@ def cmd_play(args: argparse.Namespace) -> int:
           f"  ({metrics['collision_count_mode']})")
     print(f"reward       : {metrics['cumulative_reward']:+.2f}")
     print(f"input source : {getattr(source, 'name', type(source).__name__)}")
+    fn = getattr(source, "hud_line", None)
+    link = fn() if callable(fn) else None
+    if link:
+        print(f"link status  : {link}")
     if hasattr(source, "switch_count"):
         print(f"mode switches: {source.switch_count}  history="
               f"{[(e.from_mode, e.to_mode) for e in source.history]}")
