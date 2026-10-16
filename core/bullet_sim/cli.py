@@ -1008,7 +1008,18 @@ def cmd_play(args: argparse.Namespace) -> int:
 
     source = play.source
     obs, info = env.reset(seed=args.seed)
-    source.open()
+    try:
+        source.open()
+    except Exception as exc:
+        # 输入源打不开（串口不在 / 被占 / UDP 端口占用）就**别开窗**、也别甩 traceback：
+        # 说清楚怎么修，然后退出。以前这里直接崩，用户会以为是"窗口出不来"。
+        print(f"输入源打不开，比赛场没起来：\n{exc}", file=sys.stderr)
+        try:
+            renderer.close()
+        except Exception:
+            pass
+        env.close()
+        return 2
     from bullet_sim.action import Action
 
     last_action = Action.zero()

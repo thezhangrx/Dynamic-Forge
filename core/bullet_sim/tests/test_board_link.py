@@ -260,3 +260,19 @@ def test_board_signal_up_moves_the_other_axis() -> None:
     finally:
         ad.close()
         env.close()
+
+
+def test_cli_missing_serial_port_explains_itself() -> None:
+    """串口不在时**不能甩 traceback、也不能开一个没输入的空窗**。
+
+    这条是用户实际踩到的：`--port /dev/ttyUSB0` 在没 attach 的 WSL 里直接崩，
+    而崩在"开窗之前"，所以看起来像是"平台弹窗出不来"。现在要退 2 并说清楚
+    设备在不在、以及两条不需要串口的路（--stdin / --udp）。
+    """
+    r = _cli(["board-control", "--port", "/dev/definitely-not-a-port"])
+    assert r.returncode == 2, f"应当退 2，实际 {r.returncode}"
+    msg = (r.stdout + r.stderr).decode()
+    assert "Traceback" not in msg, f"不该甩 traceback：\n{msg}"
+    assert "打不开串口" in msg, msg
+    assert "--stdin" in msg and "--udp" in msg, f"要给两条替代路：\n{msg}"
+    assert "usbipd" in msg, f"WSL 里要给 usbipd 的提示：\n{msg}"

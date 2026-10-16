@@ -250,11 +250,35 @@ class SerialBoardAdapter(BoardInputAdapter):
     def _open_transport(self) -> None:
         try:
             import serial                     # pyserial
+            from serial.tools import list_ports
         except ImportError as exc:            # pragma: no cover - 环境问题
             raise RuntimeError(
                 "读串口需要 pyserial：pip install pyserial"
             ) from exc
-        self._ser = serial.serial_for_url(self.port, self.baud, timeout=0)
+        try:
+            self._ser = serial.serial_for_url(self.port, self.baud, timeout=0)
+        except Exception as exc:
+            # 换成能照着做的提示。原始 traceback 只会让人以为"程序坏了"，
+            # 而真正的原因通常是**串口没挂到 WSL**（CP210x 要 usbipd attach），
+            # 或者被 MobaXterm 占着。
+            ports = [p.device for p in list_ports.comports()]
+            hint = [
+                f"打不开串口 {self.port}：{exc}",
+                f"  当前系统里的串口：{', '.join(ports) if ports else '（一个都没有）'}",
+            ]
+            if not ports:
+                hint += [
+                    "  一个串口都没有 → 设备没接到这台机器上。WSL 里要先把 USB 串口"
+                    "挂进来（Windows 侧、需要管理员）：",
+                    "      usbipd list",
+                    "      usbipd attach --wsl --busid <CP210x 的 BUSID>",
+                    "  不想动 usbipd 的话，用另外两条路（都不需要串口）：",
+                    "      --stdin   （ssh 板子 '... --keyboard-dev stdout' | ...）",
+                    "      --udp PORT（板子 --keyboard-dev udp://本机IP:PORT）",
+                ]
+            else:
+                hint.append("  设备在、但打不开 → 多半被别的程序占着（MobaXterm / 串口助手）")
+            raise RuntimeError("\n".join(hint)) from exc
 
     def _read_bytes(self) -> bytes:
         if self._ser is None:
