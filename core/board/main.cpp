@@ -18,6 +18,7 @@
 // （验收口径 `tier` 逐位一致 + 浮点量 rel_err < 1e-9，10 条交叉验证用例见
 // `core/cpu/tests/test_cpp_gap_avoid.py`）。
 // ===========================================================================
+#include "fiducial_zone.hpp"
 #include "gap_avoid.hpp"
 #include "motion.hpp"
 #include "action_codec.hpp"
@@ -468,23 +469,13 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
     //: 真角色就被推着**往边上钻**，然后卡在边上（相机能看见，但检出漂移）。
     //: 所以：落在标记 footprint 里的"角色"记录一律**当没检出**（这一帧 stay），
     //: 宁可不动，也不拿一个已知是标记的位置去发指令。
-    bool player_on_fiducial = false;
-    if (f.player.present) {
-        const double half = args.fiducial_side / 2.0;
-        const double zone = half + args.fiducial_slack;   // 半边长（场地单位）
-        const double cx[2] = {args.fiducial_margin + half,
-                              args.field_w - args.fiducial_margin - half};
-        const double cy[2] = {args.fiducial_margin + half,
-                              args.field_h - args.fiducial_margin - half};
-        for (int ix = 0; ix < 2 && !player_on_fiducial; ++ix) {
-            for (int iy = 0; iy < 2 && !player_on_fiducial; ++iy) {
-                if (std::fabs(f.player.x - cx[ix]) <= zone &&
-                    std::fabs(f.player.y - cy[iy]) <= zone) {
-                    player_on_fiducial = true;
-                }
-            }
-        }
-    }
+    fiducial_zone::Zone zone;
+    zone.field_w = args.field_w;
+    zone.field_h = args.field_h;
+    zone.side = args.fiducial_side;
+    zone.margin = args.fiducial_margin;
+    zone.slack = args.fiducial_slack;
+    const bool player_on_fiducial = f.player.present && zone.contains(f.player.x, f.player.y);
     if (player_on_fiducial) ++st.n_player_on_fiducial;
     const bool player_ok = f.player.present && !player_on_fiducial;
 
