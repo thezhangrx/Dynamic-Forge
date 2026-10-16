@@ -104,11 +104,20 @@ void StdinPump::recycle(std::vector<uint8_t>&& buf) {
     if (free_.size() < 4) free_.push_back(std::move(buf));
 }
 
+//: 单调时钟（纳秒）。用它而不是墙钟：stamp 要的是"帧之间的真实间隔"，
+//: 墙钟会被 NTP 跳变污染（跳一次 → 某一帧的 dt 变成负数或巨大）。
+uint64_t mono_ns() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 bool StdinPump::get(std::vector<uint8_t>* out, std::string* why) {
     std::unique_lock<std::mutex> lk(m_);
     cv_.wait(lk, [this] { return !ready_.empty() || done_; });
     if (ready_.empty()) { *why = why_; return false; }
-    *out = std::move(ready_.front());
+    last_stamp_ns_ = ready_.front().second;
+    *out = std::move(ready_.front().first);
     ready_.pop_front();
     cv_.notify_all();                 // 叫醒读线程：腾出位置了
     return true;
@@ -159,9 +168,12 @@ void StdinPump::run() {
             got += static_cast<size_t>(n);
         }
         ++local_got;
+        // ⚠ 时间戳打在这里（**读完这一帧的那一刻**），不是主循环取走它的时候：
+        //   主循环取走时已经过了推像素/等流水线，那会把处理耗时算进 dt，速度偏小。
+        const uint64_t ts = mono_ns();
         {
             std::lock_guard<std::mutex> lk(m_);
-            ready_.push_back(std::move(buf));
+            ready_.emplace_back(std::move(buf), ts);
         }
         cv_.notify_all();
     }

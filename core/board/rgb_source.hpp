@@ -97,6 +97,15 @@ public:
 
     //: 取一帧（阻塞直到有帧或结束）。false = 没有更多帧了，原因见 :meth:`why`。
     bool get(std::vector<uint8_t>* out, std::string* why);
+
+    //: 上一帧 `get()` 拿到的像素是**什么时候读进来的**（CLOCK_MONOTONIC 纳秒）。
+    //:
+    //: 为什么要它：几何帧的 `stamp_ns` 是"采集时刻"，而速度是 `Δ位置 / Δstamp`。
+    //: 以前主循环每帧固定 `+= 33.3 ms`（30 fps），可相机实测交付 **40~48 fps** ——
+    //: 于是推出来的速度被系统性缩小 (30/实际fps) 倍（40 fps 时低 28%，60 fps 时低一半），
+    //: 而决策的 `t_arr = 距离 / v_n` 直接吃这个数。让读线程在读完后打时间戳，
+    //: 才是真正的"采集间隔"，也把"处理耗时"排除在 dt 之外（同 `to_standard.py` 的纪律）。
+    uint64_t last_stamp_ns() const { return last_stamp_ns_; }
     //: 把用完的缓冲还回空闲池（省一次分配；不还也不影响正确性）。
     void recycle(std::vector<uint8_t>&& buf);
     int skipped() const { return skipped_; }
@@ -112,10 +121,12 @@ private:
     std::thread th_;
     std::mutex m_;
     std::condition_variable cv_;
-    std::deque<std::vector<uint8_t>> ready_;   // 已读好的帧
+    //: 已读好的帧 + 它的**采集时刻**（读线程读完那一刻，纳秒）
+    std::deque<std::pair<std::vector<uint8_t>, uint64_t>> ready_;
     std::deque<std::vector<uint8_t>> free_;    // 可复用的缓冲
     bool done_ = false;
     std::string why_;
+    uint64_t last_stamp_ns_ = 0;
 };
 
 }   // namespace vision_board

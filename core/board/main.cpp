@@ -80,6 +80,11 @@ struct Args {
     std::string ppm_file;           // 单张图（每帧重复用它）
     std::string ppm_dir;            // 目录（%06d.ppm，与协同仿真的激励同命名）
     std::string track_log_path;     // --track-log 的路径（main 里开成 FILE*）
+    //: 离线帧序列（--ppm/--ppm-dir）合成时间戳用的帧率。
+    //: ⚠ 必须与素材的真实帧间隔一致，否则推出来的速度会整体差一个倍数：
+    //:   例：60fps 的素材按 30fps 打戳 → 速度算小一半（而决策的 t_arr 直接吃它）。
+    //: 实时路径（--stdin-rgb）**不用**这个值 —— 那边用读线程打下的真实采集时刻。
+    double ppm_fps = 30.0;
     //: 逐帧轨迹日志（`--track-log FILE`）：原始矩形 + 跟踪器状态。
     //: 只为**验证速度估计**用：光看"推出来的速度"没法区分"东西真在动"和
     //: "检测框在抖" —— 必须把原始位置一起落盘才能离线算差分。
@@ -135,6 +140,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--verify-both")  a.verify_both = true;
         else if (k == "--ppm-dir")      a.ppm_dir = next();
         else if (k == "--track-log")    a.track_log_path = next();
+        else if (k == "--ppm-fps")      a.ppm_fps = std::atof(next());
         else if (k == "--keyboard-dev") a.keyboard_dev = next();
         else if (k == "--no-keyboard")  a.keyboard_dev.clear();
         else if (k == "--action-deadzone") a.action_deadzone = std::atof(next());
@@ -161,6 +167,10 @@ Args parse_args(int argc, char** argv) {
                 "  --echo-action        把动作号也打到 stdout。\n"
                 "  --track-log FILE     逐帧把原始矩形与跟踪器状态写成文本（验证速度估计用：\n"
                 "                       只有原始位置落盘，才分得清「真在动」和「框在抖」）。\n"
+                "  --ppm-fps F          离线帧序列合成时间戳用的帧率，默认 30。\n"
+                "                       ⚠ 要和素材真实帧间隔一致，否则速度整体差一个倍数\n"
+                "                       （60fps 素材按 30 打戳 → 速度算小一半）。\n"
+                "                       实时路径不用它：那边用读线程打下的真实采集时刻。\n"
                 "  --ppm FILE           几何帧改由 PS 上跑 C 参考模型产出（单张图，重复用）。\n"
                 "                       **真摄像头就走这条**：\n"
                 "                         ffmpeg -f v4l2 -i /dev/video0 -frames:v 1 o.ppm\n"
@@ -689,6 +699,10 @@ int main(int argc, char** argv) {
                 ++bad; break;
             }
             pw = kPlWidth; ph = kPlHeight;
+            // 用读线程打下的**真实采集时刻**当 stamp：固定步长会让速度系统性偏小
+            // （相机实测 40~48 fps，按 30fps 打戳就低 28%~50%）。
+            const uint64_t cam_ts = pump->last_stamp_ns();
+            if (cam_ts != 0) stamp_ns = cam_ts;
         } else if (src) {
             std::string swhy;
             if (!src->next(&rgb, &pw, &ph, &swhy)) {
@@ -828,7 +842,8 @@ int main(int argc, char** argv) {
                          "⚠ 帧缓冲溢出位置位 —— 上一帧比窗口(2048B)还长。\n"
                          "  查 n_obs/n_gaps 是不是爆了（障碍上限 32、缺口上限 16）。\n");
         }
-        stamp_ns += 33'333'333ull;      // 30 fps 的步长
+        // 离线序列：按 --ppm-fps 合成步长（实时路径已在上面用真实采集时刻覆盖）
+        stamp_ns += static_cast<uint64_t>(1e9 / args.ppm_fps + 0.5);
     }
 
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
