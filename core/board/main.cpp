@@ -69,6 +69,13 @@ struct Args {
     double field_h = 480.0;         // 场高
     double player_speed = 200.0;    // 速度上限
     double dt_default = 1.0 / 30.0; // 首帧没有上一帧 stamp 时用
+    //: 四角标定标记（平台契约，`core/standard/fiducial.py`）：
+    //: 黑边外沿边长 + 到场地边的距离。板子用它们**排除"把标记当角色"**。
+    double fiducial_side = 48.0;
+    double fiducial_margin = 8.0;
+    //: 标记周围还要额外留多少（场地单位）才算"这是标记不是角色"。
+    //: 相机有透视/量化误差，标记的留白边也比黑边外沿大一圈（48 → 64）。
+    double fiducial_slack = 12.0;
     // 键盘桥：决策算出的速度 → 动作号 → "@MOVE <n>\n" → 板子控制台 TX。
     // RP2040 的 GP1 就接在控制台 TX 上（见 core/rp2040_keyboard/README.md），
     // 它从共享的控制台流里挑出带 @MOVE 前缀的行。空串 = 不发。
@@ -132,6 +139,9 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--field-h")      a.field_h = std::atof(next());
         else if (k == "--player-speed") a.player_speed = std::atof(next());
         else if (k == "--dt-default")   a.dt_default = std::atof(next());
+        else if (k == "--fiducial-side")   a.fiducial_side = std::atof(next());
+        else if (k == "--fiducial-margin") a.fiducial_margin = std::atof(next());
+        else if (k == "--fiducial-slack")  a.fiducial_slack = std::atof(next());
         else if (k == "--ppm")          a.ppm_file = next();
         else if (k == "--via-pl")       a.via_pl = true;
         else if (k == "--stdin-rgb")    a.stdin_rgb = true;
@@ -219,6 +229,8 @@ struct DecisionState {
     bool have_prev_stamp = false;
     int n_decisions = 0;
     int n_failed = 0;
+    //: 有几帧的"角色"落在四角标定标记上（被当没检出）—— 见 decide() 里的说明。
+    int n_player_on_fiducial = 0;
     int tier_count[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // 见 tier_bucket()
 };
 
@@ -450,7 +462,33 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
     // 都被当成静止的 —— 而训练环境里它们是有速度的，两边判据就不是一回事了。
     const double t_now = static_cast<double>(f.header.stamp_ns) * 1e-9;
     double pvx = 0.0, pvy = 0.0;
+    //: 四角标定标记是**已知位置**的亮块（`standard.fiducial`：边长 48、离边 8，
+    //: 留白边还有 8）—— 实测它们的填充度会偶尔越过 `player_min_fill_pct=45`，
+    //: 于是几何帧里"角色"会突然跳到某个角落。板子如果照着那个位置发指令，
+    //: 真角色就被推着**往边上钻**，然后卡在边上（相机能看见，但检出漂移）。
+    //: 所以：落在标记 footprint 里的"角色"记录一律**当没检出**（这一帧 stay），
+    //: 宁可不动，也不拿一个已知是标记的位置去发指令。
+    bool player_on_fiducial = false;
     if (f.player.present) {
+        const double half = args.fiducial_side / 2.0;
+        const double zone = half + args.fiducial_slack;   // 半边长（场地单位）
+        const double cx[2] = {args.fiducial_margin + half,
+                              args.field_w - args.fiducial_margin - half};
+        const double cy[2] = {args.fiducial_margin + half,
+                              args.field_h - args.fiducial_margin - half};
+        for (int ix = 0; ix < 2 && !player_on_fiducial; ++ix) {
+            for (int iy = 0; iy < 2 && !player_on_fiducial; ++iy) {
+                if (std::fabs(f.player.x - cx[ix]) <= zone &&
+                    std::fabs(f.player.y - cy[iy]) <= zone) {
+                    player_on_fiducial = true;
+                }
+            }
+        }
+    }
+    if (player_on_fiducial) ++st.n_player_on_fiducial;
+    const bool player_ok = f.player.present && !player_on_fiducial;
+
+    if (player_ok) {
         const motion::Point pp{f.player.x, f.player.y};
         if (!motion::track_one(st.player_motion, pp, t_now, &pvx, &pvy)) {
             // 时间戳坏了（倒流/NaN）：重起时基，这一帧速度为 0。
@@ -458,14 +496,17 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
             st.player_motion.reset();
             pvx = pvy = 0.0;
         }
+    } else {
+        pvx = pvy = 0.0;                 // 没角色（或那是标定标记）：不留旧速度
+        st.player_motion.reset();
     }
 
     // ---- 角色 ----
     const double player[7] = {
-        f.player.present ? f.player.x : args.field_w * 0.5,
-        f.player.present ? f.player.y : 0.0,
+        player_ok ? f.player.x : args.field_w * 0.5,
+        player_ok ? f.player.y : 0.0,
         pvx, pvy,
-        f.player.present ? f.player.radius : 10.0,
+        player_ok ? f.player.radius : 10.0,
         args.player_speed,
         1.0,
     };
@@ -536,15 +577,17 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
 
     const gap_avoid::Decision d = gap_avoid::plan(world, st.mem, st.cfg, 2.0);
     gap_avoid::Vec2 cmd = gap_avoid::to_command(d);
-    if (!f.player.present) {
-        // 角色没检出来时，上面用的位置是**兜底值**（场地中线）—— 拿它发指令等于
-        // 闭着眼睛开：实测在仿真器画面上漏检角色时，指令会恒定不变、平台一直朝
-        // 一个方向走且永不收敛（角色早就顶上边了还在"左"）。
-        // 所以这一帧只发 stay，并把原因打出来。
+    if (!player_ok) {
+        // 角色没检出来（或检出来的位置正好是四角标定标记）时，上面用的位置是
+        // **兜底值**（场地中线）—— 拿它发指令等于闭着眼睛开：实测漏检角色时指令会
+        // 恒定不变、平台一直朝一个方向走且永不收敛；而"把角落标记当角色"更糟，
+        // 它会照着角落把真角色往边上推。所以这一帧只发 stay，并把原因打出来。
         cmd.x = 0.0;
         cmd.y = 0.0;
         if (args.verbose) {
-            std::fprintf(stderr, "  ⚠ 本帧没检出角色 → 只发 stay（不拿兜底位置发指令）\n");
+            std::fprintf(stderr, player_on_fiducial
+                ? "  ⚠ 本帧的「角色」落在四角标定标记上 → 只发 stay（不拿标记当角色）\n"
+                : "  ⚠ 本帧没检出角色 → 只发 stay（不拿兜底位置发指令）\n");
         }
     }
     ++st.n_decisions;
@@ -585,12 +628,16 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
                          i < asg.size() ? asg[i] : -1);
         }
         std::fprintf(args.track_log, "P %.6f %.6f %.6f %.6f\n",
-                     f.player.present ? f.player.x : 0.0,
-                     f.player.present ? f.player.y : 0.0, pvx, pvy);
+                     player_ok ? f.player.x : 0.0,
+                     player_ok ? f.player.y : 0.0, pvx, pvy);
         std::fflush(args.track_log);
     }
     if (rects.empty()) std::printf("  [无矩形障碍]");
-    if (!f.player.present) std::printf("  [无角色，按场宽中线/半径 10 兜底]");
+    if (!player_ok) {
+        std::printf(player_on_fiducial
+            ? "  [角色落在四角标定标记上，当没检出]"
+            : "  [无角色，按场宽中线/半径 10 兜底]");
+    }
     if (dt_is_default) std::printf("  [dt=默认，无上一帧 stamp]");
     std::printf("\n");
     return cmd;
@@ -943,6 +990,10 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("\n");
+        if (st.n_player_on_fiducial > 0) {
+            std::printf("其中 %d 帧的「角色」落在四角标定标记上（已当没检出，只发 stay）\n",
+                        st.n_player_on_fiducial);
+        }
     }
 
     delete io;      // icraft/devmem 后端是 new 出来的

@@ -519,3 +519,13 @@ ffmpeg -f v4l2 -i /dev/video0 -frames:v 1 -pix_fmt rgb24 /root/cam.ppm
 | 7 | ~~动作怎么送到 PC（零接线）~~ | ✅ 已完成：`--keyboard-dev stdout` + SSH 管道 + `pc_key_driver.py --stdin`，真机验过 |
 | 7.5 | ~~像素 FIFO 溢出路径~~ | ✅ 三层都验了：RTL 行为（协同仿真 `tb_axi --fifo`）、**真芯片粘滞位与 flush 恢复**（`tools/pix_overflow.c`：盲写 8 KB 内不丢、16 KB 时置位）、**应用层丢帧**（驱动暴露 `last_push_overflowed()`，`main.cpp` 两处调用点把溢出帧计入 bad 并跳过决策）——溢出帧的几何是"自洽但错"（CRC 会过），只打日志就决策是最难查的一类错 |
 | 8 | **平台收不收合成按键** | 唯一还没验的一环，只能人眼判：`pc_key_driver.py --press 1,2,3,4 --arm --delay-s 5`（先把平台窗口点成焦点），有方向动了就说明 C 路成立、RP2040 不用买 |
+
+---
+
+## 8. 向真实小车迁移
+
+**接缝在"场地坐标几何"**：只换前端（图像 → 场地单位下的墙段/缺口 + 小车自身位姿），
+下游 `motion`（推速度）→ `gap_avoid`（决策）→ `action_codec`（动作号）→ 线协议
+**一律不动**。斜视地面投影、只看见前方一两个标记、小车自己就是"角色"、车身盲区、
+以及"先在仿真里造一个虚拟斜视相机当试验台"的具体做法，见
+[`docs/CAR_MIGRATION.md`](docs/CAR_MIGRATION.md)。
