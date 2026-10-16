@@ -282,3 +282,49 @@ def test_jump_does_not_corrupt_an_established_velocity():
     assert tracks[0].x == pytest.approx(2.0 * 20 + 24.0), "位置要落位"
     assert tracks[0].vx == pytest.approx(v_before), \
         f"单帧跳变不该改写已有速度：{v_before} → {tracks[0].vx}"
+
+
+# --------------------------------------------------------------------------
+# 快速起步：物体**出现时就在动**（轨迹刚建立，速度从 0 起）
+#
+# 实测（30fps）：常规 β=0.0728 下要 19 帧才追到 90%，而决策的 t_arr = 距离/v_n
+# 直接吃这个速度 —— 墙刚在以 60/s 逼近时 t_arr 会被高估成 45 s（真 3.3 s）。
+# 仿真里速度是真值、没有这个滞后，所以这是**部署与训练不一致**的一处来源。
+# --------------------------------------------------------------------------
+def test_fast_start_converges_when_object_appears_moving():
+    V, DT = 60.0, 1.0 / 30.0
+
+    def frames_to_90(**kw):
+        tr, err = Tracker(**kw), []
+        for k in range(40):
+            err.append(abs(tr.update([(V * k * DT, 0.0)], k * DT)[0].vx - V))
+        for k in range(len(err)):
+            if err[k] <= 0.1 * V:
+                return k
+        return None
+
+    slow = frames_to_90(fast_updates=0)
+    fast = frames_to_90()
+    assert slow is not None and fast is not None
+    assert fast <= 8, f"快速起步后应当 8 帧内追到 90%，实测 {fast} 帧"
+    assert fast < slow, f"必须比常规 β 快：{fast} vs {slow}"
+
+
+def test_fast_start_does_not_change_steady_state_noise():
+    """代价只在轨迹头几帧；**稳态**噪声必须与常规 β 完全一样（否则就是拿噪声换收敛）。"""
+    import random
+    def steady(**kw):
+        rng = random.Random(7)
+        tr, vs = Tracker(**kw), []
+        for k in range(150):
+            t = tr.update([(100.0 + rng.gauss(0, 0.5), 50.0 + rng.gauss(0, 0.5))],
+                          k * 1.0 / 30.0)[0]
+            if k >= 40:
+                vs.append(abs(t.vx))
+        vs.sort()
+        return vs[int(len(vs) * 0.9)]
+    # ⚠ 不能要求"逐位相同"：快速起步改变了前几帧的状态，两条轨迹是**同一个随机过程的
+    #   两次不同实现**，采到的样本自然不同。口径是"稳态噪声量级一致"（都在 1 单位/秒
+    #   上下，而真实速度是 15~200）。
+    a, b = steady(), steady(fast_updates=0)
+    assert abs(a - b) <= 1.0, f"稳态噪声不该被快速起步改变：{a} vs {b}"

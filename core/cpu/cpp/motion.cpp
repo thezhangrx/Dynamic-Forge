@@ -107,14 +107,18 @@ bool Tracker::update(const Point* dets, int n_dets, double stamp) {
                 ++t.suspect;
                 t.x = z.x;
                 t.y = z.y;
+                t.boot = 0;            // 位置跳变 → 速度不认，快速起步重新起算
                 ++n_relocalized_;
             } else {
                 // 正常帧，或者**连续可疑**（那说明是真运动）：照常 α-β
                 t.suspect = 0;
                 t.x = p.x + cfg_.alpha * rx;
                 t.y = p.y + cfg_.alpha * ry;
-                t.vx += (cfg_.beta / dt) * rx;
-                t.vy += (cfg_.beta / dt) * ry;
+                // 速度刚建立/刚清零的那几帧用大 β 追上（见 Config::fast_updates）
+                const double b = (t.boot < cfg_.fast_updates) ? cfg_.fast_beta : cfg_.beta;
+                t.vx += (b / dt) * rx;
+                t.vy += (b / dt) * ry;
+                ++t.boot;
             }
         }
         t.stamp = stamp;

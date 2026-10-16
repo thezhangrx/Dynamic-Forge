@@ -296,3 +296,12 @@ def test_fast_target_and_jump_guard_match(cli: pathlib.Path) -> None:
     assert cpp2[-1]["tracks"][0]["x"] == 2.0 * 20 + 24.0, "位置要落位"
     assert cpp2[-1]["tracks"][0]["vx"] == pytest.approx(cpp2[-2]["tracks"][0]["vx"]), \
         "单帧跳变不该改写已有速度"
+
+
+def test_fast_start_matches(cli: pathlib.Path) -> None:
+    """**出现时就在动**的目标：两侧的快速起步必须给出同一串速度。"""
+    frames = [(k / 30.0, [(60.0 * k / 30.0, 0.0)]) for k in range(40)]
+    cpp, py = _run_cpp(cli, frames), _run_python(frames)
+    _cmp(cpp, py, label="出现即在动（快速起步）")
+    assert cpp[-1]["tracks"][0]["vx"] == pytest.approx(60.0, abs=2.0), \
+        "跑道末帧速度应当基本追上真值"

@@ -76,6 +76,8 @@ class Track:
     age: int = 1
     #: 连续「可疑」（残差超阈值）的帧数；一旦某帧正常就清零。
     suspect: int = 0
+    #: 距上次"速度被清零/刚建立"过了几帧（快速起步用；每帧匹配都 +1）。
+    boot: int = 0
 
     @property
     def speed(self) -> float:
@@ -131,7 +133,21 @@ class Tracker:
     #: 取值依据：本平台 **30fps** 下墙的最快步长在 2 个单位/帧量级（间隙扫描
     #: ~30-60 px/s），8 已经是它的 4 倍；而那个假跳变是 24。
     max_residual: float = 8.0
-    #: 连续多少帧可疑才**改判**成"真运动"（然后照常做 α-β 更新）。
+    #: 「快速起步」：轨迹的速度**刚被清零/刚建立**时，先用 ``fast_beta`` 追几帧，
+    #: 再回到常规 ``beta``。（默认 0 = 关，保持既有行为不变。）
+    #:
+    #: 为什么需要（实测，30fps）：常规 β=0.0728 下，运动突然开始后估计要 **7 帧**
+    #: 才追到 50%、**19 帧**到 90%、**25 帧**到 95%。而决策的 ``t_arr = 距离 / v_n``
+    #: 直接吃这个速度 —— 墙刚以 60/s 逼近时，``t_arr`` 会被高估成 **45 s（真 3.3 s）**，
+    #: 12 帧后仍偏 1.8 倍。仿真里速度是真值、没有这个滞后，所以这是**部署与训练不一致**
+    #: 的一处来源。
+    #:
+    #: 而噪声地板（同一批实测）低得多：静止目标叠 σ=0.5 px 抖动时，常规 β 只凭空造出
+    #: 0.8 单位/秒（90% 位 2.0）；σ=1 px 也才 1.6/4.1。真实速度是 15~200 单位/秒，
+    #: 所以**有余量**用几帧大 β 换收敛速度。
+    fast_updates: int = 3
+    #: 快速起步阶段用的 β（只在速度刚清零/刚建立后的 ``fast_updates`` 帧内生效）。
+    fast_beta: float = 0.3
     #:
     #: ⚠ 这一条是**必须**的，不能只看单帧残差：跑得快的目标在速度还没建立起来时
     #: 残差本来就大（≈ 每帧步长）。只用"残差 > 阈值就丢"会让**任何**步长大于阈值
@@ -210,6 +226,7 @@ class Tracker:
                 # 第一帧或大间隔：直接落位，速度保持 0
                 t.x, t.y = zx, zy
                 t.vx = t.vy = 0.0
+                t.boot = 0            # 速度清零 → 快速起步重新起算
             else:
                 px, py = predicted[ti]
                 rx, ry = zx - px, zy - py
@@ -220,14 +237,18 @@ class Tracker:
                     # 那正是我们要修的老行为）。
                     t.suspect += 1
                     t.x, t.y = zx, zy
+                    t.boot = 0            # 位置跳变 → 速度不认，快速起步重新起算
                     self._n_relocalized += 1
                 else:
                     # 正常帧，或者**连续可疑**（说明那真是持续运动）：照常 α-β
                     t.suspect = 0
                     t.x = px + self.alpha * rx
                     t.y = py + self.alpha * ry
-                    t.vx += (self.beta / dt) * rx
-                    t.vy += (self.beta / dt) * ry
+                    # 速度刚建立/刚清零的那几帧用大 β 追上（见 fast_updates 的实测）
+                    b = self.fast_beta if t.boot < self.fast_updates else self.beta
+                    t.vx += (b / dt) * rx
+                    t.vy += (b / dt) * ry
+                    t.boot += 1
             t.stamp = float(stamp)
             t.hits += 1
             t.misses = 0

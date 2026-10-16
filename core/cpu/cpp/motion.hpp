@@ -65,6 +65,13 @@ struct Config {
     //: -66 px/s 的假横向速度（真实运动只有 15~30 px/s）。8 是"最快真实步长
     //: （~2 单位/帧）"的 4 倍，又远小于那个 24。
     double max_residual = 8.0;
+    //: 「快速起步」：轨迹速度**刚被清零/刚建立**时，先用 `fast_beta` 追几帧再回到
+    //: 常规 `beta`。实测依据（30fps，见 core/vision/motion.py 同名字段）：
+    //: 常规 β 下"物体出现时就在动"要 19 帧才追到 90%；fast 3 帧 β=0.3 只要 7 帧；
+    //: 代价是轨迹头几帧会凭空造出速度（σ=0.5px 抖动下峰值 19 单位/秒，中位 3）。
+    int fast_updates = 3;
+    //: 快速起步阶段用的 β。
+    double fast_beta = 0.3;
     //: 连续多少帧可疑才**改判**成"真运动"（然后照常 α-β 更新）。
     //: ⚠ 必须有：只看单帧残差的话，任何步长 > max_residual 的目标永远拿不到速度
     //: （速度恒 0、位置却看着对 —— 静默错）。这条是既有测试
@@ -84,6 +91,8 @@ struct Track {
     int age = 1;
     //: 连续"可疑"（残差超阈值）的帧数；一旦某帧正常就清零。
     int suspect = 0;
+    //: 距上次"速度被清零/刚建立"过了几帧（快速起步用）。
+    int boot = 0;
 
     double speed() const { return std::hypot(vx, vy); }
     double heading() const {
