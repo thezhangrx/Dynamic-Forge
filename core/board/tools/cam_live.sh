@@ -118,6 +118,25 @@ if [ "${FPS_PRIORITY:-0}" = "1" ]; then
         && echo "[cam_live] FPS_PRIORITY=1：已关掉「为长曝光降帧率」（画面可能偏暗）" >&2
 fi
 
+# ---- 2.5) 颜色/亮度：**拍屏幕时必须调** -------------------------------------
+#
+# 为什么必须调（2026-10-16 实测，相机对着仿真窗口的屏幕）：
+#   * 相机默认 brightness=128 → 画面均值 180，**整个场地被拍成灰白**：
+#     PL 判"亮色"的条件是 min(RGB)>195，于是场地自己就成了"亮块"，
+#     角色（白圆）淹没在里面 —— 实测 500 帧里**一帧都没检出角色**，
+#     平台于是把角色丢在那儿不动（或偶尔误检一下就往一边推）。
+#   * 墙在屏幕上 (240,160,48)，相机里 r-b 只剩 20~57（PL 判墙要 >40），
+#     又亮又橙的墙被洗成白的 → 墙段消失、缺口无从谈起。
+#   * `saturation` 拉到 100（最大）+ `brightness` 压到 80 之后（实测）：
+#     角色稳定检出（填充度 74~76%，4/4 帧）、墙恢复成橙色（2 段墙 + 缺口）。
+#   * ⚠ 手动曝光在这颗 sensor 上是坏的：`exposure_auto=1` + 10…2500 全部过曝
+#     （画面均值 253），所以只能靠 brightness/saturation 调，曝光留给自动。
+# 需要时用 CAM_BRIGHTNESS / CAM_SATURATION 覆盖；`CAM_BRIGHTNESS=128` 回到旧行为。
+CAM_SATURATION=${CAM_SATURATION:-100}
+CAM_BRIGHTNESS=${CAM_BRIGHTNESS:-80}
+v4l2-ctl -d "$DEV" -c saturation=$CAM_SATURATION -c brightness=$CAM_BRIGHTNESS >/dev/null 2>&1 \
+    && echo "[cam_live] 颜色: saturation=$CAM_SATURATION brightness=$CAM_BRIGHTNESS（拍屏幕时必需，见脚本注释）"
+
 # ---- 3) 一次开设备、连续出帧、原始 RGB 走管道 → 板子程序 -------------------
 if [ "$CAM_MODE" = "mjpg" ]; then
     IN_FMT=mjpeg

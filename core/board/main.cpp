@@ -471,10 +471,25 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
     };
 
     // ---- 障碍：只取矩形（决策的 group_walls 只认矩形）----
+    //
+    // ⚠ **丢掉退化矩形**：PL 的游程检测会把屏幕上的**一条细线**（场地外框、
+    //   网格线、窗口边、反光边缘）也输出成"矩形" —— 实测相机画面里这些假矩形
+    //   宽 3~6 px、half_h ≤ 0，而且**每帧出现在同一个位置**。它们进决策的后果
+    //   很具体：几何帧里一会儿 1 个、一会儿 6 个矩形，`gap_avoid` 找错缺口、
+    //   跟踪器给墙推出一帧 188 一帧 5 的假速度，平台于是"左右乱跑"。
+    //   真正的墙：half_w ≈ 90、half_h ≈ 3（640 宽画面里横贯半场）。
+    //   这里按**绝对像素尺寸**过滤，比调阈值更不容易误伤（墙最薄也有 2 px）。
+    static const double kMinRectHalfW = 12.0;   // px（pipeline 坐标）
+    static const double kMinRectHalfH = 1.0;
     std::vector<gap_avoid::Rect> rects;
     rects.reserve(f.obstacles.size());
+    int n_degenerate = 0;
     for (const GeometryObstacle& o : f.obstacles) {
         if (!o.is_rect()) continue;
+        if (!(o.half_w >= kMinRectHalfW) || !(o.half_h >= kMinRectHalfH)) {
+            ++n_degenerate;      // NaN 也走这里（比较为假）
+            continue;
+        }
         gap_avoid::Rect r;
         // ⚠ `o.id` 是**当帧序号**（RTL: `seg_id <= n_obs + 1`），跨帧不稳定，
         //   所以这里只当标签用；跨帧配速度靠跟踪器的位置关联（见 motion.hpp）。
@@ -541,6 +556,7 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
                 std::isfinite(d.gap) ? d.gap : -1.0,
                 std::isfinite(d.usable_half) ? d.usable_half : -1.0,
                 d.n_rects);
+    if (n_degenerate > 0) std::printf("（丢了 %d 个退化矩形）", n_degenerate);
     // 推出来的速度也打出来：线协议不带它，"到底推没推、推得对不对"只能看这一行。
     // 墙速取**最大**的那个（有多面墙时逐个打会把日志淹掉）。
     double wall_v = 0.0;

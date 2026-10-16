@@ -116,6 +116,7 @@ class PygameRenderer:
         wall_color: tuple[int, int, int] = WALL_COLOR,
         show_fiducials: bool = True,
         fiducial_side: float = 48.0,
+        show_field_border: bool = True,
         window_timeout_s: float = 20.0,
     ) -> None:
         self.mode = mode
@@ -189,6 +190,9 @@ class PygameRenderer:
         #: 位图与布局在 ``standard.fiducial``（平台画、视觉认，共享契约）。
         self.show_fiducials = bool(show_fiducials)
         self.fiducial_side = float(fiducial_side)
+        #: 场地外框那 1 像素的线。相机拍屏幕时它是一条**横贯画面的长线**，会被
+        #: 视觉判成矩形（实测：几何帧里多出一条贴底边的"墙"），板子在环里时关掉。
+        self.show_field_border = bool(show_field_border)
         #: 墙（矩形障碍）的颜色。**和视觉链路的契约**，见 ``WALL_COLOR``。
         self.wall_color = (int(wall_color[0]), int(wall_color[1]), int(wall_color[2]))
         self.viewport: Viewport | None = None
@@ -315,7 +319,8 @@ class PygameRenderer:
             int(min(x0, x1)), int(min(y0, y1)), int(abs(x1 - x0)), int(abs(y1 - y0))
         )
         pygame.draw.rect(screen, (34, 40, 55), field_rect)
-        pygame.draw.rect(screen, (60, 70, 95), field_rect, 1)
+        if self.show_field_border:
+            pygame.draw.rect(screen, (60, 70, 95), field_rect, 1)
         if self.show_world_axes:
             self._draw_world_axes(screen, world, vp)
 

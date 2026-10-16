@@ -220,6 +220,20 @@ def _add_play_args(p: argparse.ArgumentParser, *, input_default: str = "manual")
     p.add_argument("--calib-marker-color", default="800080",
                    help="reference colour as RRGGBB hex (default 800080 half-intensity magenta; "
                         "magenta is immune to the room's white glare)")
+    p.add_argument("--wall-color", default="F0A030",
+                   help="墙（矩形障碍）的颜色 RRGGBB。**这是和视觉链路的契约**：PL 判墙的"
+                        "条件是 r-b>40 且 r>110 且 g>60，而摄像头会把屏幕上**又亮又橙**的墙"
+                        "洗成白色（实测：屏幕 (240,160,48) → 相机里 r-b 只剩 20~60，"
+                        "半边被判成'亮'，墙就消失、缺口无从谈起）。把墙调得**更深更饱和**"
+                        "（例如 C83C00 = (200,60,0)）反而更耐洗。默认 F0A030")
+    p.add_argument("--no-fiducials", action="store_true",
+                   help="不画四角 ArUco 标定标记。板子在环里时建议加：标记**画在所有东西之上**，"
+                        "墙/角色经过角落会被它盖住；它本身也会被相机判成矩形/亮块，"
+                        "实测让几何帧里多出 1~7 个假矩形，决策跟着乱")
+    p.add_argument("--plain-field", action="store_true",
+                   help="**场地只留墙和角色**：不画网格、不画场地外框。相机拍屏幕时那一圈"
+                        "外框是一条横贯画面的长线，视觉会把它判成矩形（实测几何帧里多出"
+                        "一条贴底边的「墙」）；网格线同理会变成细长假矩形。板子在环里时加")
     p.add_argument("--scale", type=float, default=1.0)
     p.add_argument("--no-switch", action="store_true",
                    help="disable runtime MANUAL<->AUTO switching (no TAB binding)")
@@ -1192,6 +1206,10 @@ def cmd_play(args: argparse.Namespace) -> int:
             show_calibration_marker=args.calib_marker,
             calibration_marker=(args.calib_marker_w, args.calib_marker_h),
             calibration_marker_color=parse_hex_color(args.calib_marker_color),
+            wall_color=parse_hex_color(args.wall_color),
+            show_fiducials=not args.no_fiducials,
+            show_world_axes=not args.plain_field,
+            show_field_border=not args.plain_field,
         )
     except Exception as exc:
         print(f"cannot open a window ({exc}).", file=sys.stderr)
