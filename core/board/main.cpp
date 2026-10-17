@@ -18,6 +18,7 @@
 // （验收口径 `tier` 逐位一致 + 浮点量 rel_err < 1e-9，10 条交叉验证用例见
 // `core/cpu/tests/test_cpp_gap_avoid.py`）。
 // ===========================================================================
+#include "auto_params.hpp"
 #include "fiducial_zone.hpp"
 #include "segment_merge.hpp"
 #include "gap_avoid.hpp"
@@ -138,6 +139,19 @@ struct Args {
     //: 比对几何帧是否**逐字节相同**。这是"PL 吃真图"在真硅上的等价性判据
     //: —— 协同仿真的 `tb_axi --fifo` 证的是同一件事。
     bool verify_both = false;
+    //: `--auto-thresholds`（**默认关**，见下面的实测）/ `--no-auto-thresholds`。
+    //:
+    //: 逐像素分类的 7 个阈值**每帧由本帧统计推出**（见 auto_params.hpp）：
+    //: 真机上自动曝光把橙墙拍成淡粉白，(r-b) 只剩 10~30，固定 `(r-b)>40 && r>110`
+    //: 于是帧间翻转（实测 43% 的帧一个矩形都没有）。
+    //:
+    //: ⚠ 第一版自动阈值（全局 z 分数 / Otsu）在真机位上**更差**：这一轮实测
+    //:   `--auto-thresholds` 250 帧零矩形 100%，关掉只有 1%（ALIGN 218）。
+    //: 原因写在 auto_params.hpp 的注释里：整幅图被屏幕辉光抬成一个宽的中灰，
+    //: 全局直方图上"亮 83%"、谷值落在 88~142，背景的 d 又比墙还暖 ——
+    //: **全局统计量在这台相机上不成立**，必须走局部/结构判据（行带匹配滤波）。
+    //: 所以默认关，留作对照实验的开关。
+    bool auto_thresholds = false;
 
     std::string keyboard_dev = "/dev/ttyPS0";
     double action_deadzone = kDefaultDeadzone;
@@ -183,6 +197,8 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--stdin-rgb")    a.stdin_rgb = true;
         else if (k == "--timing")       a.timing = true;
         else if (k == "--skip-frames")  a.skip_frames = std::atoi(next());
+        else if (k == "--auto-thresholds")    a.auto_thresholds = true;
+        else if (k == "--no-auto-thresholds") a.auto_thresholds = false;
         else if (k == "--verify-both")  a.verify_both = true;
         else if (k == "--ppm-dir")      a.ppm_dir = next();
         else if (k == "--track-log")    a.track_log_path = next();
@@ -236,6 +252,7 @@ Args parse_args(int argc, char** argv) {
                 "  --green-gm N         覆盖「绿」的 G-max(R,B) 下限（默认 10）\n"
                 "  --green-min N        覆盖「绿」的 G 下限（默认 90）\n"
                 "  --verify-both        同一张图两条路都跑，比对几何帧是否逐字节相同\n"
+                "  --no-auto-thresholds 关掉每帧自动阈值（对照用；默认开）\n"
                 "                       （真硅上验「PL 吃真图」，与 tb_axi --fifo 同一性质）。\n",
                 argv[0], argv[0]);
             std::exit(0);
@@ -261,6 +278,17 @@ VisionParams effective_vision_params(const Args& a) {
     if (a.ov_bright_spread >= 0) p.bright_spread = a.ov_bright_spread;
     if (a.ov_green_gm >= 0)      p.green_gm = a.ov_green_gm;
     if (a.ov_green_min >= 0)     p.green_min = a.ov_green_min;
+    return p;
+}
+
+/// 把「本帧统计推出的阈值」并进有效阈值：**命令行显式给的仍然最优先**
+/// （`--wall-rb N` 说明人明确要看那个数，用来做对照实验）。
+VisionParams apply_auto_thresholds(const Args& a, VisionParams p,
+                                  const auto_params::Derived& d) {
+    if (a.ov_wall_rb < 0)       p.wall_rb = d.wall_rb;
+    if (a.ov_wall_min_r < 0)    p.wall_min_r = d.wall_min_r;
+    if (a.ov_wall_min_g < 0)    p.wall_min_g = d.wall_min_g;
+    if (a.ov_bright_min < 0)    p.bright_min = d.bright_min;
     return p;
 }
 
@@ -339,6 +367,32 @@ public:
         bright_.resize(1024 * 1024);
         rowc_.resize(4096);
         frame_.resize(8192);
+    }
+
+    //: 让参考模型用**与 PL 完全同一套**阈值 —— `--verify-both` 的前提。
+    //: 不设的话参考模型会用默认常量，自动阈值一开，两边比的就不是同一件事了。
+    void set_vision_params(const VisionParams& p) {
+        params_.wall_rb = p.wall_rb;
+        params_.wall_min_r = p.wall_min_r;
+        params_.wall_min_g = p.wall_min_g;
+        params_.bright_min = p.bright_min;
+        params_.bright_spread = p.bright_spread;
+        params_.green_gm = p.green_gm;
+        params_.green_min = p.green_min;
+        params_.band_row_pct = p.band_row_pct;
+        params_.band_join_rows = p.band_join_rows;
+        params_.band_min_rows = p.band_min_rows;
+        params_.field_col_min = p.field_col_min;
+        params_.wall_col_pct = p.wall_col_pct;
+        params_.wall_col_min = p.wall_col_min;
+        params_.edge_min = p.edge_min;
+        params_.edge_min_cols = p.edge_min_cols;
+        params_.min_seg_px = p.min_seg_px;
+        params_.min_gap_px = p.min_gap_px;
+        params_.player_min_area = p.player_min_area;
+        params_.player_max_area = p.player_max_area;
+        params_.player_min_fill_pct = p.player_min_fill;
+        params_.player_max_aspect_pct = p.player_max_aspect;
     }
 
     //: 用**外部给的**像素跑参考模型（与 :meth:`next` 的唯一区别是"图从哪来"）。
@@ -849,6 +903,7 @@ int main(int argc, char** argv) {
     uint64_t stamp_ns = 0;
     double sum_read = 0, sum_push = 0, sum_wait = 0, sum_total = 0;
     long n_timed = 0;
+    long n_auto_frames = 0;      // 用本帧统计推出阈值的帧数（--no-auto-thresholds 时为 0）
     // `--frames 0` = 不限帧数，一直跑到输入结束（实时采集用）
     const long want_frames = args.frames > 0 ? args.frames : 1000000000L;
     for (int i = 0; i < want_frames; ++i) {
@@ -884,6 +939,27 @@ int main(int argc, char** argv) {
                     "  （PL 的 WIDTH/HEIGHT 是编译期常量；要换尺寸得改 RTL 重建位流）\n",
                     i, pw, ph, kPlWidth, kPlHeight);
                 ++bad; break;
+            }
+        }
+
+        // ---- 每帧自动阈值：用**这一帧自己的统计**推 7 个分类阈值 -----------
+        // 必须在推像素**之前**写寄存器：PL 的逐像素比较器读的就是这 21 个数。
+        // 统计量全部来自本帧（d=r-b 的中位数/MAD + 实测噪声地板），不是"这台相机"的常数。
+        if (args.auto_thresholds && !rgb.empty() && pw > 0 && ph > 0) {
+            const auto_params::Stats st_a = auto_params::measure(rgb, pw, ph);
+            if (st_a.ok) {
+                const auto_params::Derived dp = auto_params::derive(st_a);
+                const VisionParams pp =
+                    apply_auto_thresholds(args, effective_vision_params(args), dp);
+                if (drv) drv->configure(pp);      // --via-pl：写 21 个寄存器
+                if (ref) ref->set_vision_params(pp);   // PS 参考模型：同一套阈值
+                ++n_auto_frames;
+                if (args.verbose && (n_auto_frames <= 3 || n_auto_frames % 50 == 0)) {
+                    std::printf("  [自动阈值] 帧 %ld: t_l=%d t_d=%d 亮像素=%.1f%% "
+                                "→ wall_rb=%d wall_min_r=%d wall_min_g=%d bright_min=%d\n",
+                                (long)i, dp.t_l, dp.t_d, 100.0f * dp.bright_frac,
+                                pp.wall_rb, pp.wall_min_r, pp.wall_min_g, pp.bright_min);
+                }
             }
         }
 
@@ -1084,6 +1160,9 @@ int main(int argc, char** argv) {
         if (st.n_edge_limited > 0) {
             std::printf("其中 %d 帧被边界余量限速（朝外分量被削，切向保留）\n",
                         st.n_edge_limited);
+        }
+        if (n_auto_frames > 0) {
+            std::printf("其中 %ld 帧用**本帧统计**推出分类阈值（自动阈值）\n", n_auto_frames);
         }
         if (st.n_hold_cmd > 0) {
             std::printf("其中 %d 帧没检出障碍、沿用了上一条有效指令（漏检≠该停）\n",
