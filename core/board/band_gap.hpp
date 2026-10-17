@@ -441,7 +441,7 @@ inline std::vector<double> col_means(const uint8_t* rgb, int w, int h) {
 ///     oy      = (h - field_h/scale_y)/2   // 场地在画面里居中
 inline Extent field_extent(const uint8_t* rgb, int w, int h, double field_w = 640.0,
                            double field_h = 480.0, double k = 5.0, int min_run = 3,
-                           double squash = 0.75) {
+                           double squash = 0.75, double tan_a = 0.0) {
     Extent e;
     if (!rgb || w < 32 || h < 32) return e;
     (void)k;
@@ -458,15 +458,26 @@ inline Extent field_extent(const uint8_t* rgb, int w, int h, double field_w = 64
     // 场地与场外的区别在**亮度**上（场地底色 vs 黑边），这跟配色无关：
     // 取逐列/逐行亮度均值，找两条最强的**亮度台阶**，它们就是场地的左右/上下边。
     // -------------------------------------------------------------------
+    // 沿**剪切后的坐标轴**取剖面：`tan_a != 0` 时，竖直方向不再沿图像列，
+    // 而是沿"去剪切"后的竖直线（每列按 shear_dy 平移）。不这么做的话，
+    // 旋转过的场地用轴对齐外接框去量，宽度和原点会被一起污染
+    // （实测旋转 6° 时宽度由 544 变 501，门的位置偏 150 场地单位）。
     auto luminance_profile = [&](bool vertical) {
         const int n = vertical ? w : h;
         const int m = vertical ? h : w;
         std::vector<double> prof(static_cast<size_t>(n), 0.0);
         for (int i = 0; i < n; ++i) {
+            const int dshift = (vertical && tan_a != 0.0)
+                ? static_cast<int>(std::lround((static_cast<double>(i) - 0.5 * static_cast<double>(w)) * tan_a))
+                : 0;
             double acc = 0.0;
             for (int j = 0; j < m; ++j) {
-                const int x = vertical ? i : j;
-                const int y = vertical ? j : i;
+                int x = vertical ? i : j;
+                int y = vertical ? j - dshift : i;
+                if (x < 0) x = 0;
+                if (x >= w) x = w - 1;
+                if (y < 0) y = 0;
+                if (y >= h) y = h - 1;
                 const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(w) +
                                    static_cast<size_t>(x);
                 int l = rgb[idx * 3];

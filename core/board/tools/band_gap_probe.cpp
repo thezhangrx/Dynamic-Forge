@@ -74,7 +74,10 @@ int main(int argc, char** argv) {
         const band_gap::Door d = angle0
             ? band_gap::find_at(rgb.data(), w, h, 0.0)
             : band_gap::find(rgb.data(), w, h);
-        const band_gap::Extent e = band_gap::field_extent(rgb.data(), w, h);
+        const double ta = angle0 ? 0.0
+            : std::tan(static_cast<double>(d.angle_deg) * 3.14159265358979 / 180.0);
+        const band_gap::Extent e = band_gap::field_extent(rgb.data(), w, h, 640.0, 480.0,
+                                                         5.0, 3, 0.75, ta);
         std::printf("%s found=%d bands=%d y0=%d y1=%d x0=%d x1=%d cx=%d w=%d "
                     "support=%.2f snr=%.1f\n",
                     argv[i], d.found ? 1 : 0, d.n_bands, d.y0, d.y1,

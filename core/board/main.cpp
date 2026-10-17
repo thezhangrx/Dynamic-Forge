@@ -1344,6 +1344,21 @@ int main(int argc, char** argv) {
             }
             sg_doors = band_gap::find_all(rgb.data(), pw, ph, 6, 40, 6, 5.0f, 10.0f, 2.5f,
                                           sg_min_gap_px);
+            // 场地范围要在**去剪切**的坐标系里量：先由角度搜索定角，再用同一个角
+            // 重新量一次边界。顺序不能反（先量框会把旋转的信息烧掉，实测偏 150 单位）。
+            {
+                float best_ang = 0.0f;
+                int best_w = -1;
+                for (const band_gap::Door& d : sg_doors) {
+                    if (d.width > best_w) { best_w = d.width; best_ang = d.angle_deg; }
+                }
+                if (best_ang != 0.0f) {
+                    const double ta = std::tan(static_cast<double>(best_ang) * 3.14159265358979 / 180.0);
+                    sg_ext = band_gap::field_extent(rgb.data(), pw, ph, args.field_w,
+                                                    args.field_h, 5.0, 3,
+                                                    args.image_squash, ta);
+                }
+            }
 
             // ---- 世界模型：有检出就更新，没检出就按速度外推 ------------------
             // 只在**场地可见**时做（看不见场地由 `field_extent` 的显著性门判掉，
