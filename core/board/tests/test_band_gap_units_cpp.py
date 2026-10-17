@@ -22,6 +22,13 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 BOARD = ROOT / "core" / "board"
 
+def field_rect_in_image(ow=640, oh=360, squash=0.75):
+    """与 `scene()` 里同样的"居中等比、左右黑边"布置，返回 (x, y, w, h)。"""
+    fld_w = 0.85 * ow
+    fld_h = fld_w * (480.0 / 640.0) * squash
+    return 0.5 * (ow - fld_w), 0.5 * (oh - fld_h), fld_w, fld_h
+
+
 WARM = (240, 160, 48)
 BG = (34, 40, 55)
 WHITE = (235, 240, 250)
@@ -43,7 +50,7 @@ pytestmark = pytest.mark.skipif(not _gxx(), reason="没有 g++")
 xfail = pytest.mark.xfail(reason="field_extent 依赖暖色边框，仿真边框是冷色（待修）", strict=False)
 
 
-def scene(*, wall_y=479.0, gap=(251.0, 327.0), player=(320.0, 240.0), field=(640.0, 480.0),
+def scene(*, wall_y=300.0, gap=(251.0, 327.0), player=(320.0, 240.0), field=(640.0, 480.0),
           squash=0.75, rot_deg=0.0, gain=1.0, offset=0.0, out=(640, 360)):
     """按**场地坐标**画一张"相机看到的平台"，返回 (rgb, 变换函数)。
 
@@ -150,6 +157,24 @@ def test_gap_lands_within_ten_field_units(tmp_path: Path, kw):
     assert r["found"] == 1, f"没找到门：{r}"
     s = 640.0 / (r["ex1"] - r["ex0"] + 1)
     cx = (0.5 * (r["x0"] + r["x1"]) - r["ex0"]) * s   # 以**左边框**为原点
-    cy = 0.5 * (r["y0"] + r["y1"]) * s / 0.75  # 纵向还原压缩
+    _fx, fy, _fw, fh = field_rect_in_image()
+    cy = (0.5 * (r["y0"] + r["y1"]) - fy) * (480.0 / fh)   # 去掉黑边偏移再还原压缩
     assert abs(cx - (0.5 * (251 + 327) - 0.0)) <= 20.0, f"缺口中心 {cx:.1f} 偏了（真值 289）"
-    assert abs(cy - 479.0) <= 20.0, f"墙带 y {cy:.1f} 偏了（真值 479）"
+    assert abs(cy - 300.0) <= 20.0, f"墙带 y {cy:.1f} 偏了（真值 300）"
+
+
+def test_wall_hugging_the_border_never_reports_a_fake_door(tmp_path: Path):
+    """墙贴在场地边界（wall_y=479，场地高 480）时的**明确预期**。
+
+    这种布置下"缺口"可能被边界吞掉 —— 那就必须报"没有门"，而**不能**在
+    别处编一个门出来（上一版就是这样：红框落在墙下面的黑边上、绿框落在实墙上，
+    结果平台照着假门开）。所以这里只允许两种结果：
+        * found == 0；或者
+        * found == 1 且墙带 y 与真值差 ≤20 场地单位。
+    """
+    rgb, _to_img, size = scene(wall_y=479.0)
+    r = probe(tmp_path, rgb, size)
+    if r["found"]:
+        _fx, fy, _fw, fh = field_rect_in_image()
+        cy = (0.5 * (r["y0"] + r["y1"]) - fy) * (480.0 / fh)
+        assert abs(cy - 479.0) <= 20.0, f"贴边墙上报了假门：墙带 y={cy:.1f}（真值 479）"
