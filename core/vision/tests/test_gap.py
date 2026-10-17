@@ -133,3 +133,70 @@ def test_snr_is_reported_and_drops_with_noise_but_stays_above_the_gate():
                      band["y0"], band["y1"])
     assert noisy["found"]
     assert noisy["snr"] < quiet["snr"]
+
+
+# --------------------------------------------------------------------------
+# 多条墙带 + "门"的判别（真机位上的真实失败模式）
+# --------------------------------------------------------------------------
+def border_frame(*, w: int = 320, h: int = 180, walls=(), band=(30, 36)) -> P.Frame:
+    """场地上有**橙色边框**（同样暖），边框在墙带那几行被黑角标挖开一个口。
+
+    这是真机位实测到的坑：`best_wall_band` 会在**边框**和**障碍墙**之间跳
+    （亮度 40/70/100/130 分别锁在 58..84 / 300..324 / 19..42 / 253..287 行），
+    然后在边框的角标洞上报一个"缺口"。
+    """
+    y0, y1 = band
+    rgb = bytearray()
+    for y in range(h):
+        for x in range(w):
+            c = BG
+            edge = y <= 2 or y >= h - 3 or x <= 2 or x >= w - 3
+            if edge:
+                c = WARM                                     # 橙色边框
+            if y0 <= y <= y1:
+                if x <= 2 or x >= w - 3:
+                    c = BG                                   # 角标把边框挖开
+                for a, b in walls:
+                    if a <= x <= b:
+                        c = WARM
+                        break
+            rgb += bytes(c)
+    return P.Frame(width=w, height=h, r=rgb[0::3], g=rgb[1::3], b=rgb[2::3])
+
+
+def test_multiple_bands_are_all_returned():
+    from vision.relative import wall_bands
+
+    f = field(band=(20, 26))
+    rgb = bytearray(f.to_rgb())
+    for y in range(120, 128):                 # 再加一条带缺口的墙
+        for x in range(320):
+            if 150 <= x <= 200:
+                continue
+            i = (y * 320 + x) * 3
+            rgb[i:i + 3] = bytes(WARM)
+    g = P.Frame(width=320, height=180, r=bytes(rgb[0::3]),
+                g=bytes(rgb[1::3]), b=bytes(rgb[2::3]))
+    bands = wall_bands(g)
+    assert len(bands) >= 2, f"只找到 {len(bands)} 条带：{bands}"
+    tops = sorted(b["y0"] for b in bands)
+    assert any(t <= 26 for t in tops) and any(t <= 128 for t in tops)
+
+
+def test_a_hole_in_the_field_border_is_not_a_door():
+    """边框上的角标洞：一侧几乎没墙 → 支撑比很小 → 不是门。"""
+    from vision.relative import best_door
+
+    f = border_frame(walls=((80, 300),))
+    d = best_door(f)
+    assert not d["found"], f"把边框上的洞当成了门：{d}"
+
+
+def test_a_wall_with_long_flanks_is_a_door():
+    from vision.relative import best_door
+
+    f = border_frame(walls=((60, 130), (190, 260)))
+    d = best_door(f)
+    assert d["found"], d
+    assert abs(d["cx"] - 160.0) <= 4.0, d
+    assert d["support"] >= 1.0

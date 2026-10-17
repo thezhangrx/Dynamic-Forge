@@ -507,3 +507,118 @@ def best_gap(frame: P.Frame, y0: int, y1: int, *,
                wide_enough=wide_enough, min_gap_px=float(min_gap_px),
                x0=x0, x1=x1, wall_level=wall_level, bg_level=bg_level)
     return out
+
+
+# ==========================================================================
+# 第三级证据：**门洞**（多条墙带里挑"真的有门的那条"）
+# ==========================================================================
+def wall_bands(frame: P.Frame, *, min_rows: int = 6, max_rows: int = 40,
+               pad: int = 6, k_sigma: float = 5.0, max_bands: int = 4) -> list:
+    """**所有**横墙带（不是只要最显著那条）。
+
+    为什么必须全找：真场地里同时有 2 条障碍墙 + 1 圈**橙色的场地边框**，
+    于是"最显著的那条带"会随曝光在它们之间跳（实测亮度 40/70/100/130 分别
+    锁在 58..84 / 300..324 / 19..42 / 253..287 行）。跳的不是缺口，是**选错了墙**。
+    证据不足时就不要"挑一条最像的"，而要把候选都拿出来，交给下一层用几何判。
+
+    实现就是 `best_wall_band` 的非极大值抑制版：挑一条 → 屏蔽它的行 → 再挑。
+    """
+    prof = row_profile(frame)
+    h = len(prof)
+    if h < min_rows + 2 * pad + 2:
+        return []
+    pre = [0.0] * (h + 1)
+    for y in range(h):
+        pre[y + 1] = pre[y] + prof[y]
+
+    def mean(a: int, b: int) -> float:
+        if b < a:
+            return 0.0
+        return (pre[b + 1] - pre[a]) / float(b - a + 1)
+
+    diffs = [prof[i + 1] - prof[i] for i in range(h - 1)]
+    sigma = max(_QUANT_SIGMA,
+                DEFAULTS.mad_to_sigma * _mad(diffs, _median(diffs)) + DEFAULTS.eps)
+
+    # 所有候选 (contrast, y0, y1) —— 360 行 × 40 宽 = 1.4 万个，PS 上也是微秒级
+    cands = []
+    for y0 in range(pad, h - min_rows - pad):
+        for y1 in range(y0 + min_rows, min(h - pad, y0 + max_rows + 1)):
+            contrast = mean(y0, y1) - 0.5 * (mean(y0 - pad, y0 - 1) + mean(y1 + 1, y1 + pad))
+            cands.append((contrast, y0, y1))
+    cands.sort(reverse=True)
+
+    bands: list = []
+    taken = [False] * h
+    for contrast, y0, y1 in cands:
+        if len(bands) >= max_bands:
+            break
+        if contrast / sigma < k_sigma:
+            break
+        if any(taken[y] for y in range(y0, y1 + 1)):
+            continue
+        bands.append({"y0": y0, "y1": y1, "snr": contrast / sigma,
+                      "contrast": contrast, "thickness": y1 - y0 + 1})
+        for y in range(max(0, y0 - 1), min(h, y1 + 2)):
+            taken[y] = True
+    return bands
+
+
+def door_from_band(frame: P.Frame, band: dict, *,
+                   min_support: float = 1.0, k_sigma: float = 5.0) -> dict:
+    """在一条墙带里判"是不是门"：缺口两侧的墙**各要够长**。
+
+    `min_support` 是**无量纲**的：`min(左墙长, 右墙长) / 缺口宽`。
+    场地边框上的黑角标会在边框上挖出一个洞，那个洞的左边只剩十几列墙，
+    比值远小于 1；真正的门洞两侧都是长墙，比值 >> 1。
+    所以这一条把"边框上的洞"和"墙上的门"分开，**不需要知道边框在哪**。
+    """
+    g = dict(best_gap(frame, band["y0"], band["y1"], k_sigma=k_sigma))
+    if not g.get("found"):
+        g["is_door"] = False
+        return g
+    prof = band_column_profile(frame, band["y0"], band["y1"])
+    if not prof:
+        g["is_door"] = False
+        return g
+    half = 0.5 * (g["wall_level"] + g["bg_level"])
+    x0, x1 = g["x0"], g["x1"]
+    # 缺口左/右各有多少列仍然是"墙"（超过半高）
+    left = 0
+    x = x0 - 1
+    while x >= 0 and prof[x] >= half:
+        left += 1
+        x -= 1
+    right = 0
+    x = x1 + 1
+    while x < len(prof) and prof[x] >= half:
+        right += 1
+        x += 1
+    support = min(left, right) / max(1.0, float(x1 - x0 + 1))
+    g.update(left_wall=left, right_wall=right, support=support,
+             is_door=support >= min_support)
+    return g
+
+
+def best_door(frame: P.Frame, *, k_sigma: float = 5.0,
+              min_support: float = 1.0, max_bands: int = 4) -> dict:
+    """在一帧里找**门**：所有墙带各判一次，取支撑比最大的那扇门。
+
+    返回 `{found, y0, y1, cx, width, support, snr, band}`
+    （`x0/x1` 等 `best_gap` 的字段都在里面）。
+    """
+    out = {"found": False, "cx": 0.0, "width": 0.0, "support": 0.0, "snr": 0.0,
+           "y0": 0, "y1": 0, "door": None,
+           "bands": wall_bands(frame, k_sigma=k_sigma, max_bands=max_bands)}
+    best = None
+    for band in out["bands"]:
+        g = door_from_band(frame, band, min_support=min_support, k_sigma=k_sigma)
+        if not g.get("is_door"):
+            continue
+        if best is None or g["support"] > best["support"]:
+            best = g
+            best["y0"], best["y1"] = band["y0"], band["y1"]
+    if best is not None:
+        out.update(best)
+        out.update(found=True, door=best)
+    return out
