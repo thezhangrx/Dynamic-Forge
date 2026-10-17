@@ -154,7 +154,8 @@ inline std::vector<double> col_profile(const uint8_t* rgb, int w, int h,
 //: 在**给定剪切角**下找门（对 `find()` 而言是一次内层调用）。
 inline Door find_at(const uint8_t* rgb, int w, int h, double tan_a,
                     int min_rows = 6, int max_rows = 40, int pad = 6,
-                    float k_sigma = 5.0f, std::vector<Door>* all = nullptr) {
+                    float k_sigma = 5.0f, std::vector<Door>* all = nullptr,
+                    int min_gap_px = 0) {
     Door out;
     if (!rgb || w < 32 || h < min_rows + 2 * pad + 4) return out;
     const std::vector<double> ev = detail::row_profile(rgb, w, h, tan_a);
@@ -205,7 +206,10 @@ inline Door find_at(const uint8_t* rgb, int w, int h, double tan_a,
             detail::col_profile(rgb, w, h, b.y0, b.y1, pad, tan_a);
         const int wn = static_cast<int>(prof.size());
         const int thick = b.y1 - b.y0 + 1;
-        int min_gap = thick < 4 ? 4 : thick;       // 几何先验：门洞不会比墙还窄
+        // 缺口宽度下限：**可通过性**（调用方按"角色直径 × 1.6"给），
+        // 没给时退回几何先验"门洞不会比墙还窄"。
+        int min_gap = thick < 4 ? 4 : thick;
+        if (min_gap_px > min_gap) min_gap = min_gap_px;
         int shoulder = thick < 4 ? 4 : thick;
         if (wn < min_gap + 2 * shoulder + 2) continue;
         std::vector<double> pre(static_cast<size_t>(wn) + 1, 0.0);
@@ -295,13 +299,14 @@ inline Door find_at(const uint8_t* rgb, int w, int h, double tan_a,
 inline std::vector<Door> find_all(const uint8_t* rgb, int w, int h,
                                   int min_rows = 6, int max_rows = 40, int pad = 6,
                                   float k_sigma = 5.0f, float max_angle_deg = 10.0f,
-                                  float step_deg = 2.5f) {
+                                  float step_deg = 2.5f, int min_gap_px = 0) {
     std::vector<Door> best_doors;
     int best_n = -1;
     for (float ang = -max_angle_deg; ang <= max_angle_deg + 0.001f; ang += step_deg) {
         const double tan_a = std::tan(ang * 3.14159265358979 / 180.0);
         std::vector<Door> doors;
-        const Door one = find_at(rgb, w, h, tan_a, min_rows, max_rows, pad, k_sigma, &doors);
+        const Door one = find_at(rgb, w, h, tan_a, min_rows, max_rows, pad, k_sigma,
+                                 &doors, min_gap_px);
         if (!doors.empty() && static_cast<int>(doors.size()) > best_n) {
             best_n = static_cast<int>(doors.size());
             for (Door& d : doors) d.angle_deg = ang;
@@ -527,7 +532,11 @@ struct Player {
 /// `t_l` 传 0 就表示"阈值只相对本帧最亮像素"（`0.75·Lmax`）：曝光/白平衡是整幅图
 /// 一起变，`Lmax` 也跟着变，所以这条阈值天然跨曝光；真正区分角色与墙的是**形状**
 /// （`aspect < 2`：墙是长条，角色是圆）。
-inline Player find_player(const uint8_t* rgb, int w, int h, int t_l = 0) {
+//: `min_px`/`max_px`：外接框长边的允许范围（像素）。
+//: 调用方用**场地比例尺 + 契约半径**算出来传进来 —— 这样 `r=32` 那种"抓到大块
+//: 方形亮物（墙角/角标）"的帧会被直接丢掉，而不是被当成角色去发指令。
+inline Player find_player(const uint8_t* rgb, int w, int h, int t_l = 0,
+                          int min_px = 0, int max_px = 0) {
     Player out;
     if (!rgb || w < 16 || h < 16) return out;
     int lmax = 0;
@@ -595,6 +604,9 @@ inline Player find_player(const uint8_t* rgb, int w, int h, int t_l = 0) {
         const int bw = c.x1 - c.x0 + 1;
         const int bh = c.y1 - c.y0 + 1;
         if (c.area < 16 || c.area > 4000) continue;
+        const int longest = bw > bh ? bw : bh;
+        if (min_px > 0 && longest < min_px) continue;
+        if (max_px > 0 && longest > max_px) continue;
         const double fill = static_cast<double>(c.area) / (static_cast<double>(bw) * bh);
         const double aspect = static_cast<double>(bw > bh ? bw : bh) /
                               static_cast<double>(bw < bh ? bw : bh);

@@ -164,6 +164,10 @@ struct Args {
     //: 画面纵向压缩比（`cam_live.sh` 用 scale=640:360 把 4:3 压成 16:9 → 0.75；
     //: 用 CAM_CROP=1 时是 1.0）。纵向换算**靠它推**，不靠被截断的下边框。
     double image_squash = 0.75;
+    //: 契约里的角色半径（场地单位）。用作**尺寸先验**：结构判据抓到的角色，
+    //: 其外接框必须在"契约半径 × 比例尺"附近；抓到大块方形亮物（墙角/角标）
+    //: 必须丢掉，否则会照着错的位置发指令（实测出现过 r=32.4，契约是 10）。
+    double player_radius = 10.0;
 
     std::string keyboard_dev = "/dev/ttyPS0";
     double action_deadzone = kDefaultDeadzone;
@@ -211,6 +215,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--skip-frames")  a.skip_frames = std::atoi(next());
         else if (k == "--structural-gap") a.structural_gap = true;
         else if (k == "--image-squash") a.image_squash = std::atof(next());
+        else if (k == "--player-radius") a.player_radius = std::atof(next());
         else if (k == "--auto-thresholds")    a.auto_thresholds = true;
         else if (k == "--no-auto-thresholds") a.auto_thresholds = false;
         else if (k == "--verify-both")  a.verify_both = true;
@@ -1150,12 +1155,23 @@ int main(int argc, char** argv) {
         band_gap::Extent sg_ext;
         std::vector<band_gap::Door> sg_doors;
         band_gap::Player sg_player;
+        int sg_min_gap_px = 0;
         if (args.structural_gap && !rgb.empty() && pw > 0 && ph > 0) {
-            sg_doors = band_gap::find_all(rgb.data(), pw, ph);
             sg_ext = band_gap::field_extent(rgb.data(), pw, ph,
                                             args.field_w, args.field_h,
                                             5.0, 3, args.image_squash);
-            sg_player = band_gap::find_player(rgb.data(), pw, ph);
+            // 尺寸窗口与可通过性都由**契约 + 本帧比例尺**算出来，不是像素常数
+            if (sg_ext.ok && sg_ext.scale_x > 0.0) {
+                const double dia_px = 2.0 * args.player_radius / sg_ext.scale_x;
+                sg_player = band_gap::find_player(
+                    rgb.data(), pw, ph, 0,
+                    static_cast<int>(0.5 * dia_px), static_cast<int>(2.0 * dia_px));
+                sg_min_gap_px = static_cast<int>(1.6 * dia_px);
+            } else {
+                sg_player = band_gap::find_player(rgb.data(), pw, ph);
+            }
+            sg_doors = band_gap::find_all(rgb.data(), pw, ph, 6, 40, 6, 5.0f, 10.0f, 2.5f,
+                                          sg_min_gap_px);
             // 日志/回退用：仍然报"最宽的那扇门"
             for (const band_gap::Door& d : sg_doors)
                 if (!sg_door.found || d.width > sg_door.width) sg_door = d;
