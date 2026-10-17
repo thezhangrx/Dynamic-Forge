@@ -396,6 +396,12 @@ struct DecisionState {
     int n_edge_limited = 0;
     //: 本帧没检出障碍、于是**沿用上一条有效指令**的帧数（见 decide() 里的说明）
     int n_hold_cmd = 0;
+    //: 最后一次"几何有效"（至少有一个矩形）的 stamp。用来给"沿用上一条指令"封顶：
+    //: 实测把相机挡住时，`field_extent` 仍会在噪声里"找出"边框（40 帧只有 1 帧报
+    //: 看不到场地），角色也会在噪声里被当成亮点 —— 于是先前的"漏检也沿上一条指令"
+    //: 会**一直开下去**（实测挡镜头时 40/40 帧都在发 @MOVE 1）。
+    //: 规矩：只在看门狗窗口（500 ms，与协议一致）内允许沿用，超时一律 stay。
+    uint64_t last_geom_ns = 0;
     //: 用结构判据重建几何的帧数（--structural-gap）
     int n_structural = 0;
     //: 门的时序平滑器（见 DoorSmoother 的注释）
@@ -690,7 +696,7 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
         // 角色优先用**PS 侧的结构检测**（最亮的圆，见 `band_gap::find_player`）：
         // RTL 的"亮 + 低饱和"在淡粉白的墙面前会把角色吞掉（实测 28/40 帧无角色），
         // 而板子的规矩是"没角色就 stay"。这里仍然只给像素坐标，下面统一换算。
-        if (splayer && splayer->found) {
+        if (splayer && splayer->found && !doors->empty()) {
             f.player.present = true;
             f.player.x = splayer->x;
             f.player.y = splayer->y;
@@ -948,13 +954,21 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
                 : "  ⚠ 本帧没检出角色 → 只发 stay（不拿兜底位置发指令）\n");
         }
     }
+    if (!rects.empty()) st.last_geom_ns = f.header.stamp_ns;
+
     // 本帧一个障碍都没检出：**不要**当成"该停"。
     // 板子控平台时场景**只有一种障碍**（--obstacle-type 强约束），所以"这帧没检出"
     // 是漏检，不是"墙没了"。实测 43% 的帧零矩形，指令就在"走"与"停"之间来回跳，
     // 角色在出发点附近乱晃。物理事实是墙还在 —— 保持上一条有效指令。
     static gap_avoid::Vec2 last_cmd{0.0, 0.0};
     static bool have_cmd = false;
-    if (rects.empty() && have_cmd && player_ok && cmd.x == 0.0 && cmd.y == 0.0) {
+    //: 沿用的前提：最近 500 ms 内**真的**有过几何（看门狗窗口，与协议一致）。
+    //: 没有这个前提，镜头被挡住时会拿着一条旧指令一直开（实测 40/40 帧）。
+    const bool geom_fresh = st.last_geom_ns != 0 &&
+                            f.header.stamp_ns > st.last_geom_ns &&
+                            (f.header.stamp_ns - st.last_geom_ns) < 500ull * 1000ull * 1000ull;
+    if (rects.empty() && geom_fresh && have_cmd && player_ok
+        && cmd.x == 0.0 && cmd.y == 0.0) {
         cmd = last_cmd;
         ++st.n_hold_cmd;
     } else if (player_ok && (cmd.x != 0.0 || cmd.y != 0.0)) {

@@ -475,6 +475,22 @@ inline Extent field_extent(const uint8_t* rgb, int w, int h, double field_w = 64
     const int cxa = (cr[static_cast<size_t>(ia)].a + cr[static_cast<size_t>(ia)].b) / 2;
     const int cxb = (cr[static_cast<size_t>(ib)].a + cr[static_cast<size_t>(ib)].b) / 2;
     if (std::abs(cxa - cxb) < w / 2) return e;      // 两条峰必须横跨大半幅画面
+    // **显著性**门槛：边框峰必须显著高于背景。
+    // 实测挡镜头时，`field_extent` 仍会在噪声里凑出"两条峰"（40 帧里 39 帧都报
+    // ok、场地 600 px），于是后续一切判据都在噪声上工作 —— 平台照样开。
+    // 这里用"几个稳健标准差"（统计显著性），不是像素常数。
+    {
+        std::vector<double> cd;
+        cd.reserve(colp.size());
+        for (size_t i = 0; i + 1 < colp.size(); ++i) cd.push_back(colp[i + 1] - colp[i]);
+        const double med = detail::median(cd);
+        double sd = detail::mad(cd, med) * detail::kMadToSigma;
+        if (sd < 0.5) sd = 0.5;
+        const double pa = colp[static_cast<size_t>(cxa)] - med;
+        const double pb = colp[static_cast<size_t>(cxb)] - med;
+        const double amin = pa < pb ? pa : pb;
+        if (amin / sd < 8.0) return e;      // 8σ 显著性（与 5σ 检测同一把尺）
+    }
     e.x0 = cxa < cxb ? cxa : cxb;
     e.x1 = cxa < cxb ? cxb : cxa;
 
