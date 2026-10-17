@@ -329,9 +329,16 @@ VisionParams apply_auto_thresholds(const Args& a, VisionParams p,
 struct DoorSmoother {
     bool ok = false;
     double cx = 0.0, width = 0.0, y = 0.0, hh = 0.0;
+    //: 门在动时的速度（场地单位/秒）。**必须有**：注入的矩形如果 vx=vy=0，
+    //: `gap_avoid` 就认为墙是静止的，不会提前切向；而真平台上的墙是扫动的，
+    //: 于是"照着上一帧的缺口走"必然撞 —— 真机闭环 13~14 次碰撞的主要来源。
+    double vx = 0.0, vy = 0.0;
+    double prev_cx = 0.0, prev_y = 0.0, prev_t = 0.0;
+    bool has_prev = false;
 
-    /// 返回平滑后的 (cx, width, y, hh)。
-    void update(double ncx, double nwidth, double ny, double nhh) {
+    /// 返回平滑后的 (cx, width, y, hh)，并更新速度估计。
+    void update(double ncx, double nwidth, double ny, double nhh, double t_now = 0.0) {
+        const double old_cx = cx, old_y = y;
         if (!ok) {
             ok = true;
             cx = ncx; width = nwidth; y = ny; hh = nhh;
@@ -349,6 +356,14 @@ struct DoorSmoother {
         width += kAlpha * (nwidth - width);
         y += kAlpha * (ny - y);
         hh += kAlpha * (nhh - hh);
+        // 速度：用**平滑后**的位置差分（差分放大抖动，平滑后再差分才稳）
+        if (has_prev && t_now > prev_t) {
+            const double dtv = t_now - prev_t;
+            const double k = 0.5;              // 半步低通，够跟手也不抖
+            vx += k * ((cx - old_cx) / dtv - vx);
+            vy += k * ((y - old_y) / dtv - vy);
+        }
+        prev_cx = cx; prev_y = y; prev_t = t_now; has_prev = true;
     }
 };
 
@@ -771,18 +786,25 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
             const double nwidth = static_cast<double>(pick->width) * s_scale;
             const double ny = 0.5 * ((pick->y0 - oy) + (pick->y1 - oy)) * s_scale_y;
             const double nhh = 0.5 * (static_cast<double>(pick->y1 - pick->y0) + 1.0) * s_scale_y;
-            st.door_sm.update(ncx, nwidth, ny, nhh);
+            st.door_sm.update(ncx, nwidth, ny, nhh, t_now);
         }
         const double sm_cx = st.door_sm.cx;
         const double sm_w = st.door_sm.width;
         const double sm_y = st.door_sm.y;
         const double sm_hh = st.door_sm.hh;
+        // 注入**所有**墙（每扇门各自带缺口），但把"角色正对着的那扇"用平滑后的几何。
+        // 只注入一扇会漏掉另一堵墙 —— 规划器看不见它，于是直直撞上去
+        // （真机闭环实测 13 次碰撞，多数是撞在没被注入的那堵墙上）。
+        // 其余墙用原始几何（它们不是当前目标，抖动不影响指令）。
         for (const band_gap::Door& d : *doors) {
-            if (&d != pick) continue;
-            const double by = sm_y;
-            const double hh = sm_hh;
-            const double gl = sm_cx - 0.5 * sm_w;
-            const double gr = sm_cx + 0.5 * sm_w;
+            const bool near_one = (&d == pick);
+            const double by = near_one ? sm_y : 0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale_y;
+            const double hh = near_one ? sm_hh
+                                       : 0.5 * (static_cast<double>(d.y1 - d.y0) + 1.0) * s_scale_y;
+            const double gl = near_one ? sm_cx - 0.5 * sm_w
+                                       : (static_cast<double>(d.x0) - ox) * s_scale;
+            const double gr = near_one ? sm_cx + 0.5 * sm_w
+                                       : (static_cast<double>(d.x1) - ox) * s_scale;
             auto push_seg = [&](double a, double b) {
                 gap_avoid::Rect r;
                 r.ent_id = ++ent;
@@ -791,7 +813,10 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
                 r.half_w = 0.5 * (b - a);
                 r.half_h = hh;
                 r.rotation = 0.0;
-                r.vx = r.vy = 0.0;
+                // 墙在动：把门的速度填进矩形（场地单位/秒）。
+                // 只给"角色正对着的那堵"填 —— 它才是当前目标，速度估计也只对它可信。
+                r.vx = near_one ? st.door_sm.vx : 0.0;
+                r.vy = near_one ? st.door_sm.vy : 0.0;
                 r.angular_velocity = 0.0;
                 rects.push_back(r);
             };
@@ -799,6 +824,17 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
             if (args.field_w - gr > 1.0) push_seg(gr, args.field_w);
         }
         if (!rects.empty()) ++st.n_structural;
+        if (args.verbose && rects.size() >= 2) {
+            static long shown = 0;
+            if ((++shown % 40) == 1) {
+                std::printf("  [注入] 角色=(%.0f,%.0f) r=%.1f | 门=(%.0f,%.0f) 宽=%.0f 带厚=%.1f"
+                            " | 左墙 x=%.0f±%.0f 右墙 x=%.0f±%.0f\n",
+                            f.player.x, f.player.y, f.player.radius,
+                            sm_cx, sm_y, sm_w, sm_hh,
+                            rects[0].x, rects[0].half_w,
+                            rects[1].x, rects[1].half_w);
+            }
+        }
     }
 
     // ---- 矩形层碎片合并（颜色分割 → 掩膜修复 → **形状/连通性** → 时序跟踪）----
