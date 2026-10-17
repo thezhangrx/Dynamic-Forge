@@ -154,7 +154,7 @@ inline std::vector<double> col_profile(const uint8_t* rgb, int w, int h,
 //: 在**给定剪切角**下找门（对 `find()` 而言是一次内层调用）。
 inline Door find_at(const uint8_t* rgb, int w, int h, double tan_a,
                     int min_rows = 6, int max_rows = 40, int pad = 6,
-                    float k_sigma = 5.0f) {
+                    float k_sigma = 5.0f, std::vector<Door>* all = nullptr) {
     Door out;
     if (!rgb || w < 32 || h < min_rows + 2 * pad + 4) return out;
     const std::vector<double> ev = detail::row_profile(rgb, w, h, tan_a);
@@ -261,6 +261,17 @@ inline Door find_at(const uint8_t* rgb, int w, int h, double tan_a,
         // 教训：真机位帧上门洞宽 24~58 px，而角标洞/反光缝只有 10~18 px；
         // 按支撑比挑会选中那些窄缝（它们的左右肩比值反而更高），
         // 于是决策拿到一个"只有 10 px 的门" → NO_GAP。
+        if (all) {
+            Door each;
+            each.found = true;
+            each.support = support;
+            each.snr = snr;
+            each.y0 = b.y0; each.y1 = b.y1;
+            each.x0 = x0;   each.x1 = x1;
+            each.cx = (x0 + x1) / 2;
+            each.width = width;
+            all->push_back(each);
+        }
         if (!out.found || width > out.width ||
             (width == out.width && support > out.support)) {
             out.found = true;
@@ -273,6 +284,32 @@ inline Door find_at(const uint8_t* rgb, int w, int h, double tan_a,
         }
     }
     return out;
+}
+
+//: 把所有**门**都拿出来（每个带一扇；角度用使带对比最大的那个）。
+//:
+//: 为什么需要"全部"：场景里常有 2 条横墙（各自缺口位置不同）+ 场地边框，
+//: 只挑最宽的那扇，会丢掉玩家正对着的那堵墙 —— 而 `gap_avoid` 要的是
+//: "我正在朝它走的那个缺口"，不是"全场最宽的缺口"。选择权交给决策层，
+//: 判据层只负责把几何报准。
+inline std::vector<Door> find_all(const uint8_t* rgb, int w, int h,
+                                  int min_rows = 6, int max_rows = 40, int pad = 6,
+                                  float k_sigma = 5.0f, float max_angle_deg = 10.0f,
+                                  float step_deg = 2.5f) {
+    std::vector<Door> best_doors;
+    int best_n = -1;
+    for (float ang = -max_angle_deg; ang <= max_angle_deg + 0.001f; ang += step_deg) {
+        const double tan_a = std::tan(ang * 3.14159265358979 / 180.0);
+        std::vector<Door> doors;
+        const Door one = find_at(rgb, w, h, tan_a, min_rows, max_rows, pad, k_sigma, &doors);
+        if (!doors.empty() && static_cast<int>(doors.size()) > best_n) {
+            best_n = static_cast<int>(doors.size());
+            for (Door& d : doors) d.angle_deg = ang;
+            best_doors = doors;
+            if (!one.found) continue;
+        }
+    }
+    return best_doors;
 }
 
 //: 主入口：在 ±`kMaxAngleDeg` 里搜"使墙带对比最大"的剪切角，再在该角下找门。

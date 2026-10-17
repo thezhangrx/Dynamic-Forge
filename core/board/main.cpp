@@ -317,6 +317,41 @@ VisionParams apply_auto_thresholds(const Args& a, VisionParams p,
 //   真正的修法是 PS 侧按 stamp 差分出速度再填进来 —— 那是下一步，不是这里。
 // ⚠ **player/field 来自配置**：视觉帧不携带（标准 §6），用了默认值就要报出来。
 // ---------------------------------------------------------------------------
+/// 门的**时序平滑**（"颜色分割 → 掩膜修复 → 形状/连通性 → 时序跟踪"的最后一级）。
+///
+/// 为什么必须有：`band_gap` 每帧独立重算，真机位上门心的列坐标会抖 ±10 px，
+/// 而决策对它做符号判断 —— 于是同一个 tier 里指令左右来回翻（实测翻转里
+/// `ALIGN → ALIGN`、`NO_GAP → NO_GAP` 占了一半）。
+///
+/// 关联/接纳的门槛全部用**门自己的尺寸**表达（宽、带厚），不是像素常数：
+/// 门心偏离不到一个门宽、宽度变化不到半个门宽、行偏移不到两个带厚 → 认为是同一扇门，
+/// 做指数平滑；否则直接换成新门（走开了就是另一扇）。
+struct DoorSmoother {
+    bool ok = false;
+    double cx = 0.0, width = 0.0, y = 0.0, hh = 0.0;
+
+    /// 返回平滑后的 (cx, width, y, hh)。
+    void update(double ncx, double nwidth, double ny, double nhh) {
+        if (!ok) {
+            ok = true;
+            cx = ncx; width = nwidth; y = ny; hh = nhh;
+            return;
+        }
+        const bool same = std::fabs(ncx - cx) <= (width > 1.0 ? width : 1.0) &&
+                          std::fabs(nwidth - width) <= (0.5 * width + 1.0) &&
+                          std::fabs(ny - y) <= (2.0 * hh + 1.0);
+        if (!same) {                     // 换了一扇门：直接采纳，不混旧值
+            cx = ncx; width = nwidth; y = ny; hh = nhh;
+            return;
+        }
+        constexpr double kAlpha = 1.0 / 3.0;   // 三帧等效平均：够快跟手，又能压抖动
+        cx += kAlpha * (ncx - cx);
+        width += kAlpha * (nwidth - width);
+        y += kAlpha * (ny - y);
+        hh += kAlpha * (nhh - hh);
+    }
+};
+
 struct DecisionState {
     gap_avoid::GapMemory mem;
     gap_avoid::AlgoConfig cfg;
@@ -339,6 +374,8 @@ struct DecisionState {
     int n_hold_cmd = 0;
     //: 用结构判据重建几何的帧数（--structural-gap）
     int n_structural = 0;
+    //: 门的时序平滑器（见 DoorSmoother 的注释）
+    DoorSmoother door_sm;
     int tier_count[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // 见 tier_bucket()
 };
 
@@ -580,7 +617,8 @@ private:
 };
 
 gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
-                       const band_gap::Door* door, const band_gap::Extent* ext) {
+                       const std::vector<band_gap::Door>* doors,
+                       const band_gap::Extent* ext) {
     // ---- dt：两帧 stamp 之差 ----
     double dt = args.dt_default;
     bool dt_is_default = true;
@@ -697,38 +735,59 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
     // 为什么不是"补充"：碎块每帧个数/位置都在变，混进去只会让 `group_walls`
     // 把同一堵墙分成两组。结构判据给出的是**这堵墙的完整几何**（两段 + 缺口），
     // 语义上就是 `gap_avoid` 想要的输入。
-    if (use_struct && door && door->found) {
+    if (use_struct && !doors->empty()) {
         rects.clear();
         const double ox = static_cast<double>(ext->x0), oy = static_cast<double>(ext->y0);
-        const double by = 0.5 * ((door->y0 - oy) + (door->y1 - oy)) * s_scale;
-        const double hh = 0.5 * (static_cast<double>(door->y1 - door->y0) + 1.0) * s_scale;
-        const double gl = (static_cast<double>(door->x0) - ox) * s_scale;
-        const double gr = (static_cast<double>(door->x1) - ox) * s_scale;
-        if (gl > 1.0) {
-            gap_avoid::Rect r;
-            r.ent_id = 1;
-            r.x = 0.5 * gl;
-            r.y = by;
-            r.half_w = 0.5 * gl;
-            r.half_h = hh;
-            r.rotation = 0.0;
-            r.vx = r.vy = 0.0;
-            r.angular_velocity = 0.0;
-            rects.push_back(r);
+        int ent = 0;
+        // 选**角色正对着的那扇门**：按"墙带中心与角色的行距离"取最近。
+        // 为什么不是全部注入，也不是只取最宽：场景里常有 2 条横墙，各自缺口位置不同；
+        // 全部注入时 `gap_avoid` 会在两堵墙之间来回换目标（实测翻转 8%），
+        // 只取最宽又会选到玩家不去的那堵。角色所在行是**唯一**能把"我要过哪个门"
+        // 定下来的信息，而且它不需要任何阈值。
+        const band_gap::Door* pick = nullptr;
+        double best_dy = 1e18;
+        for (const band_gap::Door& d : *doors) {
+            const double dy = std::fabs(0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale - f.player.y);
+            if (dy < best_dy) {
+                best_dy = dy;
+                pick = &d;
+            }
         }
-        if (args.field_w - gr > 1.0) {
-            gap_avoid::Rect r;
-            r.ent_id = 2;
-            r.x = 0.5 * (gr + args.field_w);
-            r.y = by;
-            r.half_w = 0.5 * (args.field_w - gr);
-            r.half_h = hh;
-            r.rotation = 0.0;
-            r.vx = r.vy = 0.0;
-            r.angular_velocity = 0.0;
-            rects.push_back(r);
+        if (pick == nullptr) { return gap_avoid::Vec2{0.0, 0.0}; }
+        // 先平滑，再用平滑后的几何去铺两段墙（否则门心抖动会直接变成指令抖动）
+        {
+            const double ncx = 0.5 * ((pick->x0 - ox) + (pick->x1 - ox)) * s_scale;
+            const double nwidth = static_cast<double>(pick->width) * s_scale;
+            const double ny = 0.5 * ((pick->y0 - oy) + (pick->y1 - oy)) * s_scale;
+            const double nhh = 0.5 * (static_cast<double>(pick->y1 - pick->y0) + 1.0) * s_scale;
+            st.door_sm.update(ncx, nwidth, ny, nhh);
         }
-        ++st.n_structural;
+        const double sm_cx = st.door_sm.cx;
+        const double sm_w = st.door_sm.width;
+        const double sm_y = st.door_sm.y;
+        const double sm_hh = st.door_sm.hh;
+        for (const band_gap::Door& d : *doors) {
+            if (&d != pick) continue;
+            const double by = sm_y;
+            const double hh = sm_hh;
+            const double gl = sm_cx - 0.5 * sm_w;
+            const double gr = sm_cx + 0.5 * sm_w;
+            auto push_seg = [&](double a, double b) {
+                gap_avoid::Rect r;
+                r.ent_id = ++ent;
+                r.x = 0.5 * (a + b);
+                r.y = by;
+                r.half_w = 0.5 * (b - a);
+                r.half_h = hh;
+                r.rotation = 0.0;
+                r.vx = r.vy = 0.0;
+                r.angular_velocity = 0.0;
+                rects.push_back(r);
+            };
+            if (gl > 1.0) push_seg(0.0, gl);
+            if (args.field_w - gr > 1.0) push_seg(gr, args.field_w);
+        }
+        if (!rects.empty()) ++st.n_structural;
     }
 
     // ---- 矩形层碎片合并（颜色分割 → 掩膜修复 → **形状/连通性** → 时序跟踪）----
@@ -1020,10 +1079,14 @@ int main(int argc, char** argv) {
         // （像素被 push 消费掉了）→ 结构判据从来没跑过，日志里一行都没有。
         band_gap::Door sg_door;
         band_gap::Extent sg_ext;
+        std::vector<band_gap::Door> sg_doors;
         if (args.structural_gap && !rgb.empty() && pw > 0 && ph > 0) {
-            sg_door = band_gap::find(rgb.data(), pw, ph);
+            sg_doors = band_gap::find_all(rgb.data(), pw, ph);
             sg_ext = band_gap::field_extent(rgb.data(), pw, ph,
                                             args.field_w, args.field_h);
+            // 日志/回退用：仍然报"最宽的那扇门"
+            for (const band_gap::Door& d : sg_doors)
+                if (!sg_door.found || d.width > sg_door.width) sg_door = d;
         }
 
         // ---- 每帧自动阈值：用**这一帧自己的统计**推 7 个分类阈值 -----------
@@ -1162,7 +1225,7 @@ int main(int argc, char** argv) {
                                 sg_door.support, sg_ext.scale_x, sg_ext.width_px);
                 }
             }
-            const gap_avoid::Vec2 cmd = decide(frame, args, st, &sg_door, &sg_ext);
+            const gap_avoid::Vec2 cmd = decide(frame, args, st, &sg_doors, &sg_ext);
             const int action = vision_board::action_from_velocity(
                 cmd.x, cmd.y, args.action_deadzone);
             if (args.echo_action) {
