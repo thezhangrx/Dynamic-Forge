@@ -20,6 +20,7 @@
 // ===========================================================================
 #include "auto_params.hpp"
 #include "band_gap.hpp"
+#include "rectify.hpp"
 #include "fiducial_zone.hpp"
 #include "segment_merge.hpp"
 #include "gap_avoid.hpp"
@@ -755,7 +756,8 @@ private:
 gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
                        const std::vector<band_gap::Door>* doors,
                        const band_gap::Extent* ext,
-                       const band_gap::Player* splayer) {
+                       const band_gap::Player* splayer,
+                       const rectify::Homography* hmap) {
     // ---- dt：两帧 stamp 之差 ----
     double dt = args.dt_default;
     bool dt_is_default = true;
@@ -796,9 +798,26 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
         // 而板子的规矩是"没角色就 stay"。这里仍然只给像素坐标，下面统一换算。
         if (splayer && splayer->found && !doors->empty()) {
             f.player.present = true;
-            f.player.x = splayer->x;
-            f.player.y = splayer->y;
-            f.player.radius = 0.25 * static_cast<double>(splayer->w + splayer->h);
+            if (hmap && hmap->ok) {
+                const auto q = hmap->apply(splayer->x, splayer->y);
+                f.player.x = q[0];
+                f.player.y = q[1];
+                // 半径用两点映射量（单应会把圆压成椭圆，取两轴平均）
+                const double rr = 0.5 * static_cast<double>(splayer->w);
+                const auto qx = hmap->apply(splayer->x + rr, splayer->y);
+                const auto qy = hmap->apply(splayer->x, splayer->y + rr);
+                const double rx = std::hypot(qx[0] - q[0], qx[1] - q[1]);
+                const double ry = std::hypot(qy[0] - q[0], qy[1] - q[1]);
+                f.player.radius = 0.5 * (rx + ry);
+                // **掩膜**：单应映射后必须在场地四边形内，否则这一帧没有可信角色
+                if (!hmap->inside(splayer->x, splayer->y, args.field_w, args.field_h, 0.0)) {
+                    f.player.present = false;
+                }
+            } else {
+                f.player.x = splayer->x;
+                f.player.y = splayer->y;
+                f.player.radius = 0.25 * static_cast<double>(splayer->w + splayer->h);
+            }
         }
         const double ox = static_cast<double>(ext->x0), oy = static_cast<double>(ext->y0);
         if (f.player.present) {
@@ -975,10 +994,16 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
             const double by = near_one ? sm_y : 0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale_y;
             const double hh = near_one ? sm_hh
                                        : 0.5 * (static_cast<double>(d.y1 - d.y0) + 1.0) * s_scale_y;
-            double gl = near_one ? sm_cx - 0.5 * sm_w
-                                 : (static_cast<double>(d.x0) - ox) * s_scale;
-            double gr = near_one ? sm_cx + 0.5 * sm_w
-                                 : (static_cast<double>(d.x1) - ox) * s_scale;
+            double gl, gr;
+            if (hmap && hmap->ok) {
+                const double band_row = 0.5 * (static_cast<double>(d.y0) + d.y1);
+                gl = hmap->apply(static_cast<double>(d.x0), band_row)[0];
+                gr = hmap->apply(static_cast<double>(d.x1), band_row)[0];
+                if (near_one) { gl = sm_cx - 0.5 * sm_w; gr = sm_cx + 0.5 * sm_w; }
+            } else {
+                gl = near_one ? sm_cx - 0.5 * sm_w : (static_cast<double>(d.x0) - ox) * s_scale;
+                gr = near_one ? sm_cx + 0.5 * sm_w : (static_cast<double>(d.x1) - ox) * s_scale;
+            }
             // 缺口只在**场地内**才有意义（场外不算可通行）
             if (gl < 0.0) gl = 0.0;
             if (gr > args.field_w) gr = args.field_w;
@@ -1328,6 +1353,7 @@ int main(int argc, char** argv) {
         std::vector<band_gap::Door> sg_doors;
         band_gap::Player sg_player;
         int sg_min_gap_px = 0;
+        rectify::Homography sg_h;
         if (args.structural_gap && !rgb.empty() && pw > 0 && ph > 0) {
             sg_ext = band_gap::field_extent(rgb.data(), pw, ph,
                                             args.field_w, args.field_h,
@@ -1341,6 +1367,17 @@ int main(int argc, char** argv) {
                 sg_min_gap_px = static_cast<int>(1.6 * dia_px);
             } else {
                 sg_player = band_gap::find_player(rgb.data(), pw, ph);
+            // 四角标记 → 单应（吃掉旋转与透视），并给出场地四边形掩膜
+            {
+                const std::vector<rectify::Marker> ms =
+                    rectify::find_markers(rgb.data(), pw, ph);
+                if (ms.size() == 4) {
+                    // find_markers 按象限返回 TL,TR,BL,BR；单应要求 TL,TR,BR,BL
+                    const std::array<std::array<double, 2>, 4> img = {{{ms[0].x, ms[0].y},
+                        {ms[1].x, ms[1].y}, {ms[3].x, ms[3].y}, {ms[2].x, ms[2].y}}};
+                    sg_h = rectify::solve(img, rectify::contract_markers(args.field_w, args.field_h));
+                }
+            }
             }
             sg_doors = band_gap::find_all(rgb.data(), pw, ph, 6, 40, 6, 5.0f, 10.0f, 2.5f,
                                           sg_min_gap_px);
@@ -1544,7 +1581,7 @@ int main(int argc, char** argv) {
                 }
             }
             const gap_avoid::Vec2 cmd =
-                decide(frame, args, st, &sg_doors, &sg_ext, &sg_player);
+                decide(frame, args, st, &sg_doors, &sg_ext, &sg_player, &sg_h);
             const int action = vision_board::action_from_velocity(
                 cmd.x, cmd.y, args.action_deadzone);
             if (args.echo_action) {
