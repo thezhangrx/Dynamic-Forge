@@ -184,7 +184,29 @@ inline bool field_region_bbox(const uint8_t* rgb, int w, int h,
         }
         return 255;
     };
-    const int thr = (q(0.10) + q(0.90)) / 2;
+    // **Otsu**（双峰）：屏幕/场地 vs 黑边，两类亮度差很大。
+    // 之前用 (p10+p90)/2，p90 被墙的高光抬高 → 阈值偏高，只能圈到屏幕上半部分
+    // （实测 y=34..227，下半场被切掉，四角标记自然凑不齐）。
+    int thr = 0;
+    {
+        double total = 0.0, sum = 0.0;
+        for (int v = 0; v < 256; ++v) {
+            total += hist[static_cast<size_t>(v)];
+            sum += static_cast<double>(v) * hist[static_cast<size_t>(v)];
+        }
+        double w0 = 0.0, s0 = 0.0, best = -1.0;
+        for (int v = 0; v < 256; ++v) {
+            w0 += hist[static_cast<size_t>(v)];
+            if (w0 <= 0) continue;
+            s0 += static_cast<double>(v) * hist[static_cast<size_t>(v)];
+            const double w1 = total - w0;
+            if (w1 <= 0) break;
+            const double m0 = s0 / w0, m1 = (sum - s0) / w1;
+            const double var = w0 * w1 * (m0 - m1) * (m0 - m1);
+            if (var > best) { best = var; thr = v; }
+        }
+    }
+    (void)q;
     // 列/行的"亮像素占比"：场地是成片亮的，边框/杂物只占少数列
     std::vector<int> colcnt(static_cast<size_t>(w), 0), rowcnt(static_cast<size_t>(h), 0);
     for (int y = 0; y < h; ++y) {
@@ -211,57 +233,53 @@ inline bool field_region_bbox(const uint8_t* rgb, int w, int h,
 }
 
 
-//: 用**暗框**找四角标记（黑底 + 白图案里的黑框），失败时调用方退回亮块检测。
+//: 用"**黑块 + 亮环**"找四角标记。
 //:
-//: 为什么需要第二条路：真机位照片上，标记的白图案和墙的高光混在一起，
-//: "亮块"检测只能稳定找到 2~3 个，而且会选中墙端（实测四角拼出来的单应把场地
-//: 映射到画面外，宽 745 px > 640）。标记的**黑框**是场上最暗的东西，反而更干净。
+//: 判据只用几何/亮度关系，不含像素常数：
+//:   * 标记 = 一块**暗**（黑底）；
+//:   * 它的**周围是亮的**（标定标记贴在场地上，四周是场地底色/网格）；
+//:   * 尺寸接近"场地宽 × 48/640"（契约：边长 48、场地 640）。
+//:
+//: 这条"亮环"判据正好把**屏幕黑边/键盘/边框**排掉 —— 那些也是暗的，但四周也是暗的。
+//: 踩过的坑：只看"暗块"，屏幕黑边会和标记的黑框连成一片，底部两个标记直接被滤掉。
 inline std::vector<Marker> find_markers_dark(const uint8_t* rgb, int w, int h) {
     std::vector<Marker> res;
     if (!rgb || w < 32 || h < 32) return res;
-    int rx0 = 0, rx1 = w - 1, ry0 = 0, ry1 = h - 1;
-    if (!field_region_bbox(rgb, w, h, &rx0, &rx1, &ry0, &ry1)) return res;
+    auto lum = [&](int x, int y) {
+        const size_t i = (static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)) * 3;
+        int l = rgb[i];
+        if (rgb[i + 1] > l) l = rgb[i + 1];
+        if (rgb[i + 2] > l) l = rgb[i + 2];
+        return l;
+    };
+    // 全场亮度中位数（用于"暗"的判据：低于中位数的一半）
     std::vector<int> hh(256, 0);
     for (int i = 0; i < w * h; ++i) {
-        const int o = i * 3;
-        int l = rgb[o];
-        if (rgb[o + 1] > l) l = rgb[o + 1];
-        if (rgb[o + 2] > l) l = rgb[o + 2];
+        int l = rgb[i * 3];
+        if (rgb[i * 3 + 1] > l) l = rgb[i * 3 + 1];
+        if (rgb[i * 3 + 2] > l) l = rgb[i * 3 + 2];
         ++hh[static_cast<size_t>(l)];
     }
+    long acc = 0;
+    int med = 0;
     const long total = static_cast<long>(w) * h;
-    auto qq = [&](double f) {
-        const double want = f * static_cast<double>(total);
-        long acc = 0;
-        for (size_t v = 0; v < hh.size(); ++v) {
-            acc += hh[v];
-            if (static_cast<double>(acc) >= want) return static_cast<int>(v);
-        }
-        return 255;
-    };
-    const int thr = (qq(0.10) + qq(0.50)) / 2;
+    for (int v = 0; v < 256; ++v) {
+        acc += hh[static_cast<size_t>(v)];
+        if (acc * 2 >= total) { med = v; break; }
+    }
+    const int thr = med / 2;              // "暗"= 低于全场中位数的一半
+
     struct Comp { int x0, y0, x1, y1; long area, sx, sy; };
     std::vector<Comp> comps;
     struct Run { int a, b, id; };
     std::vector<Run> prev;
-    for (int y = ry0; y <= ry1; ++y) {
+    for (int y = 0; y < h; ++y) {
         std::vector<Run> cur;
-        int x = rx0;
-        while (x <= rx1) {
-            const int o = (y * w + x) * 3;
-            int l = rgb[o];
-            if (rgb[o + 1] > l) l = rgb[o + 1];
-            if (rgb[o + 2] > l) l = rgb[o + 2];
-            if (l > thr) { ++x; continue; }
+        int x = 0;
+        while (x < w) {
+            if (lum(x, y) > thr) { ++x; continue; }
             const int s0 = x;
-            while (x <= rx1) {
-                const int k = (y * w + x) * 3;
-                int v = rgb[k];
-                if (rgb[k + 1] > v) v = rgb[k + 1];
-                if (rgb[k + 2] > v) v = rgb[k + 2];
-                if (v > thr) break;
-                ++x;
-            }
+            while (x < w && lum(x, y) <= thr) ++x;
             int id = -1;
             for (const Run& r : prev)
                 if (r.a <= x - 1 && r.b >= s0) { id = r.id; break; }
@@ -280,24 +298,63 @@ inline std::vector<Marker> find_markers_dark(const uint8_t* rgb, int w, int h) {
         }
         prev = cur;
     }
-    const double mx = 0.5 * (rx0 + rx1), my = 0.5 * (ry0 + ry1);
-    std::vector<Marker> quad(4);
-    std::vector<double> best(4, 1e18);
+    std::vector<Marker> cands;
     for (const Comp& c : comps) {
         const int bw = c.x1 - c.x0 + 1, bh = c.y1 - c.y0 + 1;
-        if (c.area < 200 || c.area > 12000) continue;      // 标记的黑框是"块"，不是细线
+        const double side = 0.5 * (bw + bh);
+        if (side < 12.0 || side > 120.0) continue;
+        if (c.area < 0.4 * side * side) continue;          // 方块（不是细线）
         const double asp = static_cast<double>(bw > bh ? bw : bh) /
                            static_cast<double>(bw < bh ? bw : bh);
         if (asp >= 2.0) continue;
-        const double cx = static_cast<double>(c.sx) / c.area + 0.5;
-        const double cy = static_cast<double>(c.sy) / c.area + 0.5;
-        const int q = (cx < mx ? 0 : 1) + (cy < my ? 0 : 2);
-        const double tx = (q % 2 == 0) ? static_cast<double>(rx0) : static_cast<double>(rx1);
-        const double ty = (q / 2 == 0) ? static_cast<double>(ry0) : static_cast<double>(ry1);
-        const double d = std::hypot(cx - tx, cy - ty);
+        // **亮环**：取 bbox 外扩 8 px 的一圈，均值要明显高于块本身
+        const int gx0 = c.x0 - 8, gx1 = c.x1 + 8, gy0 = c.y0 - 8, gy1 = c.y1 + 8;
+        long ring_sum = 0, ring_n = 0, in_sum = 0, in_n = 0;
+        for (int y = gy0; y <= gy1; ++y) {
+            if (y < 0 || y >= h) continue;
+            for (int x = gx0; x <= gx1; ++x) {
+                if (x < 0 || x >= w) continue;
+                const int l = lum(x, y);
+                const bool inside = (x >= c.x0 && x <= c.x1 && y >= c.y0 && y <= c.y1);
+                if (inside) { in_sum += l; ++in_n; }
+                // 环上只统计**亮**的部分：标记贴边时环里会混进屏幕黑边，
+                // 把"四周是亮的"这条判据的整体均值拉低，导致贴边的标记被丢掉。
+                else if (l > med / 2) { ring_sum += l; ++ring_n; }
+            }
+        }
+        if (ring_n == 0 || in_n == 0) continue;
+        const double in_mean = static_cast<double>(in_sum) / in_n;
+        const double ring_mean = static_cast<double>(ring_sum) / ring_n;
+        if (ring_mean < 1.6 * in_mean + 8.0) continue;      // 四周要明显更亮
+        // 环上"亮"的比例不能太低（否则只是块边上的一点反光）
+        {
+            long lit = 0, all = 0;
+            for (int y = gy0; y <= gy1; ++y) {
+                if (y < 0 || y >= h) continue;
+                for (int x = gx0; x <= gx1; ++x) {
+                    if (x < 0 || x >= w) continue;
+                    if (x >= c.x0 && x <= c.x1 && y >= c.y0 && y <= c.y1) continue;
+                    ++all;
+                    if (lum(x, y) > med / 2) ++lit;
+                }
+            }
+            if (all == 0 || lit * 4 < all) continue;
+        }
+        cands.push_back(Marker{static_cast<double>(c.sx) / c.area + 0.5,
+                               static_cast<double>(c.sy) / c.area + 0.5, bw, bh});
+    }
+    // 四象限各取一个"离该象限的场角最近"的候选
+    std::vector<Marker> quad(4);
+    std::vector<double> best(4, 1e18);
+    const double mx = 0.5 * w, my = 0.5 * h;
+    for (const Marker& m : cands) {
+        const int q = (m.x < mx ? 0 : 1) + (m.y < my ? 0 : 2);
+        const double cx = (q % 2 == 0) ? 0.0 : static_cast<double>(w - 1);
+        const double cy = (q / 2 == 0) ? 0.0 : static_cast<double>(h - 1);
+        const double d = std::hypot(m.x - cx, m.y - cy);
         if (d < best[static_cast<size_t>(q)]) {
             best[static_cast<size_t>(q)] = d;
-            quad[static_cast<size_t>(q)] = Marker{cx, cy, bw, bh};
+            quad[static_cast<size_t>(q)] = m;
         }
     }
     for (int i = 0; i < 4; ++i)
