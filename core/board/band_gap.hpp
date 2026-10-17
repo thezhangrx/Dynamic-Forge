@@ -570,4 +570,114 @@ inline Extent field_extent(const uint8_t* rgb, int w, int h, double field_w = 64
     return e;
 }
 
+// ===========================================================================
+// 为什么不能只靠 RTL 的玩家检测：它按"亮 + 低饱和"分类，而真机位把橙墙拍成了
+// **淡粉白**（饱和也很低），于是墙和角色被同一类接走 —— 角色要么被墙吞掉、
+// 要么因为合并后的面积超过 `player_max_area` 被丢掉。实测板上 28/40 帧"无角色"，
+// 而板子的规矩是"没角色就 stay"，于是平台永远不动。
+//
+// 这里的判据只用到两个**契约事实**：场景里只有角色是**圆的**，而且它是**最亮**的东西。
+//   1. 阈值取 `t_l + 0.75*(Lmax - t_l)`（t_l 是场地边框量出的背景/亮物分界，
+//      Lmax 是本帧最亮像素）—— 相对量，不含"这台相机"的常数；
+//   2. 连通域按 4 邻域扫两遍（并查集就够），保留 fill ∈ [0.4, 0.95]、aspect < 2、
+//      面积 ∈ [16, 4000] 的那几个，取**最亮**的一个的质心。
+struct Player {
+    bool found = false;
+    double x = 0.0, y = 0.0;   // 图像坐标（质心）
+    int w = 0, h = 0;          // 外接框
+    double fill = 0.0;
+};
+
+/// `t_l` 传 0 就表示"阈值只相对本帧最亮像素"（`0.75·Lmax`）：曝光/白平衡是整幅图
+/// 一起变，`Lmax` 也跟着变，所以这条阈值天然跨曝光；真正区分角色与墙的是**形状**
+/// （`aspect < 2`：墙是长条，角色是圆）。
+inline Player find_player(const uint8_t* rgb, int w, int h, int t_l = 0,
+                          int min_px = 0, int max_px = 0) {
+    Player out;
+    if (!rgb || w < 16 || h < 16) return out;
+    int lmax = 0;
+    for (int y = 0; y < h; ++y) {
+        const size_t base = static_cast<size_t>(y) * static_cast<size_t>(w);
+        for (int x = 0; x < w; ++x) {
+            const size_t i = base + static_cast<size_t>(x);
+            int l = rgb[i * 3];
+            if (rgb[i * 3 + 1] > l) l = rgb[i * 3 + 1];
+            if (rgb[i * 3 + 2] > l) l = rgb[i * 3 + 2];
+            if (l > lmax) lmax = l;
+        }
+    }
+    const int thr = t_l + static_cast<int>(0.75 * static_cast<double>(lmax - t_l));
+    if (lmax - t_l < 24 || thr <= 0) return out;   // 整帧没有"更亮的东西"
+
+    // 连通域：逐行游程 + 与上一行重叠合并（和 Python 的 scanline_blobs 同一套）
+    struct Comp { int x0, y0, x1, y1; long area; long sum_x; long sum_y; int peak; };
+    std::vector<Comp> comps;
+    struct Run { int x0, x1, comp; };
+    std::vector<Run> prev;
+    for (int y = 0; y < h; ++y) {
+        const size_t base = static_cast<size_t>(y) * static_cast<size_t>(w);
+        std::vector<Run> cur;
+        int x = 0;
+        while (x < w) {
+            int l = rgb[(base + static_cast<size_t>(x)) * 3];
+            if (rgb[(base + static_cast<size_t>(x)) * 3 + 1] > l) l = rgb[(base + static_cast<size_t>(x)) * 3 + 1];
+            if (rgb[(base + static_cast<size_t>(x)) * 3 + 2] > l) l = rgb[(base + static_cast<size_t>(x)) * 3 + 2];
+            if (l <= thr) { ++x; continue; }
+            const int s = x;
+            int peak = l;
+            while (x < w) {
+                const size_t i = base + static_cast<size_t>(x);
+                int v = rgb[i * 3];
+                if (rgb[i * 3 + 1] > v) v = rgb[i * 3 + 1];
+                if (rgb[i * 3 + 2] > v) v = rgb[i * 3 + 2];
+                if (v <= thr) break;
+                if (v > peak) peak = v;
+                ++x;
+            }
+            int id = -1;
+            for (const Run& r : prev) {
+                if (r.x0 <= x - 1 && r.x1 >= s) { id = r.comp; break; }
+            }
+            if (id < 0) {
+                comps.push_back(Comp{s, y, x - 1, y, 0, 0, 0, peak});
+                id = static_cast<int>(comps.size()) - 1;
+            }
+            Comp& c = comps[static_cast<size_t>(id)];
+            if (s < c.x0) c.x0 = s;
+            if (x - 1 > c.x1) c.x1 = x - 1;
+            c.y1 = y;
+            c.area += x - s;
+            c.sum_x += static_cast<long>(s + x - 1) * (x - s) / 2;
+            c.sum_y += static_cast<long>(y) * (x - s);
+            if (peak > c.peak) c.peak = peak;
+            cur.push_back(Run{s, x - 1, id});
+        }
+        prev = cur;
+    }
+
+    double best_peak = -1.0;
+    for (const Comp& c : comps) {
+        const int bw = c.x1 - c.x0 + 1;
+        const int bh = c.y1 - c.y0 + 1;
+        if (c.area < 16 || c.area > 4000) continue;
+        const int longest = bw > bh ? bw : bh;
+        if (min_px > 0 && longest < min_px) continue;
+        if (max_px > 0 && longest > max_px) continue;
+        const double fill = static_cast<double>(c.area) / (static_cast<double>(bw) * bh);
+        const double aspect = static_cast<double>(bw > bh ? bw : bh) /
+                              static_cast<double>(bw < bh ? bw : bh);
+        if (fill < 0.40 || fill > 0.98 || aspect >= 2.0) continue;
+        if (c.peak > best_peak) {
+            best_peak = static_cast<double>(c.peak);
+            out.found = true;
+            out.x = static_cast<double>(c.sum_x) / static_cast<double>(c.area) + 0.5;
+            out.y = static_cast<double>(c.sum_y) / static_cast<double>(c.area) + 0.5;
+            out.w = bw;
+            out.h = bh;
+            out.fill = fill;
+        }
+    }
+    return out;
+}
+
 }  // namespace band_gap
