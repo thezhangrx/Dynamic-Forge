@@ -32,10 +32,16 @@ echo "[gt_demo] 编译决策 CLI ..."
 g++ -std=c++17 -O2 -I core/cpu/cpp -o "$DEC" \
     core/board/tools/gt_decision_cli.cpp core/cpu/cpp/gap_avoid.cpp || exit 1
 
+# **先把生效的墙速打出来**（不靠肉眼判断快慢）：同一组参数走一遍场景构建。
+EXTRA_ARGS=""
+if [ -n "$SPEED" ]; then EXTRA_ARGS="--obstacle-speed $SPEED"; fi
+echo "[gt_demo] 场景速度自检："
+"$PY" core/board/tools/scene_speed.py play --input board $EXTRA_ARGS 2>&1 | sed 's/^/    /'
+
 echo "[gt_demo] 起仿真（--danger，分层势图）..."
 (setsid sh -c "tail -f /tmp/mv.txt | $PY -u -m bullet_sim board-control \
-    --input board --stdin --nostop --duration $SECS --fullscreen \
-    ${SPEED:+--obstacle-speed $SPEED} \
+    --stdin --nostop --duration $SECS --fullscreen \
+    $EXTRA_ARGS \
     --potential --state-pipe /tmp/state.pkt --state-log /tmp/gt.jsonl" > /tmp/sim_gt.log 2>&1 &)
 sleep 3
 echo '@MOVE 0' >> /tmp/mv.txt      # 喂一行，仿真才会开始跑（不等太久）
