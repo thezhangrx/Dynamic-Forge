@@ -19,6 +19,7 @@
 // `core/cpu/tests/test_cpp_gap_avoid.py`）。
 // ===========================================================================
 #include "fiducial_zone.hpp"
+#include "segment_merge.hpp"
 #include "gap_avoid.hpp"
 #include "motion.hpp"
 #include "action_codec.hpp"
@@ -77,6 +78,10 @@ struct Args {
     //: 标记周围还要额外留多少（场地单位）才算"这是标记不是角色"。
     //: 相机有透视/量化误差，标记的留白边也比黑边外沿大一圈（48 → 64）。
     double fiducial_slack = 12.0;
+    //: 矩形层"碎片合并"（见 `segment_merge.hpp`）：一堵墙被切成几段时并回一段。
+    //: 默认开；`--merge-gap-px 0` 关掉。实测真缺口约 58 px，所以默认 6 px 有 10 倍余量。
+    double merge_gap_px = 6.0;
+    double merge_dy_px = 4.0;
     //: 逐像素分类的 7 个阈值**覆盖**（负数 = 用 C 参考模型/Python 真值的默认值）。
     //:
     //: 为什么要有这个：判据是**绝对阈值**（`r-b>40` 这类），而相机拍屏幕会把
@@ -157,6 +162,8 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--fiducial-side")   a.fiducial_side = std::atof(next());
         else if (k == "--fiducial-margin") a.fiducial_margin = std::atof(next());
         else if (k == "--fiducial-slack")  a.fiducial_slack = std::atof(next());
+        else if (k == "--merge-gap-px")    a.merge_gap_px = std::atof(next());
+        else if (k == "--merge-dy-px")     a.merge_dy_px = std::atof(next());
         // 分类阈值覆盖（--wall-rb 等；不给就用默认值）
         else if (k == "--wall-rb")        a.ov_wall_rb = std::atoi(next());
         else if (k == "--wall-min-r")     a.ov_wall_min_r = std::atoi(next());
@@ -280,6 +287,8 @@ struct DecisionState {
     int n_failed = 0;
     //: 有几帧的"角色"落在四角标定标记上（被当没检出）—— 见 decide() 里的说明。
     int n_player_on_fiducial = 0;
+    //: 矩形层碎片合并的次数（"一堵墙被切成几段"被并回来的总次数）。
+    int n_merged_rects = 0;
     int tier_count[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // 见 tier_bucket()
 };
 
@@ -586,6 +595,16 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
         rects.push_back(r);
     }
 
+    // ---- 矩形层碎片合并（颜色分割 → 掩膜修复 → **形状/连通性** → 时序跟踪）----
+    int n_merged = 0;
+    if (args.merge_gap_px > 0.0 && rects.size() > 1) {
+        segment_merge::Params mp;
+        mp.max_gap = args.merge_gap_px;
+        mp.max_dy = args.merge_dy_px;
+        rects = segment_merge::merge_collinear(rects, mp, &n_merged);
+    }
+    if (n_merged > 0) st.n_merged_rects += n_merged;
+
     if (!rects.empty()) {
         std::vector<motion::Point> dets;
         dets.reserve(rects.size());
@@ -640,6 +659,7 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
                 std::isfinite(d.usable_half) ? d.usable_half : -1.0,
                 d.n_rects);
     if (n_degenerate > 0) std::printf("（丢了 %d 个退化矩形）", n_degenerate);
+    if (n_merged > 0) std::printf("（并了 %d 段碎墙）", n_merged);
     // 推出来的速度也打出来：线协议不带它，"到底推没推、推得对不对"只能看这一行。
     // 墙速取**最大**的那个（有多面墙时逐个打会把日志淹掉）。
     double wall_v = 0.0;
@@ -1035,6 +1055,10 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("\n");
+        if (st.n_merged_rects > 0) {
+            std::printf("其中矩形层碎片合并 %d 次（一堵墙被切成几段 → 并回一段）\n",
+                        st.n_merged_rects);
+        }
         if (st.n_player_on_fiducial > 0) {
             std::printf("其中 %d 帧的「角色」落在四角标定标记上（已当没检出，只发 stay）\n",
                         st.n_player_on_fiducial);
