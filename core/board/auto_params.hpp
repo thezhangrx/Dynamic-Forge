@@ -86,7 +86,34 @@ inline Stats measure(const std::vector<uint8_t>& rgb, int pw, int ph,
         ++hist_a[dd];
     }
     s.mad = static_cast<float>(quantile(hist_a, n, 0.5));
+    // ⚠ 合成图/干净图上 MAD 可以是 0（只有几种颜色，中位绝对偏差为 0），
+    // 这时 med + kσ 会退化成 med，墙阈值塌到地板 → 什么都被判成墙。
+    // 所以 σ 还必须**不低于本帧实测的传感器噪声**：用水平相邻像素差分估
+    // （缓慢的光照/色温梯度被差分消掉，剩下的才是噪声）。RTL 侧不需要知道这件事。
+    float noise = 0.0f;
+    {
+        std::vector<int> hist_noise(256, 0);
+        size_t cnt = 0;
+        for (int y = 0; y < ph; ++y) {
+            const size_t row = static_cast<size_t>(y) * static_cast<size_t>(pw);
+            for (int x = 1; x < pw; ++x) {
+                const size_t i = row + static_cast<size_t>(x);
+                int dd = (static_cast<int>(rgb[i * 3 + 0]) - static_cast<int>(rgb[i * 3 + 2]))
+                       - (static_cast<int>(rgb[(i - 1) * 3 + 0]) - static_cast<int>(rgb[(i - 1) * 3 + 2]));
+                if (dd < 0) dd = -dd;
+                if (dd > 255) dd = 255;
+                ++hist_noise[dd];
+                ++cnt;
+            }
+        }
+        if (cnt > 0) {
+            // 差分噪声的 MAD 再除以 √2（两个独立样本之差）
+            const float mad_n = static_cast<float>(quantile(hist_noise, cnt, 0.5));
+            noise = 1.4826f * mad_n / 1.4142f;
+        }
+    }
     s.sd = 1.4826f * s.mad;
+    if (noise > s.sd) s.sd = noise;
     s.ok = true;
     return s;
 }
