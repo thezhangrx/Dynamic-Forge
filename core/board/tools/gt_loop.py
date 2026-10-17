@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import math
 import subprocess
@@ -124,25 +125,38 @@ def main(argv=None) -> int:
     state_path, out_path = Path(args.state), Path(args.out)
     state_path.touch(exist_ok=True)
     out_path.touch(exist_ok=True)
+    # ⚠ 增量读：以前每轮都 `read_text()` 把整个状态日志读一遍，日志越长越慢 ——
+    # 跑到后面中继的决策频率掉下来，表现就是"板子信号卡顿、有延迟"。
+    # 现在只读新增的字节（seek + read）。
     pos = 0
+    pending = b""
     n = 0
     t0 = time.time()
     while time.time() - t0 < args.max_seconds:
         if args.max_frames and n >= args.max_frames:
             break
+        # 状态日志可能被重写/重建（每次跑 demo 都会新建），所以要检查 inode：
+        # inode 变了就重开，否则会读到一个已被删掉的旧文件（I/O on closed file）。
+        # 每轮重开 + seek：状态日志会被 demo 重写，长期持有句柄会读到"已删除"的旧文件。
+        # 只读新增字节，所以开销与日志长度无关（以前是整文件重读，越跑越慢）。
         try:
-            data = state_path.read_text(encoding="utf-8", errors="replace")
+            with state_path.open("rb") as fh:
+                fh.seek(pos)
+                chunk = fh.read()
+                pos = fh.tell()
         except FileNotFoundError:
-            time.sleep(0.05)
+            time.sleep(0.01)
             continue
-        new = data[pos:]
-        if not new.strip():
-            time.sleep(0.02)
+        if not chunk:
+            time.sleep(0.004)
             continue
-        pos = len(data)
-        for line in new.splitlines():
+        pending += chunk
+        if b"\n" not in pending:
+            continue
+        *complete, pending = pending.split(b"\n")
+        for line in complete:
             try:
-                obj = json.loads(line)
+                obj = json.loads(line.decode("utf-8", "replace"))
             except Exception:
                 continue
             decide.stdin.write(gt_line(obj) + "\n")
