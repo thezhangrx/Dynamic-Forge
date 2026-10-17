@@ -202,6 +202,13 @@ def _add_play_args(p: argparse.ArgumentParser, *, input_default: str = "manual")
     p.add_argument("--danger-every", type=int, default=4,
                    help="recompute the danger field every N rendered frames")
     p.add_argument("--horizon", type=int, default=90)
+    p.add_argument(
+        "--state-log",
+        default=None,
+        metavar="FILE",
+        help="**仿真真值日志**（每帧一行 JSON：角色与所有障碍的世界坐标）。"
+             "配合 core/board/tools/score_vs_sim.py，把板子报的几何与真值按场地单位对账",
+    )
     p.add_argument("--fullscreen", action="store_true",
                    help="全屏显示场地（调试视觉时建议开：场地就是整个屏幕，"
                         "窗口外的桌面内容不会再被当成目标）")
@@ -1163,6 +1170,10 @@ def cmd_play(args: argparse.Namespace) -> int:
         **_collision_kwargs(args, spec),
     )
 
+    _state_log = None
+    if getattr(args, "state_log", None):
+        _state_log = open(args.state_log, "w", encoding="utf-8")
+
     mode = "manual" if args.interactive else args.input
     switchable = not args.no_switch
     try:
@@ -1337,6 +1348,32 @@ def cmd_play(args: argparse.Namespace) -> int:
                 except Exception:  # pragma: no cover - overlay must never break the loop
                     renderer.danger = None
             frame_index += 1
+            if _state_log is not None:
+                # 真值：角色 + 所有障碍（矩形带 half_w/half_h/rotation，圆带半径）
+                _pl = env.world.player
+                _obs = []
+                _pool = getattr(getattr(env.world, "state", None), "bullets", None)
+                if _pool is not None:
+                    try:
+                        _n = int(getattr(_pool, "count", len(_pool.alive)))
+                    except Exception:
+                        _n = 0
+                    for _i in range(min(_n, int(getattr(_pool, "capacity", _n)))):
+                        try:
+                            if not bool(_pool.alive[_i]):
+                                continue
+                            _obs.append([float(_pool.x[_i]), float(_pool.y[_i]),
+                                         float(_pool.half_w[_i]), float(_pool.half_h[_i]),
+                                         float(getattr(_pool, "rotation", [0.0] * _n)[_i])])
+                        except Exception:
+                            continue
+                _state_log.write(json.dumps({
+                    "frame": frame_index,
+                    "t": steps_done * float(env.spec.dt) if hasattr(env, "spec") else steps_done,
+                    "player": [float(_pl[0]), float(_pl[1]), float(_pl[4])],
+                    "obstacles": _obs,
+                }) + "\n")
+                _state_log.flush()
             # ⚠ 窗口被关掉时 SDL 不一定投递 pygame.QUIT（WSLg 上实测过），
             #   而 `--nostop` 不设步数上限 —— 那就变成"窗口没了、进程还在跑"（卡死）。
             #   所以每一帧都判一次显示是否还活着，渲染失败也直接退。
