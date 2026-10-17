@@ -156,6 +156,155 @@ struct Marker {
     int w = 0, h = 0;
 };
 
+/// **场地亮区**的包围盒：把画面按亮度二值化（阈值取 (p10+p90)/2，与配色无关），
+/// 取最大连通区的包围盒。
+///
+/// 为什么需要它：`find_markers` 原来按"每个象限里离画面角最近的最亮块"选，
+/// 实测会选到**屏幕边框/键盘反光**（照片里四角附近确实有更亮的东西），
+/// 于是四角标记拼出来的单应把场地映射到画面外（bbox 宽 745 px > 画面 640）。
+/// 先用亮区把"屏幕/场地"圈出来，再从里面挑标记，就不会跑到画面外的杂物上。
+inline bool field_region_bbox(const uint8_t* rgb, int w, int h,
+                              int* x0, int* x1, int* y0, int* y1) {
+    if (!rgb || w < 32 || h < 32) return false;
+    std::vector<int> hist(256, 0);
+    for (int i = 0; i < w * h; ++i) {
+        const int o = i * 3;
+        int l = rgb[o];
+        if (rgb[o + 1] > l) l = rgb[o + 1];
+        if (rgb[o + 2] > l) l = rgb[o + 2];
+        ++hist[static_cast<size_t>(l)];
+    }
+    const long n = static_cast<long>(w) * h;
+    auto q = [&](double f) {
+        const double want = f * static_cast<double>(n);
+        long acc = 0;
+        for (size_t v = 0; v < hist.size(); ++v) {
+            acc += hist[v];
+            if (static_cast<double>(acc) >= want) return static_cast<int>(v);
+        }
+        return 255;
+    };
+    const int thr = (q(0.10) + q(0.90)) / 2;
+    // 列/行的"亮像素占比"：场地是成片亮的，边框/杂物只占少数列
+    std::vector<int> colcnt(static_cast<size_t>(w), 0), rowcnt(static_cast<size_t>(h), 0);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const int o = (y * w + x) * 3;
+            int l = rgb[o];
+            if (rgb[o + 1] > l) l = rgb[o + 1];
+            if (rgb[o + 2] > l) l = rgb[o + 2];
+            if (l > thr) { ++colcnt[static_cast<size_t>(x)]; ++rowcnt[static_cast<size_t>(y)]; }
+        }
+    }
+    auto span = [](const std::vector<int>& cnt, int limit) {
+        int lo = -1, hi = -1;
+        for (int i = 0; i < static_cast<int>(cnt.size()); ++i) {
+            if (cnt[static_cast<size_t>(i)] * 2 >= limit) { if (lo < 0) lo = i; hi = i; }
+        }
+        return std::pair<int, int>{lo, hi};
+    };
+    const auto cx = span(colcnt, h);
+    const auto cy = span(rowcnt, w);
+    if (cx.first < 0 || cy.first < 0) return false;
+    *x0 = cx.first; *x1 = cx.second; *y0 = cy.first; *y1 = cy.second;
+    return (*x1 - *x0) > w / 3 && (*y1 - *y0) > h / 3;
+}
+
+
+//: 用**暗框**找四角标记（黑底 + 白图案里的黑框），失败时调用方退回亮块检测。
+//:
+//: 为什么需要第二条路：真机位照片上，标记的白图案和墙的高光混在一起，
+//: "亮块"检测只能稳定找到 2~3 个，而且会选中墙端（实测四角拼出来的单应把场地
+//: 映射到画面外，宽 745 px > 640）。标记的**黑框**是场上最暗的东西，反而更干净。
+inline std::vector<Marker> find_markers_dark(const uint8_t* rgb, int w, int h) {
+    std::vector<Marker> res;
+    if (!rgb || w < 32 || h < 32) return res;
+    int rx0 = 0, rx1 = w - 1, ry0 = 0, ry1 = h - 1;
+    if (!field_region_bbox(rgb, w, h, &rx0, &rx1, &ry0, &ry1)) return res;
+    std::vector<int> hh(256, 0);
+    for (int i = 0; i < w * h; ++i) {
+        const int o = i * 3;
+        int l = rgb[o];
+        if (rgb[o + 1] > l) l = rgb[o + 1];
+        if (rgb[o + 2] > l) l = rgb[o + 2];
+        ++hh[static_cast<size_t>(l)];
+    }
+    const long total = static_cast<long>(w) * h;
+    auto qq = [&](double f) {
+        const double want = f * static_cast<double>(total);
+        long acc = 0;
+        for (size_t v = 0; v < hh.size(); ++v) {
+            acc += hh[v];
+            if (static_cast<double>(acc) >= want) return static_cast<int>(v);
+        }
+        return 255;
+    };
+    const int thr = (qq(0.10) + qq(0.50)) / 2;
+    struct Comp { int x0, y0, x1, y1; long area, sx, sy; };
+    std::vector<Comp> comps;
+    struct Run { int a, b, id; };
+    std::vector<Run> prev;
+    for (int y = ry0; y <= ry1; ++y) {
+        std::vector<Run> cur;
+        int x = rx0;
+        while (x <= rx1) {
+            const int o = (y * w + x) * 3;
+            int l = rgb[o];
+            if (rgb[o + 1] > l) l = rgb[o + 1];
+            if (rgb[o + 2] > l) l = rgb[o + 2];
+            if (l > thr) { ++x; continue; }
+            const int s0 = x;
+            while (x <= rx1) {
+                const int k = (y * w + x) * 3;
+                int v = rgb[k];
+                if (rgb[k + 1] > v) v = rgb[k + 1];
+                if (rgb[k + 2] > v) v = rgb[k + 2];
+                if (v > thr) break;
+                ++x;
+            }
+            int id = -1;
+            for (const Run& r : prev)
+                if (r.a <= x - 1 && r.b >= s0) { id = r.id; break; }
+            if (id < 0) {
+                comps.push_back(Comp{s0, y, x - 1, y, 0, 0, 0});
+                id = static_cast<int>(comps.size()) - 1;
+            }
+            Comp& c = comps[static_cast<size_t>(id)];
+            if (s0 < c.x0) c.x0 = s0;
+            if (x - 1 > c.x1) c.x1 = x - 1;
+            c.y1 = y;
+            c.area += x - s0;
+            c.sx += static_cast<long>(s0 + x - 1) * (x - s0) / 2;
+            c.sy += static_cast<long>(y) * (x - s0);
+            cur.push_back(Run{s0, x - 1, id});
+        }
+        prev = cur;
+    }
+    const double mx = 0.5 * (rx0 + rx1), my = 0.5 * (ry0 + ry1);
+    std::vector<Marker> quad(4);
+    std::vector<double> best(4, 1e18);
+    for (const Comp& c : comps) {
+        const int bw = c.x1 - c.x0 + 1, bh = c.y1 - c.y0 + 1;
+        if (c.area < 200 || c.area > 12000) continue;      // 标记的黑框是"块"，不是细线
+        const double asp = static_cast<double>(bw > bh ? bw : bh) /
+                           static_cast<double>(bw < bh ? bw : bh);
+        if (asp >= 2.0) continue;
+        const double cx = static_cast<double>(c.sx) / c.area + 0.5;
+        const double cy = static_cast<double>(c.sy) / c.area + 0.5;
+        const int q = (cx < mx ? 0 : 1) + (cy < my ? 0 : 2);
+        const double tx = (q % 2 == 0) ? static_cast<double>(rx0) : static_cast<double>(rx1);
+        const double ty = (q / 2 == 0) ? static_cast<double>(ry0) : static_cast<double>(ry1);
+        const double d = std::hypot(cx - tx, cy - ty);
+        if (d < best[static_cast<size_t>(q)]) {
+            best[static_cast<size_t>(q)] = d;
+            quad[static_cast<size_t>(q)] = Marker{cx, cy, bw, bh};
+        }
+    }
+    for (int i = 0; i < 4; ++i)
+        if (best[static_cast<size_t>(i)] < 1e17) res.push_back(quad[static_cast<size_t>(i)]);
+    return res;
+}
+
 inline std::vector<Marker> find_markers(const uint8_t* rgb, int w, int h) {
     std::vector<Marker> out;
     if (!rgb || w < 32 || h < 32) return out;
@@ -172,6 +321,34 @@ inline std::vector<Marker> find_markers(const uint8_t* rgb, int w, int h) {
     }
     const int thr = static_cast<int>(0.75 * static_cast<double>(lmax));
     if (lmax < 48) return out;                 // 整帧没有亮物
+    // **暗框优先**：标定标记是"黑底 + 白图案"，它的黑框是场上最暗的东西；
+    // 而"亮块"在真机位上会和墙的高光混在一起（实测只找到 3 个、且有一个在墙上）。
+    // 阈值取全场亮度的 (p10+p50)/2 —— 相对量，不含相机常数。
+    int thr_dark = 0;
+    {
+        std::vector<int> hh(256, 0);
+        for (int y = 0; y < h; ++y) {
+            const size_t base = static_cast<size_t>(y) * static_cast<size_t>(w);
+            for (int x = 0; x < w; ++x) {
+                const size_t k = base + static_cast<size_t>(x);
+                int l = rgb[k * 3];
+                if (rgb[k * 3 + 1] > l) l = rgb[k * 3 + 1];
+                if (rgb[k * 3 + 2] > l) l = rgb[k * 3 + 2];
+                ++hh[static_cast<size_t>(l)];
+            }
+        }
+        const long total = static_cast<long>(w) * h;
+        auto qq = [&](double f) {
+            const double want = f * static_cast<double>(total);
+            long acc = 0;
+            for (size_t v = 0; v < hh.size(); ++v) {
+                acc += hh[v];
+                if (static_cast<double>(acc) >= want) return static_cast<int>(v);
+            }
+            return 255;
+        };
+        thr_dark = (qq(0.10) + qq(0.50)) / 2;
+    }
 
     struct Comp { int x0, y0, x1, y1; long area, sx, sy; int peak; };
     std::vector<Comp> comps;
@@ -226,13 +403,20 @@ inline std::vector<Marker> find_markers(const uint8_t* rgb, int w, int h) {
         out.push_back(Marker{static_cast<double>(c.sx) / c.area + 0.5,
                              static_cast<double>(c.sy) / c.area + 0.5, bw, bh});
     }
-    // 每个象限取最靠近该角的候选（标记就在四角；墙上/角色上的亮块通常不贴角）
+    // 每个象限取**离场地亮区四角最近**的候选（标记就在四角）。
+    // 用亮区包围盒而不是画面边界：画面四角附近常有屏幕边框/键盘反光。
+    int rx0 = 0, rx1 = w - 1, ry0 = 0, ry1 = h - 1;
+    if (!field_region_bbox(rgb, w, h, &rx0, &rx1, &ry0, &ry1)) {
+        rx0 = 0; rx1 = w - 1; ry0 = 0; ry1 = h - 1;
+    }
+    const double mx = 0.5 * (rx0 + rx1), my = 0.5 * (ry0 + ry1);
     std::vector<Marker> quad(4);
     std::vector<double> best(4, 1e18);
     for (const Marker& m : out) {
-        const int q = (m.x < 0.5 * w ? 0 : 1) + (m.y < 0.5 * h ? 0 : 2);
-        const double cx = (q % 2 == 0) ? 0.0 : static_cast<double>(w);
-        const double cy = (q / 2 == 0) ? 0.0 : static_cast<double>(h);
+        if (m.x < rx0 || m.x > rx1 || m.y < ry0 || m.y > ry1) continue;
+        const int q = (m.x < mx ? 0 : 1) + (m.y < my ? 0 : 2);
+        const double cx = (q % 2 == 0) ? static_cast<double>(rx0) : static_cast<double>(rx1);
+        const double cy = (q / 2 == 0) ? static_cast<double>(ry0) : static_cast<double>(ry1);
         const double d = std::hypot(m.x - cx, m.y - cy);
         if (d < best[static_cast<size_t>(q)]) {
             best[static_cast<size_t>(q)] = d;
