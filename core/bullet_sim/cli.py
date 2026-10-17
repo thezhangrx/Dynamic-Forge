@@ -1367,8 +1367,13 @@ def cmd_play(args: argparse.Namespace) -> int:
                                          float(getattr(_pool, "rotation", [0.0] * _n)[_i])])
                         except Exception:
                             continue
+                try:
+                    _na = int(getattr(source, "n_actions", -1))
+                except Exception:
+                    _na = -1
                 _state_log.write(json.dumps({
                     "frame": frame_index,
+                    "board_actions": _na,
                     "t": steps_done * float(env.spec.dt) if hasattr(env, "spec") else steps_done,
                     "player": [float(_pl[0]), float(_pl[1]), float(_pl[4])],
                     "obstacles": _obs,

@@ -879,11 +879,13 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
         if (args.verbose && rects.size() >= 2) {
             static long shown = 0;
             if ((++shown % 8) == 1) {
-                std::printf("  [注入] 角色=(%.0f,%.0f) r=%.1f | 门=(%.0f,%.0f) 宽=%.0f 带厚=%.1f"
+                std::printf("  [注入#%ld] 角色=(%.0f,%.0f) r=%.1f | 门=(%.0f,%.0f) 宽=%.0f 带厚=%.1f"
                             " | 左墙 x=%.0f±%.0f 右墙 x=%.0f±%.0f"
                             " | 跨尺 sx=%.4f sy=%.4f oy=%d\n",
+                            shown,
                             f.player.x, f.player.y, f.player.radius,
                             sm_cx, sm_y, sm_w, sm_hh,
+                            shown, f.player.x, f.player.y, f.player.radius,
                             rects[0].x, rects[0].half_w,
                             rects[1].x, rects[1].half_w,
                             s_scale, s_scale_y, ext->y0);

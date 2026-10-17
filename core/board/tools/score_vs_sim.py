@@ -37,7 +37,8 @@ def load_sim(path: Path) -> list:
             continue
         pl = d.get("player") or [0, 0, 0]
         walls = [o for o in (d.get("obstacles") or []) if len(o) >= 5 and o[2] > o[3]]
-        frames.append({"player": pl, "walls": walls})
+        frames.append({"player": pl, "walls": walls,
+                       "ba": int(d.get("board_actions", -1))})
     return frames
 
 
@@ -66,7 +67,7 @@ def bands_of(walls: list) -> list:
     return bands
 
 
-INJ = re.compile(r"角色=\((?P<px>[-+0-9.]+),(?P<py>[-+0-9.]+)\) r=(?P<pr>[0-9.]+) "
+INJ = re.compile(r"\[注入#(?P<idx>[0-9]+)\] 角色=\((?P<px>[-+0-9.]+),(?P<py>[-+0-9.]+)\) r=(?P<pr>[0-9.]+) "
                  r"\| 门=\((?P<cx>[-+0-9.]+),(?P<cy>[-+0-9.]+)\) 宽=(?P<w>[0-9.]+) "
                  r"带厚=(?P<hh>[0-9.]+) \| 左墙 x=(?P<lw>[-+0-9.]+)±(?P<lwh>[0-9.]+) "
                  r"右墙 x=(?P<rw>[-+0-9.]+)±(?P<rwh>[0-9.]+)")
@@ -104,7 +105,15 @@ def main(argv=None) -> int:
     near2d = []
     for r in rows:
         # 按角色位置找最近的真值帧
-        best = min(sim, key=lambda f: abs(f["player"][0] - r["px"]) + abs(f["player"][1] - r["py"]))
+        # 配对键优先用"已收到的板子行数"（跨机器不用对时钟）；
+        # 老日志没有这个字段时退回"角色位置最近"。
+        _cand = [f for f in sim if f.get("ba", -1) >= 0]
+        if _cand:
+            k = int(r.get("idx", 0))
+            best = min(_cand, key=lambda f: abs(f["ba"] - k))
+        else:
+            best = min(sim, key=lambda f: abs(f["player"][0] - r["px"])
+                       + abs(f["player"][1] - r["py"]))
         if not best["bands"]:
             no_band += 1
             continue
