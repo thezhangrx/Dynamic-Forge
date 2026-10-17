@@ -48,6 +48,26 @@ _BUF_LIMIT = 4096
 DEFAULT_HOLD_S = 0.5
 
 
+DEBUG_PREFIX = b"@DBG "
+
+
+def parse_debug(chunk: bytes, buf: bytearray, keep_last: int = 3) -> list[str]:
+    """解析 `@DBG <文本>` 行（板子把决策过程打出来，平台 HUD 显示）。
+
+    与 `@MOVE` 走同一条流：只认行首就是 `@DBG ` 的行，其余（日志）忽略。
+    """
+    out: list[str] = []
+    for raw in chunk.split(b"\n"):
+        line = raw.rstrip(b"\r")
+        if not line.startswith(DEBUG_PREFIX):
+            continue
+        try:
+            out.append(line[len(DEBUG_PREFIX):].decode("utf-8", "replace").strip())
+        except Exception:
+            continue
+    return out[-keep_last:]
+
+
 def parse_moves(chunk: bytes, buf: bytearray) -> list[int]:
     """从任意字节块里挑出动作号；行为与 `console_relay.parse_moves` **逐条一致**。
 
@@ -112,6 +132,9 @@ class BoardInputAdapter(HardwareInputAdapter):
         self._warned_no_signal = False
         self._opened_t = 0.0
         self._buf = bytearray()
+        #: 板子最近发来的决策文本（`@DBG` 行），给 HUD 用
+        self.debug_lines: list[str] = []
+        self._dbg_buf = bytearray()
         self._pending: list[int] = []
         self._last_action: Action = Action.zero()
         self._last_line_t = 0.0
@@ -150,6 +173,9 @@ class BoardInputAdapter(HardwareInputAdapter):
         chunk = self._read_bytes()
         if chunk:
             got = parse_moves(chunk, self._buf)
+            for text in parse_debug(chunk, self._dbg_buf):
+                if text:
+                    self.debug_lines = (self.debug_lines + [text])[-3:]
             if got:
                 self.n_actions += len(got)
                 self._pending.extend(got)
@@ -189,6 +215,10 @@ class BoardInputAdapter(HardwareInputAdapter):
                 self.n_holds += 1
                 return self._last_action
         return None
+
+    def debug_hud(self) -> list[str]:
+        """决策过程（板子发来的 `@DBG` 行）—— 直接画到 HUD 上。"""
+        return list(self.debug_lines)
 
     def hud_line(self, now: float | None = None) -> str:
         """给屏幕 HUD 用的一行"板子链路状态"。

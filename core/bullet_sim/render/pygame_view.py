@@ -608,6 +608,14 @@ class PygameRenderer:
                     line = None
                 if line:
                     extra.insert(0, str(line))
+                # 决策过程（如果这条链路有的话）：一行一条，插在状态行下面
+                dbg = getattr(cand, "debug_hud", None)
+                if callable(dbg):
+                    try:
+                        for d in list(dbg())[::-1]:
+                            extra.insert(1, str(d))
+                    except Exception:
+                        pass
                 break
         lines = hud_lines(
             world,

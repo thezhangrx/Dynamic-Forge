@@ -78,6 +78,7 @@ def main(argv=None) -> int:
                 for tok in out.split():
                     if tok.startswith("cmd=("):
                         vx, vy = (float(t) for t in tok[5:-1].split(","))
+                fifo.write(f"@DBG {out}\n")
                 fifo.write(f"@MOVE {action_from_cmd(vx, vy)}\n")
                 fifo.flush()
         time.sleep(0.02)
