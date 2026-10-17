@@ -37,6 +37,7 @@ extern "C" {
 #include "vision_driver.hpp"
 #include "vision_regs.hpp"
 
+#include <array>
 #include <chrono>
 #include <memory>
 #include <cmath>
@@ -376,6 +377,87 @@ struct DoorSmoother {
     }
 };
 
+/// **带惯性的世界模型**（用户提的方案）：识别不到时按已建模的位置+速度外推。
+///
+/// 为什么需要：`band_gap` 每帧独立重算，真机位上门/带会间歇性丢（反光、遮挡、
+/// 曝光抖动）。直接"丢了就 stay"会让平台一顿一顿；而"丢了就沿上一条指令"
+/// 又会在镜头被挡时一直开（这个坑已经踩过）。
+///
+/// 规矩：
+/// * 只桥接**短暂的漏检**，不桥接"看不见场地" —— 后者由 `field_extent` 的显著性
+///   门直接判掉（一律 stay），所以这里不需要再设安全超时；
+/// * 关联用**墙带自己的厚度**作容差（不是像素常数）；
+/// * 外推距离一旦超过**半个缺口宽**，这条带就作废（目标可能已经挪到别处，
+///   继续照着旧缺口走就是撞）。
+struct BandTrack {
+    double y = 0.0, cx = 0.0, w = 0.0, hh = 0.0;
+    double vx = 0.0, vy = 0.0;
+    int misses = 0;
+};
+
+struct WorldModel {
+    std::vector<BandTrack> tracks;
+    uint64_t last_ns = 0;
+    bool has = false;
+
+    /// 用本帧检出的门（场地单位）更新模型；`dt` 用于速度差分。
+    void update(const std::vector<std::array<double, 4>>& dets, double dt) {
+        std::vector<bool> used(dets.size(), false);
+        for (BandTrack& tr : tracks) {
+            int best = -1;
+            double best_dy = 1e18;
+            for (size_t i = 0; i < dets.size(); ++i) {
+                if (used[i]) continue;
+                const double dy = std::fabs(dets[i][1] - tr.y);
+                if (dy <= 2.0 * tr.hh + 1.0 && dy < best_dy) {
+                    best_dy = dy;
+                    best = static_cast<int>(i);
+                }
+            }
+            if (best < 0) {
+                ++tr.misses;
+                continue;
+            }
+            const auto& d = dets[static_cast<size_t>(best)];
+            used[static_cast<size_t>(best)] = true;
+            tr.misses = 0;
+            constexpr double kA = 1.0 / 3.0;
+            if (dt > 1e-4) {
+                const double nvx = (d[0] - tr.cx) / dt;
+                const double nvy = (d[1] - tr.y) / dt;
+                tr.vx += 0.5 * (nvx - tr.vx);
+                tr.vy += 0.5 * (nvy - tr.vy);
+            }
+            tr.cx += kA * (d[0] - tr.cx);
+            tr.y += kA * (d[1] - tr.y);
+            tr.w += kA * (d[2] - tr.w);
+            tr.hh += kA * (d[3] - tr.hh);
+        }
+        for (size_t i = 0; i < dets.size(); ++i) {
+            if (used[i]) continue;
+            tracks.push_back(BandTrack{dets[i][0], dets[i][1], dets[i][2], dets[i][3], 0, 0, 0});
+        }
+        last_ns = 0;
+        has = true;
+    }
+
+    /// 模型外推：`dt` 秒后仍可用的带（超过半个缺口宽的位移 → 作废）。
+    std::vector<BandTrack> predict(double dt) {
+        std::vector<BandTrack> out;
+        for (BandTrack& tr : tracks) {
+            const double dx = tr.vx * dt;
+            const double dy = tr.vy * dt;
+            const double moved = std::hypot(dx, dy);
+            if (tr.w > 1.0 && moved > 0.5 * tr.w) continue;   // 外推过头：作废
+            BandTrack q = tr;
+            q.cx += dx;
+            q.y += dy;
+            out.push_back(q);
+        }
+        return out;
+    }
+};
+
 struct DecisionState {
     gap_avoid::GapMemory mem;
     gap_avoid::AlgoConfig cfg;
@@ -410,6 +492,8 @@ struct DecisionState {
     int n_clamped = 0;
     //: 门的时序平滑器（见 DoorSmoother 的注释）
     DoorSmoother door_sm;
+    //: 带惯性的世界模型（见 WorldModel 的注释）
+    WorldModel world_model;
     //: **目标墙锁定**：一旦选中某条墙带，就盯住它直到角色穿过它。
     //: 为什么必须有：场景常有 2 条横墙，按"离角色最近"选会在地带中间来回跳
     //: （|dy| 几乎相等），实测门的 y 带与真值一致只有 2/12，指令跟着抖。
@@ -821,8 +905,13 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
     // 为什么不是"补充"：碎块每帧个数/位置都在变，混进去只会让 `group_walls`
     // 把同一堵墙分成两组。结构判据给出的是**这堵墙的完整几何**（两段 + 缺口），
     // 语义上就是 `gap_avoid` 想要的输入。
-    if (use_struct && !doors->empty()) {
+    // 结构模式：几何**只**来自结构判据，不回退 RTL 的矩形。
+    // 为什么：镜头被挡时 RTL 仍会吐噪声矩形（实测 30/40 帧因此继续发指令），
+    // 把它们当兜底等于给噪声开门。没有门 → 没有几何 → 沿用的上限是看门狗 500 ms。
+    if (use_struct) {
         rects.clear();
+    }
+    if (use_struct && !doors->empty()) {
         const double ox = static_cast<double>(ext->x0), oy = static_cast<double>(ext->y0);
         int ent = 0;
         // 选**角色正对着的那扇门**：按"墙带中心与角色的行距离"取最近。
@@ -1188,6 +1277,7 @@ int main(int argc, char** argv) {
     long n_timed = 0;
     long n_auto_frames = 0;
     long n_struct_seen = 0;
+    long n_model_frames = 0;   // 靠世界模型外推给出几何的帧数
     //: 场地不可见的帧数（`field_extent` 失败 = 相机没看到场地边框）。
     //: 闭环测试里这个数就是"这一轮算不算数"的判据：窗口被盖住时它会一路涨，
     //: 同时所有指令都是 stay —— 那是环境问题，不是判据问题，必须能一眼看出来。
@@ -1254,6 +1344,40 @@ int main(int argc, char** argv) {
             }
             sg_doors = band_gap::find_all(rgb.data(), pw, ph, 6, 40, 6, 5.0f, 10.0f, 2.5f,
                                           sg_min_gap_px);
+
+            // ---- 世界模型：有检出就更新，没检出就按速度外推 ------------------
+            // 只在**场地可见**时做（看不见场地由 `field_extent` 的显著性门判掉，
+            // 那一帧在 `decide()` 里直接 stay，不进入这里的外推）。
+            static uint64_t prev_ns = 0;
+            double mdt = 0.0;
+            if (prev_ns != 0 && stamp_ns > prev_ns) mdt = (stamp_ns - prev_ns) * 1e-9;
+            prev_ns = stamp_ns;
+            std::vector<std::array<double, 4>> dets;
+            for (const band_gap::Door& d : sg_doors) {
+                dets.push_back({0.5 * (d.x0 + d.x1), 0.5 * (d.y0 + d.y1),
+                                static_cast<double>(d.width),
+                                0.5 * (static_cast<double>(d.y1 - d.y0) + 1.0)});
+            }
+            if (!dets.empty()) {
+                st.world_model.update(dets, mdt);
+            } else if (st.world_model.has) {
+                const std::vector<BandTrack> pred = st.world_model.predict(mdt);
+                sg_doors.clear();
+                for (const BandTrack& q : pred) {
+                    band_gap::Door d;
+                    d.found = true;
+                    d.width = static_cast<int>(std::lround(q.w));
+                    const int half = static_cast<int>(std::lround(q.hh));
+                    d.x0 = static_cast<int>(std::lround(q.cx - 0.5 * q.w));
+                    d.x1 = static_cast<int>(std::lround(q.cx + 0.5 * q.w));
+                    d.y0 = static_cast<int>(std::lround(q.y - half));
+                    d.y1 = static_cast<int>(std::lround(q.y + half));
+                    d.cx = static_cast<int>(std::lround(q.cx));
+                    d.support = 1.0f;
+                    sg_doors.push_back(d);
+                }
+                if (!sg_doors.empty()) ++n_model_frames;
+            }
             // 日志/回退用：仍然报"最宽的那扇门"
             for (const band_gap::Door& d : sg_doors)
                 if (!sg_door.found || d.width > sg_door.width) sg_door = d;
@@ -1506,6 +1630,10 @@ int main(int argc, char** argv) {
                 std::printf("  ⚠ 一大半帧看不到场地 —— 这一轮**不能**用来判判据好坏"
                             "（先确认仿真窗口全屏在最前、相机对着它）\n");
             }
+        }
+        if (n_model_frames > 0) {
+            std::printf("其中 %ld 帧的几何来自**世界模型外推**（本帧没检出，按位置+速度推）\n",
+                        n_model_frames);
         }
         if (st.n_clamped > 0) {
             std::printf("其中 %d 帧角色被**夹回场地内**（换算把它算到了场外）\n", st.n_clamped);
