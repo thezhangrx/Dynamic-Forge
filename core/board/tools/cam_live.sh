@@ -181,6 +181,12 @@ echo "[cam_live] $DEV ${CAM_W}x${CAM_H} $IN_FMT -vf $VF → RGB → $APP $*"
 ffmpeg -hide_banner -loglevel error \
        -f v4l2 -input_format "$IN_FMT" -video_size "${CAM_W}x${CAM_H}" -i "$DEV" \
        -vf "$VF" -pix_fmt rgb24 -f rawvideo - \
+  | { if [ -n "${DUMP_DIR:-}" ]; then
+        python3 "$(dirname "$0")/raw_tee.py" --dir "$DUMP_DIR" --w "$PIPE_W" --h "$PIPE_H" \
+            --every "${DUMP_EVERY:-10}" --max "${DUMP_MAX:-20}"
+      else
+        cat
+      fi; } \
   | "$APP" --stdin-rgb --skip-frames "$SKIP" "$@"
 # ⚠ 两个退出码要**分开看**：脚本上面开了 `set -o pipefail`，于是 ffmpeg 的
 #   "broken pipe" 会把整条管道判成失败 —— 但那恰恰是**正常收尾**：程序处理够

@@ -17,7 +17,7 @@ echo '@MOVE 0' >> /tmp/bv_stream.txt
 sleep 1
 
 echo "[演示] 板子视觉闭环开始（相机 -> PL -> 决策 -> @MOVE）..."
-R 'cd /root/tools && ./cam_live.sh --frames 0 --via-pl --keyboard-dev stdout --structural-gap --verbose' 2>/dev/null | tee -a /tmp/bv_stream.txt >/dev/null &
+R 'cd /root/tools && rm -rf /tmp/dump && DUMP_DIR=/tmp/dump DUMP_EVERY=15 DUMP_MAX=6 ./cam_live.sh --frames 0 --via-pl --keyboard-dev stdout --structural-gap --verbose' 2>/dev/null | tee -a /tmp/bv_stream.txt >/dev/null &
 BOARD_PID=$!
 sleep "$SECS"
 kill "$BOARD_PID" 2>/dev/null
