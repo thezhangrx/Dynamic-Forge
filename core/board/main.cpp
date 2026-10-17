@@ -618,7 +618,8 @@ private:
 
 gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
                        const std::vector<band_gap::Door>* doors,
-                       const band_gap::Extent* ext) {
+                       const band_gap::Extent* ext,
+                       const band_gap::Player* splayer) {
     // ---- dt：两帧 stamp 之差 ----
     double dt = args.dt_default;
     bool dt_is_default = true;
@@ -642,18 +643,28 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
     // 不是假设 1:1 —— 实测场地只占 564~570 px，比例尺 1.12~1.14。
     const bool use_struct = args.structural_gap && ext && ext->ok;
     const double s_scale = use_struct ? ext->scale_x : 1.0;
+    const double s_scale_y = use_struct ? ext->scale_y : 1.0;
     if (use_struct) {
+        // 角色优先用**PS 侧的结构检测**（最亮的圆，见 `band_gap::find_player`）：
+        // RTL 的"亮 + 低饱和"在淡粉白的墙面前会把角色吞掉（实测 28/40 帧无角色），
+        // 而板子的规矩是"没角色就 stay"。这里仍然只给像素坐标，下面统一换算。
+        if (splayer && splayer->found) {
+            f.player.present = true;
+            f.player.x = splayer->x;
+            f.player.y = splayer->y;
+            f.player.radius = 0.25 * static_cast<double>(splayer->w + splayer->h);
+        }
         const double ox = static_cast<double>(ext->x0), oy = static_cast<double>(ext->y0);
         if (f.player.present) {
             f.player.x = (f.player.x - ox) * s_scale;
-            f.player.y = (f.player.y - oy) * s_scale;
-            f.player.radius *= s_scale;
+            f.player.y = (f.player.y - oy) * s_scale_y;
+            f.player.radius *= 0.5 * (s_scale + s_scale_y);
         }
         for (auto& o : f.obstacles) {
             o.x = (o.x - ox) * s_scale;
-            o.y = (o.y - oy) * s_scale;
+            o.y = (o.y - oy) * s_scale_y;
             o.half_w *= s_scale;
-            o.half_h *= s_scale;
+            o.half_h *= s_scale_y;
         }
     }
     //: 四角标定标记是**已知位置**的亮块（`standard.fiducial`：边长 48、离边 8，
@@ -747,7 +758,7 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
         const band_gap::Door* pick = nullptr;
         double best_dy = 1e18;
         for (const band_gap::Door& d : *doors) {
-            const double dy = std::fabs(0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale - f.player.y);
+            const double dy = std::fabs(0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale_y - f.player.y);
             if (dy < best_dy) {
                 best_dy = dy;
                 pick = &d;
@@ -758,8 +769,8 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
         {
             const double ncx = 0.5 * ((pick->x0 - ox) + (pick->x1 - ox)) * s_scale;
             const double nwidth = static_cast<double>(pick->width) * s_scale;
-            const double ny = 0.5 * ((pick->y0 - oy) + (pick->y1 - oy)) * s_scale;
-            const double nhh = 0.5 * (static_cast<double>(pick->y1 - pick->y0) + 1.0) * s_scale;
+            const double ny = 0.5 * ((pick->y0 - oy) + (pick->y1 - oy)) * s_scale_y;
+            const double nhh = 0.5 * (static_cast<double>(pick->y1 - pick->y0) + 1.0) * s_scale_y;
             st.door_sm.update(ncx, nwidth, ny, nhh);
         }
         const double sm_cx = st.door_sm.cx;
@@ -1035,7 +1046,11 @@ int main(int argc, char** argv) {
     double sum_read = 0, sum_push = 0, sum_wait = 0, sum_total = 0;
     long n_timed = 0;
     long n_auto_frames = 0;
-    long n_struct_seen = 0;      // 走到结构判据的帧数（打印节流用，i 会因为热身帧不是 0）      // 用本帧统计推出阈值的帧数（--no-auto-thresholds 时为 0）
+    long n_struct_seen = 0;
+    //: 场地不可见的帧数（`field_extent` 失败 = 相机没看到场地边框）。
+    //: 闭环测试里这个数就是"这一轮算不算数"的判据：窗口被盖住时它会一路涨，
+    //: 同时所有指令都是 stay —— 那是环境问题，不是判据问题，必须能一眼看出来。
+    long n_no_field = 0;      // 走到结构判据的帧数（打印节流用，i 会因为热身帧不是 0）      // 用本帧统计推出阈值的帧数（--no-auto-thresholds 时为 0）
     // `--frames 0` = 不限帧数，一直跑到输入结束（实时采集用）
     const long want_frames = args.frames > 0 ? args.frames : 1000000000L;
     for (int i = 0; i < want_frames; ++i) {
@@ -1080,10 +1095,12 @@ int main(int argc, char** argv) {
         band_gap::Door sg_door;
         band_gap::Extent sg_ext;
         std::vector<band_gap::Door> sg_doors;
+        band_gap::Player sg_player;
         if (args.structural_gap && !rgb.empty() && pw > 0 && ph > 0) {
             sg_doors = band_gap::find_all(rgb.data(), pw, ph);
             sg_ext = band_gap::field_extent(rgb.data(), pw, ph,
                                             args.field_w, args.field_h);
+            sg_player = band_gap::find_player(rgb.data(), pw, ph);
             // 日志/回退用：仍然报"最宽的那扇门"
             for (const band_gap::Door& d : sg_doors)
                 if (!sg_door.found || d.width > sg_door.width) sg_door = d;
@@ -1217,15 +1234,25 @@ int main(int argc, char** argv) {
                         h.flags & 1u ? "  [player_valid]" : "");
             if (args.structural_gap) {
                 ++n_struct_seen;
+                if (!sg_ext.ok) {
+                    ++n_no_field;
+                    if (n_struct_seen <= 5) {
+                        std::fprintf(stderr,
+                            "  ⚠ 第 %ld 帧看不到场地边框（field_extent 失败）："
+                            "相机可能没对准平台，或仿真窗口被挡住\n", n_struct_seen);
+                    }
+                }
                 if (args.verbose && (n_struct_seen <= 3 || n_struct_seen % 50 == 0)) {
-                    std::printf("  [结构] 门=%d 带=%.0f..%.0f 缺口=%.0f..%.0f(宽%.0f) "
+                    std::printf("  [结构] 角色=%d(%.0f,%.0f) 门=%d 带=%.0f..%.0f 缺口=%.0f..%.0f(宽%.0f) "
                                 "支撑=%.2f 比例尺=%.3f 场地=%.0fpx\n",
+                                sg_player.found ? 1 : 0, sg_player.x, sg_player.y,
                                 sg_door.found ? 1 : 0, (double)sg_door.y0, (double)sg_door.y1,
                                 (double)sg_door.x0, (double)sg_door.x1, (double)sg_door.width,
                                 sg_door.support, sg_ext.scale_x, sg_ext.width_px);
                 }
             }
-            const gap_avoid::Vec2 cmd = decide(frame, args, st, &sg_doors, &sg_ext);
+            const gap_avoid::Vec2 cmd =
+                decide(frame, args, st, &sg_doors, &sg_ext, &sg_player);
             const int action = vision_board::action_from_velocity(
                 cmd.x, cmd.y, args.action_deadzone);
             if (args.echo_action) {
@@ -1317,6 +1344,15 @@ int main(int argc, char** argv) {
         if (st.n_edge_limited > 0) {
             std::printf("其中 %d 帧被边界余量限速（朝外分量被削，切向保留）\n",
                         st.n_edge_limited);
+        }
+        if (n_struct_seen > 0) {
+            std::printf("结构判据：%ld 帧里 %ld 帧看不到场地边框（%.0f%%）\n",
+                        n_struct_seen, n_no_field,
+                        n_struct_seen > 0 ? 100.0 * n_no_field / n_struct_seen : 0.0);
+            if (n_no_field * 2 > n_struct_seen) {
+                std::printf("  ⚠ 一大半帧看不到场地 —— 这一轮**不能**用来判判据好坏"
+                            "（先确认仿真窗口全屏在最前、相机对着它）\n");
+            }
         }
         if (st.n_structural > 0) {
             std::printf("其中 %d 帧用**结构判据**重建几何（门 → 左右两段墙，场地单位）\n",
