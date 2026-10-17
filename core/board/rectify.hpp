@@ -510,4 +510,29 @@ inline std::vector<Marker> find_markers(const uint8_t* rgb, int w, int h) {
     return res;
 }
 
+//: 跨帧缓存：标记与单应**不必每帧重算**（相机与平台相对静止）。
+//: 实测标记检测在板子上约 50 ms/帧，是仅次于行带扫描的开销；每 5 帧算一次即可。
+struct MarkerCache {
+    std::vector<Marker> markers;
+    Homography homo;          // 注意：不能叫 h —— 会和 update() 的形参 h 撞名
+    long tick = 0;
+    int every = 5;
+
+    const std::vector<Marker>& update(const uint8_t* rgb, int w, int h,
+                                      double field_w, double field_h) {
+        if (tick % every == 0 || markers.size() != 4) {
+            markers = find_markers(rgb, w, h);
+            if (markers.size() == 4) {
+                const std::array<std::array<double, 2>, 4> img = {{{markers[0].x, markers[0].y},
+                    {markers[1].x, markers[1].y}, {markers[3].x, markers[3].y},
+                    {markers[2].x, markers[2].y}}};
+                const Homography nh = solve(img, contract_markers(field_w, field_h));
+                if (nh.ok) homo = nh;
+            }
+        }
+        ++tick;
+        return markers;
+    }
+};
+
 }  // namespace rectify

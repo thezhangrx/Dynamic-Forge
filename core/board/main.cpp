@@ -1391,8 +1391,10 @@ int main(int argc, char** argv) {
                 sg_player = band_gap::find_player(rgb.data(), pw, ph);
             // 四角标记 → 单应（吃掉旋转与透视），并给出场地四边形掩膜
             {
+                // 每 5 帧重算一次标记/单应，其余帧复用（相机与平台相对静止）
+                static rectify::MarkerCache mcache;
                 const std::vector<rectify::Marker> ms =
-                    rectify::find_markers(rgb.data(), pw, ph);
+                    mcache.update(rgb.data(), pw, ph, args.field_w, args.field_h);
                 // 不管找到几个标记，都先把"候选角色贴着标记"的情况排掉
                 // （标记只露出 2~3 个时也需要这条；否则会拿角标当角色）
                 if (sg_player.found && !ms.empty()) {
@@ -1404,11 +1406,8 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                if (ms.size() == 4) {
-                    // find_markers 按象限返回 TL,TR,BL,BR；单应要求 TL,TR,BR,BL
-                    const std::array<std::array<double, 2>, 4> img = {{{ms[0].x, ms[0].y},
-                        {ms[1].x, ms[1].y}, {ms[3].x, ms[3].y}, {ms[2].x, ms[2].y}}};
-                        sg_h = rectify::solve(img, rectify::contract_markers(args.field_w, args.field_h));
+                if (mcache.homo.ok) {
+                    sg_h = mcache.homo;
                     // **场地范围以四角标记为准**：`field_extent` 在真机帧上会去量
                     // 墙端（亮墙 vs 暗底产生更强台阶），实测宽度只量出 67 px（真值 544）。
                     // 标记是已知场地坐标的强特征，反解出来的包围盒不受"哪条边更亮"影响。
