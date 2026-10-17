@@ -400,6 +400,14 @@ struct DecisionState {
     int n_structural = 0;
     //: 门的时序平滑器（见 DoorSmoother 的注释）
     DoorSmoother door_sm;
+    //: **目标墙锁定**：一旦选中某条墙带，就盯住它直到角色穿过它。
+    //: 为什么必须有：场景常有 2 条横墙，按"离角色最近"选会在地带中间来回跳
+    //: （|dy| 几乎相等），实测门的 y 带与真值一致只有 2/12，指令跟着抖。
+    //: 锁定规则只用**符号**（角色在墙的哪一侧），没有任何阈值：
+    //: 选定时记下 side = sign(角色y − 墙y)；side 翻号 = 已经穿过去了 → 换下一堵。
+    bool door_locked = false;
+    double lock_y = 0.0;
+    double lock_side = 0.0;
     //: 构造时把"前后可控"打开（见构造函数）。
     DecisionState() {
         // ⚠ **这是本轮最关键的一行**：`AlgoConfig::front_back` 默认 false，
@@ -789,13 +797,38 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
         // 全部注入时 `gap_avoid` 会在两堵墙之间来回换目标（实测翻转 8%），
         // 只取最宽又会选到玩家不去的那堵。角色所在行是**唯一**能把"我要过哪个门"
         // 定下来的信息，而且它不需要任何阈值。
+        // 目标墙锁定（符号判据，见 DecisionState::door_locked 的注释）
         const band_gap::Door* pick = nullptr;
-        double best_dy = 1e18;
         for (const band_gap::Door& d : *doors) {
-            const double dy = std::fabs(0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale_y - f.player.y);
-            if (dy < best_dy) {
-                best_dy = dy;
-                pick = &d;
+            const double wy = 0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale_y;
+            const double side = f.player.y - wy;
+            if (st.door_locked) {
+                const double tol = 2.0 * 0.5 * (static_cast<double>(d.y1 - d.y0) + 1.0) * s_scale_y;
+                const bool same_wall = std::fabs(wy - st.lock_y) <= tol + 1.0;
+                const bool crossed = (side * st.lock_side) < 0.0;
+                if (same_wall && !crossed) {
+                    // 还在这堵墙的这一侧：继续盯住它
+                    st.lock_y = wy;
+                    pick = &d;
+                }
+            }
+        }
+        if (pick == nullptr) {
+            double best_dy = 1e18;
+            for (const band_gap::Door& d : *doors) {
+                const double wy = 0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale_y;
+                const double dy = std::fabs(wy - f.player.y);
+                if (dy < best_dy) {
+                    best_dy = dy;
+                    pick = &d;
+                }
+            }
+            if (pick != nullptr) {
+                const double wy = 0.5 * ((pick->y0 - oy) + (pick->y1 - oy)) * s_scale_y;
+                st.door_locked = true;
+                st.lock_y = wy;
+                st.lock_side = f.player.y - wy;
+                if (st.lock_side == 0.0) st.lock_side = 1.0;
             }
         }
         if (pick == nullptr) { return gap_avoid::Vec2{0.0, 0.0}; }

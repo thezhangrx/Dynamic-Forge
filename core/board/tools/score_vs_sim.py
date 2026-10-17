@@ -96,7 +96,7 @@ def main(argv=None) -> int:
     for f in sim:
         f["bands"] = bands_of(f["walls"])
 
-    errs_cx, errs_w, same_band, no_band = [], [], 0, 0
+    errs_cx, errs_w, errs_cy, same_band, no_band = [], [], [], 0, 0
     for r in rows:
         # 按角色位置找最近的真值帧
         best = min(sim, key=lambda f: abs(f["player"][0] - r["px"]) + abs(f["player"][1] - r["py"]))
@@ -113,6 +113,7 @@ def main(argv=None) -> int:
         tw = gap[1] - gap[0]
         errs_cx.append(r["cx"] - tcx)
         errs_w.append(r["w"] - tw)
+        errs_cy.append(r["cy"] - b["y"])
         if abs(r["cy"] - b["y"]) <= b["hh"] + r["hh"]:
             same_band += 1
 
@@ -123,6 +124,7 @@ def main(argv=None) -> int:
     print(f"门中心误差：均值 {mean(errs_cx):+.1f}  中位 {sorted(errs_cx)[len(errs_cx)//2] if errs_cx else 0:+.1f} "
           f"|P95| {abs(p95([abs(v) for v in errs_cx])):.1f}")
     print(f"门宽误差  ：均值 {mean(errs_w):+.1f}  P95 {p95([abs(v) for v in errs_w]):.1f}")
+    print(f"门 y 误差  ：均值 {mean(errs_cy):+.1f}  P95 {p95([abs(v) for v in errs_cy]):.1f}")
     print(f"门的 y 带与真值墙带一致：{same_band}/{n} = {100.0*same_band/n:.0f}%")
     return 0
 
