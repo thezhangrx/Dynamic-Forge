@@ -16,6 +16,7 @@
 // ===========================================================================
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cmath>
@@ -534,5 +535,100 @@ struct MarkerCache {
         return markers;
     }
 };
+
+
+// ===========================================================================
+// 四角标记的**四边形自洽**选择
+// ===========================================================================
+// 之前是"每个象限取离画面角最近的那个"，结果：右下角的一块墙高光就能冒充标记，
+// 四个点拼出来的单应整体歪掉（实测角色/缺口位置整体偏 150 场地单位）。
+//
+// 这里用**几何自洽**（全部无量纲，无像素常数）挑出真正的那一组：
+//     top=|TL-TR| ≈ bottom=|BL-BR|         上下两边等长
+//     left=|TL-BL| ≈ right=|TR-BR|          左右两边等长
+//     (TL+BR)/2 ≈ (TR+BL)/2                 对角线中点重合（即近似平行四边形）
+// 打分 = 两组的边长相对差 + 2×中点相对差，取最小。
+struct QuadScore {
+    double err = 1e9;
+    std::array<Marker, 4> m{};
+    bool ok = false;
+};
+
+inline double side_len(const Marker& a, const Marker& b) {
+    return std::hypot(a.x - b.x, a.y - b.y);
+}
+
+/// 从候选里挑"最像矩形"的四个点（每个象限一个），返回 TL,TR,BL,BR。
+inline QuadScore select_quad(const std::vector<std::vector<Marker>>& per_quadrant) {
+    QuadScore best;
+    const auto& q0 = per_quadrant[0];
+    const auto& q1 = per_quadrant[1];
+    const auto& q2 = per_quadrant[2];
+    const auto& q3 = per_quadrant[3];
+    for (const Marker& tl : q0) {
+        for (const Marker& tr : q1) {
+            for (const Marker& bl : q2) {
+                for (const Marker& br : q3) {
+                    const double top = side_len(tl, tr);
+                    const double bottom = side_len(bl, br);
+                    const double left = side_len(tl, bl);
+                    const double right = side_len(tr, br);
+                    if (top < 8.0 || bottom < 8.0 || left < 8.0 || right < 8.0) continue;
+                    const double e1 = std::fabs(top - bottom) / std::max(top, bottom);
+                    const double e2 = std::fabs(left - right) / std::max(left, right);
+                    // 对角线中点
+                    const double cx1 = 0.5 * (tl.x + br.x), cy1 = 0.5 * (tl.y + br.y);
+                    const double cx2 = 0.5 * (tr.x + bl.x), cy2 = 0.5 * (tr.y + bl.y);
+                    const double diag = 0.5 * (std::hypot(tl.x - br.x, tl.y - br.y) +
+                                               std::hypot(tr.x - bl.x, tr.y - bl.y));
+                    const double e3 = diag > 1.0 ? std::hypot(cx1 - cx2, cy1 - cy2) / diag : 1e9;
+                    const double err = e1 + e2 + 2.0 * e3;
+                    if (err < best.err) {
+                        best.err = err;
+                        best.m = {tl, tr, bl, br};
+                        best.ok = true;
+                    }
+                }
+            }
+        }
+    }
+    return best;
+}
+
+/// **主入口**：纹理 + 亮块两条线的候选合并后，按四边形自洽挑 4 个。
+inline std::vector<Marker> find_markers4(const uint8_t* rgb, int w, int h, int max_per_quad = 3) {
+    std::vector<Marker> all;
+    for (const Marker& m : find_markers_dark(rgb, w, h)) all.push_back(m);
+    for (const Marker& m : find_markers(rgb, w, h)) {
+        bool dup = false;
+        for (const Marker& o : all)
+            if (std::hypot(o.x - m.x, o.y - m.y) < 6.0) { dup = true; break; }
+        if (!dup) all.push_back(m);
+    }
+    const double mx = 0.5 * w, my = 0.5 * h;
+    std::vector<std::vector<Marker>> per(4);
+    for (const Marker& m : all) {
+        const int q = (m.x < mx ? 0 : 1) + (m.y < my ? 0 : 2);
+        const double cx = (q % 2 == 0) ? 0.0 : static_cast<double>(w - 1);
+        const double cy = (q / 2 == 0) ? 0.0 : static_cast<double>(h - 1);
+        per[static_cast<size_t>(q)].push_back(m);
+        (void)cx; (void)cy;
+    }
+    for (auto& v : per) {
+        std::sort(v.begin(), v.end(), [&](const Marker& a, const Marker& b) {
+            const double dx = (a.x < mx ? -a.x : a.x - (w - 1));
+            const double dy = (a.y < my ? -a.y : a.y - (h - 1));
+            const double da = std::hypot(dx, dy);
+            const double ex = (b.x < mx ? -b.x : b.x - (w - 1));
+            const double ey = (b.y < my ? -b.y : b.y - (h - 1));
+            const double db = std::hypot(ex, ey);
+            return da < db;
+        });
+        if (static_cast<int>(v.size()) > max_per_quad) v.resize(max_per_quad);
+    }
+    const QuadScore q = select_quad(per);
+    if (!q.ok) return {};
+    return {q.m[0], q.m[1], q.m[2], q.m[3]};
+}
 
 }  // namespace rectify
