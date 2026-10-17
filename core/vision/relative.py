@@ -46,6 +46,12 @@ from . import primitives as P
 
 __all__ = ["RelativeParams", "classify_relative", "DEFAULTS"]
 
+#: 量化噪声下限（8 bit：步长 1 → 均匀量化噪声 σ = 1/√12 ≈ 0.29）。
+#: 为什么要它：屏幕录制这种**无噪声**图上 MAD 估出来的 σ 接近 0，
+#: SNR 会虚高到几万，表里既没法比较也没有物理意义。它不是判据参数，
+#: 只是 SNR 的**分母下限**（换成 1 个量化步长，物理上真实存在）。
+_QUANT_SIGMA = 0.29
+
 #: 帧内亮度分位数的默认值：只取最亮的一小撮（角色是唯一的"亮紧凑块"）。
 _DEFAULT_BRIGHT_Q = 0.995
 #: "近中性"的默认容差（相对 L）：白圆的通道几乎相等，橙墙/绿物会明显偏。
@@ -297,7 +303,8 @@ def best_wall_band(frame: P.Frame, *, min_rows: int = 6, max_rows: int = 40,
     # 噪声尺度：行剖面的**一阶差分**的 MAD（去掉缓慢趋势后的抖动）
     diffs = [prof[i + 1] - prof[i] for i in range(h - 1)]
     med_d = _median(diffs)
-    sigma = DEFAULTS.mad_to_sigma * _mad(diffs, med_d) + DEFAULTS.eps
+    sigma = max(_QUANT_SIGMA,
+                DEFAULTS.mad_to_sigma * _mad(diffs, med_d) + DEFAULTS.eps)
     best = (-1e18, 0, 0, 0.0)
     for y0 in range(pad, h - min_rows - pad):
         for y1 in range(y0 + min_rows, min(h - pad, y0 + max_rows + 1)):
@@ -383,4 +390,120 @@ def band_segments(frame: P.Frame, y0: int, y1: int, *,
             best = (gap, ((a[1] + b[0]) / 2.0))
     out["gap"] = best[1]
     out["gap_width"] = float(best[0])
+    return out
+
+
+def band_column_profile(frame: P.Frame, y0: int, y1: int, *, pad: int = 6) -> list:
+    """带内每列"比带外暖多少"（列剖面）。`band_segments` 与 `best_gap` 共用。"""
+    w, h = frame.width, frame.height
+    if w <= 0 or y0 < 0 or y1 >= h or y1 < y0:
+        return []
+    ya = max(0, y0 - pad)
+    yb = min(h - 1, y1 + pad)
+    prof = [0.0] * w
+    n_in = float(y1 - y0 + 1)
+    for x in range(w):
+        inside = 0
+        for y in range(y0, y1 + 1):
+            i = y * w + x
+            inside += frame.r[i] - frame.b[i]
+        outside, n_out = 0, 0
+        for y in range(ya, y0):
+            i = y * w + x
+            outside += frame.r[i] - frame.b[i]
+            n_out += 1
+        for y in range(y1 + 1, yb + 1):
+            i = y * w + x
+            outside += frame.r[i] - frame.b[i]
+            n_out += 1
+        prof[x] = inside / n_in - (outside / n_out if n_out else 0.0)
+    return prof
+
+
+def best_gap(frame: P.Frame, y0: int, y1: int, *,
+             min_gap_px: int | None = None, max_gap_px: int = 240,
+             shoulder: int | None = None, k_sigma: float = 5.0) -> dict:
+    """**匹配滤波找缺口**：在 `(gap_start, gap_end)` 上搜索「两侧是墙、中间是背景」。
+
+    为什么不再逐列判：逐列阈值把**同一个物理缺口**在四张不同曝光的图上切出
+    110 / 16 / 6 / 46 px（实测），因为墙内部的**反光**会掉到阈值以下，而缺口边缘
+    又会被模糊抬到阈值以上。逐列判的结果是"阈值 × 局部反光"的乘积，不是几何量。
+
+    这里换成**两段式**，两段都只用本帧自己的尺度：
+
+    ```text
+    1) 定中心（广义似然比 / 匹配滤波）
+       score(a,b) = min(左肩均值, 右肩均值) - 缺口内均值
+       取 min 而不是平均：只要有一侧不是墙（背景），分数就掉下来，
+       所以"吞掉半个背景"的宽区间会被自动排除。
+    2) 定宽度（滞回，几何量）
+       墙电平 W = 两侧肩部最大值；背景电平 B = 缺口内均值
+       从中心向两侧扩，直到列剖面回到 (W+B)/2 以上
+       —— 缺口的宽度就是"两段墙之间的背景连续段"，跟阈值绝对值无关。
+    ```
+
+    两个几何先验（不是标定常数，是从数据里拿的）：
+
+    * `min_gap_px` 默认 = **墙的厚度**（`y1-y0+1` 行）：能过车的门洞不会比墙还窄。
+      它同时是**最后的形状门槛**：滞回量出来的宽度小于它，就判成"这不是门"
+      （墙上的反光缺口、JPEG 块缝都会被这一条挡掉）。
+    * `shoulder` 默认 = 同样厚度：肩部要够长，才算"真的是墙"。
+    """
+    thick = y1 - y0 + 1
+    if min_gap_px is None:
+        min_gap_px = max(4, thick)
+    if shoulder is None:
+        shoulder = max(4, thick)
+    prof = band_column_profile(frame, y0, y1)
+    w = len(prof)
+    out: dict = {"found": False, "cx": 0.0, "width": 0.0, "snr": 0.0,
+                 "score": 0.0, "x0": 0, "x1": -1, "wall_level": 0.0,
+                 "bg_level": 0.0, "wide_enough": False, "min_gap_px": float(min_gap_px)}
+    if w < min_gap_px + 2 * shoulder + 2:
+        return out
+    pre = [0.0] * (w + 1)
+    for x in range(w):
+        pre[x + 1] = pre[x] + prof[x]
+
+    def mean(a: int, b: int) -> float:          # 闭区间 [a, b]
+        if b < a:
+            return 0.0
+        return (pre[b + 1] - pre[a]) / float(b - a + 1)
+
+    # 噪声尺度：相邻列差分（缓慢结构被差分消掉，剩下的才是噪声）
+    diffs = [prof[i + 1] - prof[i] for i in range(w - 1)]
+    sigma = max(_QUANT_SIGMA,
+                DEFAULTS.mad_to_sigma * _mad(diffs, _median(diffs)) + DEFAULTS.eps)
+
+    best = (-1e18, 0, 0, 0.0, 0.0)
+    for a in range(shoulder, w - shoulder - min_gap_px + 1):
+        lo = min(max_gap_px, w - shoulder - a)
+        for width in range(min_gap_px, lo + 1):
+            b = a + width - 1
+            left = mean(a - shoulder, a - 1)
+            right = mean(b + 1, b + shoulder)
+            inside = mean(a, b)
+            score = min(left, right) - inside
+            if score > best[0]:
+                best = (score, a, b, max(left, right), inside)
+    score, a, b, wall_level, bg_level = best
+    if score <= 0.0:
+        return out
+
+    # ---- 第二段：滞回定宽度（从中心向两侧扩到"半高处"）------------------
+    half = 0.5 * (wall_level + bg_level)
+    cx = int(round(0.5 * (a + b)))
+    x0 = x1 = cx
+    while x0 - 1 >= 0 and prof[x0 - 1] < half:
+        x0 -= 1
+    while x1 + 1 < w and prof[x1 + 1] < half:
+        x1 += 1
+
+    width = float(x1 - x0 + 1)
+    wide_enough = width >= min_gap_px
+    out.update(found=((score / sigma) >= k_sigma) and wide_enough,
+               cx=0.5 * (x0 + x1), width=width,
+               snr=score / sigma, score=score,
+               wide_enough=wide_enough, min_gap_px=float(min_gap_px),
+               x0=x0, x1=x1, wall_level=wall_level, bg_level=bg_level)
     return out
