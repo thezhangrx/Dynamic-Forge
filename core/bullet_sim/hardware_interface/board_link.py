@@ -49,6 +49,7 @@ DEFAULT_HOLD_S = 0.5
 
 
 DEBUG_PREFIX = b"@DBG "
+TARGET_PREFIX = b"@TGT "
 
 
 def parse_debug(chunk: bytes, buf: bytearray, keep_last: int = 3) -> list[str]:
@@ -66,6 +67,52 @@ def parse_debug(chunk: bytes, buf: bytearray, keep_last: int = 3) -> list[str]:
         except Exception:
             continue
     return out[-keep_last:]
+
+
+def parse_target(chunk: bytes) -> tuple[float, float] | None:
+    """解析 `@TGT <x> <y>`：板子**当前决策的目标点**（场地单位，通常是缺口中心）。"""
+    got = None
+    for raw in chunk.split(b"\n"):
+        line = raw.rstrip(b"\r")
+        if not line.startswith(TARGET_PREFIX):
+            continue
+        try:
+            x, y = (float(v) for v in line[len(TARGET_PREFIX):].split()[:2])
+            got = (x, y)
+        except Exception:
+            continue
+    return got
+    """从任意字节块里挑出动作号；行为与 `console_relay.parse_moves` **逐条一致**。
+
+    规则（少一条就会"看起来也能跑，只是偶尔不动"）：
+
+    * 只按 ``\\n`` 拆行，半行留到下一批（串口/UDP 都会把一行切开）；
+    * 只认**行首**就是 ``@MOVE `` 的行（这条线上混着日志）；
+    * 前缀后必须是 0..8 的整数，否则静默丢弃（``@MOVE 9`` / ``@MOVE -1`` /
+      ``@MOVE 2.5`` / ``@MOVE`` 都丢）；
+    * 残渣超过上界就丢掉（否则没有换行的日志会把内存吃光）。
+    """
+    buf.extend(chunk)
+    out: list[int] = []
+    while True:
+        nl = buf.find(b"\n")
+        if nl < 0:
+            break
+        line = bytes(buf[:nl])
+        del buf[: nl + 1]
+        line = line.rstrip(b"\r")
+        if not line.startswith(PREFIX):
+            continue
+        tail = line[len(PREFIX):].strip()
+        try:
+            n = int(tail)
+        except ValueError:
+            continue
+        if 0 <= n <= MAX_N:
+            out.append(n)
+    if len(buf) > _BUF_LIMIT:
+        del buf[: len(buf) - _BUF_LIMIT]
+    return out
 
 
 def parse_moves(chunk: bytes, buf: bytearray) -> list[int]:
@@ -135,6 +182,8 @@ class BoardInputAdapter(HardwareInputAdapter):
         #: 板子最近发来的决策文本（`@DBG` 行），给 HUD 用
         self.debug_lines: list[str] = []
         self._dbg_buf = bytearray()
+        #: 板子决策的目标点（`@TGT`），给渲染器画准星用
+        self.target_xy: tuple[float, float] | None = None
         self._pending: list[int] = []
         self._last_action: Action = Action.zero()
         self._last_line_t = 0.0
@@ -173,6 +222,9 @@ class BoardInputAdapter(HardwareInputAdapter):
         chunk = self._read_bytes()
         if chunk:
             got = parse_moves(chunk, self._buf)
+            tgt = parse_target(chunk)
+            if tgt is not None:
+                self.target_xy = tgt
             for text in parse_debug(chunk, self._dbg_buf):
                 if text:
                     self.debug_lines = (self.debug_lines + [text])[-3:]
@@ -215,6 +267,10 @@ class BoardInputAdapter(HardwareInputAdapter):
                 self.n_holds += 1
                 return self._last_action
         return None
+
+    def debug_target(self):
+        """板子当前决策的目标点（`@TGT`），没有就是 None。"""
+        return self.target_xy
 
     def debug_hud(self) -> list[str]:
         """决策过程（板子发来的 `@DBG` 行）—— 直接画到 HUD 上。"""

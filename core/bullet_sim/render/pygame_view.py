@@ -351,6 +351,26 @@ class PygameRenderer:
                     max(2, int(vp.len_to_screen(t.radius))), 2,
                 )
 
+        # --- 板子决策的目标点（`@TGT`）：画成准星 ---
+        # 用户要"看得见决策打的是哪个缺口"。这条只依赖输入源给的目标点，
+        # 不改任何决策/物理逻辑。
+        for _cand in (self.input_source, getattr(self.input_source, "adapter", None)):
+            _fn = getattr(_cand, "debug_target", None)
+            if not callable(_fn):
+                continue
+            try:
+                _tgt = _fn()
+            except Exception:
+                _tgt = None
+            if _tgt is not None:
+                sx, sy = vp.world_to_screen(float(_tgt[0]), float(_tgt[1]))
+                pygame.draw.circle(screen, (255, 220, 60), (int(sx), int(sy)), 9, 2)
+                pygame.draw.line(screen, (255, 220, 60), (int(sx) - 13, int(sy)),
+                                 (int(sx) + 13, int(sy)), 1)
+                pygame.draw.line(screen, (255, 220, 60), (int(sx), int(sy) - 13),
+                                 (int(sx), int(sy) + 13), 1)
+            break
+
         if self.show_danger and self.danger is not None:
             self._draw_danger(screen, world)
 

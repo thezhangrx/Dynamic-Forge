@@ -53,6 +53,31 @@ def action_from_cmd(vx: float, vy: float, dead: float = 0.25) -> int:
     return _ACTION_BY_OCTANT[octant]
 
 
+def target_point(obj: dict):
+    """真值里"角色正对着的那堵墙"的缺口中心（场地单位）。
+
+    只用于**显示**（HUD 准星），不参与决策 —— 决策仍完全由 `gt_decision_cli` 算。
+    """
+    obs = [o for o in (obj.get("obstacles") or []) if len(o) >= 5 and float(o[2]) > float(o[3])]
+    if not obs:
+        return None
+    pl = obj.get("player") or [0.0, 0.0, 10.0]
+    bands = {}
+    for x, y, hw, hh, _rot in obs:
+        bands.setdefault(round(y), []).append((x - hw, x + hw))
+    best = None
+    for key, segs in bands.items():
+        segs.sort()
+        for a, b in zip(segs, segs[1:]):
+            if b[0] - a[1] <= 1.0:
+                continue
+            cx = 0.5 * (a[1] + b[0])
+            d = abs(cx - pl[0]) + abs(key - pl[1])
+            if best is None or d < best[0]:
+                best = (d, cx, float(key))
+    return None if best is None else (best[1], best[2])
+
+
 def gt_line(obj: dict) -> str:
     """一行真值 → `@GT px py pr n x y hw hh rot ...`（只取矩形障碍）。"""
     pl = obj.get("player") or [0.0, 0.0, 10.0]
@@ -121,6 +146,9 @@ def main(argv=None) -> int:
                         vx = vy = 0.0
             act = action_from_cmd(vx, vy)
             with out_path.open("a", encoding="utf-8") as fh:
+                tgt = target_point(obj)
+                if tgt is not None:
+                    fh.write(f"@TGT {tgt[0]:.1f} {tgt[1]:.1f}\n")
                 fh.write(f"@DBG {dec} | 动作 {act}\n")
                 fh.write(f"@MOVE {act}\n")
             n += 1
