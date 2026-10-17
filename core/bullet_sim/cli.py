@@ -497,6 +497,9 @@ def _spec_from_args(args: argparse.Namespace):
         level_kwargs["player_radius"] = float(args.player_radius)
     if kinds is not None:
         level_kwargs["kinds"] = kinds
+    # `--obstacle-speed` 必须真正覆盖默认场景的速度（以前只走 --obstacle-type 那条路）
+    if getattr(args, "obstacle_speed", None) is not None:
+        level_kwargs["speed_override"] = float(args.obstacle_speed)
     if getattr(args, "scenario", None):
         spec = ScenarioSpec.load(args.scenario)
         spec = cycle_spec(spec, cycle) if cycle > 0.0 else stage_spec(spec, stage)

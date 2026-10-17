@@ -326,6 +326,7 @@ def template_patterns(
     field_h: float,
     *,
     player_radius: float = 10.0,
+    speed_override: float | None = None,
 ) -> list[PatternSpec]:
     """Concrete *obstacle* set for a complexity profile.
 
@@ -347,6 +348,13 @@ def template_patterns(
     ss = float(profile.speed_scale)
     cs = float(profile.count_scale)
     has_wall = "wall_with_gap" in kinds
+    #: `--obstacle-speed` 的覆盖（场地单位/秒）。**以前这个参数根本没走到这里** ——
+    #: 它只被 `ObstacleScenario`（`--obstacle-type` 那条路）吃掉，而默认场景的速度
+    #: 是下面按 level 算的，所以用户传 580 也看不到变化。
+    #: 语义：覆盖**墙**的速度；其它障碍按同一个比例缩放，保持相对节奏。
+    wall_default = (44.0 + 52.0 * v) * ss
+    ks = (float(speed_override) / wall_default) if (speed_override is not None
+                                                    and wall_default > 0) else 1.0
 
     spawns: list[ObstacleSpawn] = []
     if "small_obstacles" in kinds:
@@ -355,7 +363,7 @@ def template_patterns(
                 type_key="small_obstacles",
                 count=max(4, int(round(18.0 * cs))),
                 size=0.35,
-                speed=(55.0 + 95.0 * v) * ss,
+                speed=(55.0 + 95.0 * v) * ss * ks,
                 interval=max(0.25, 1.1 - 0.7 * v),
                 extra={"angle_jitter": 30.0 + 15.0 * v},
             )
@@ -364,7 +372,7 @@ def template_patterns(
     # The wall is the slowest large obstacle; the block is deliberately much
     # faster and phase-shifted, and enters from a *perpendicular* edge, so the
     # block can never sit in the wall's opening at the moment the wall arrives.
-    wall_speed = (44.0 + 52.0 * v) * ss
+    wall_speed = wall_default * ks
     wall_interval = max(1.5, 5.0 - 1.6 * v)
     if has_wall:
         spawns.append(
@@ -385,7 +393,8 @@ def template_patterns(
                 type_key="moving_block",
                 count=1,
                 size=1.6 + 1.4 * v,
-                speed=wall_speed * 1.55 if has_wall else (65.0 + 70.0 * v) * ss,
+                speed=(wall_speed * 1.55 if has_wall
+                       else (65.0 + 70.0 * v) * ss * ks),
                 interval=max(1.0, 3.6 - 1.4 * v),
                 entry_span=0.35 + 0.4 * v,
                 region="left" if has_wall else "top",
@@ -399,7 +408,7 @@ def template_patterns(
                 type_key="cross_traffic",
                 count=max(3, int(round(8.0 * cs))),
                 size=0.8,
-                speed=(70.0 + 90.0 * v) * ss,
+                speed=(70.0 + 90.0 * v) * ss * ks,
                 interval=max(0.4, 1.3 - 0.5 * v),
             )
         )
@@ -459,6 +468,7 @@ def make_scenario(
     stage_seconds: float = 0.0,
     cycle_seconds: float = 0.0,
     kinds: Sequence[str] | None = None,
+    speed_override: float | None = None,
     **spec_overrides: Any,
 ) -> ScenarioSpec:
     """Build a fully-specified scenario for a difficulty level or bullet count.
@@ -521,7 +531,9 @@ def make_scenario(
                 f"kinds {unknown} are not in this level's vocabulary "
                 f"{list(profile.obstacle_kinds)}")
         profile = replace(profile, obstacle_kinds=wanted)
-    patterns = template_patterns(profile, field_w, field_h, player_radius=player_radius)
+    patterns = template_patterns(profile, field_w, field_h,
+                                 player_radius=player_radius,
+                                 speed_override=speed_override)
     base: dict[str, Any] = dict(
         name=name or f"{profile.label}_{profile.bullet_count}",
         seed=int(seed),
