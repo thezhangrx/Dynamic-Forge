@@ -615,7 +615,12 @@ def best_door(frame: P.Frame, *, k_sigma: float = 5.0,
         g = door_from_band(frame, band, min_support=min_support, k_sigma=k_sigma)
         if not g.get("is_door"):
             continue
-        if best is None or g["support"] > best["support"]:
+        # 先比**宽度**，同宽再看支撑比（与 `core/board/band_gap.hpp` 必须一致，
+        # 否则 C++/Python 对账会分家）。
+        # 为什么宽度优先：真机位上门洞宽 24~58 px，角标洞/反光缝只有 10~18 px；
+        # 按支撑比挑会选中那些窄缝（它们的左右肩比值反而更高）。
+        if (best is None or g["width"] > best["width"]
+                or (g["width"] == best["width"] and g["support"] > best["support"])):
             best = g
             best["y0"], best["y1"] = band["y0"], band["y1"]
     if best is not None:

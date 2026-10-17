@@ -37,11 +37,14 @@ def build_probe(tmp_path: Path) -> Path:
     return exe
 
 
-def run_probe(exe: Path, paths) -> dict:
-    out = subprocess.run([str(exe)] + [str(p) for p in paths],
+def run_probe(exe: Path, paths, *, angle0: bool = True) -> dict:
+    extra = ["--angle0"] if angle0 else []
+    out = subprocess.run([str(exe)] + extra + [str(p) for p in paths],
                          capture_output=True, text=True, check=True).stdout
     got = {}
     for line in out.strip().splitlines():
+        if not line.startswith("/"):        # 探测工具还会打一行缩进的 extent 诊断
+            continue
         parts = line.split()
         name = parts[0]
         fields = {}
@@ -106,3 +109,43 @@ def test_cpp_matches_python_on_synthetic_and_real_frames(tmp_path: Path):
             for key, pykey in (("y0", "y0"), ("y1", "y1"), ("x0", "x0"), ("x1", "x1")):
                 assert abs(int(c[key]) - int(ref[pykey])) <= 1, f"{path.name}: {key} 不一致"
             assert abs(c["support"] - ref["support"]) <= 0.02, f"{path.name}: support 不一致"
+
+
+def shear(frame, deg: float):
+    """把画面沿 x 方向剪切（等价于场景整体旋转，小角度下与旋转同构）。"""
+    import math
+
+    from vision import primitives as P
+
+    w, h = frame.width, frame.height
+    t = math.tan(math.radians(deg))
+    out = bytearray(w * h * 3)
+    for x in range(w):
+        dy = int(round((x - w / 2) * t))
+        for y in range(h):
+            sy = min(max(y + dy, 0), h - 1)
+            si = (sy * w + x) * 3
+            di = (y * w + x) * 3
+            out[di:di + 3] = bytes((frame.r[sy * w + x], frame.g[sy * w + x], frame.b[sy * w + x]))
+    return P.Frame(width=w, height=h, r=bytes(out[0::3]), g=bytes(out[1::3]), b=bytes(out[2::3]))
+
+
+def test_angle_search_recovers_a_rotated_wall(tmp_path: Path):
+    """真机位画面相对场地有 5~10° 旋转：0° 找门会失败，角度搜索要能找回来。
+
+    实测动机见 core/board/docs/CAR_MIGRATION.md §4：斜墙在水平行带里每行只剩很短
+    一段，左右肩被带截断，支撑比永远过不了 1。
+    """
+    exe = build_probe(tmp_path)
+    tilted = write_ppm(shear(field(), 8.0), tmp_path / "tilt8.ppm")
+    flat = write_ppm(field(), tmp_path / "flat.ppm")
+
+    plain = run_probe(exe, [tilted], angle0=True)[str(tilted)]
+    assert int(plain["found"]) == 0, "8° 斜墙上 0° 判据不该找到门（这正是问题本身）"
+
+    searched = run_probe(exe, [tilted], angle0=False)[str(tilted)]
+    assert int(searched["found"]) == 1, "角度搜索应当把斜墙找回来"
+    assert abs(float(searched["w"]) - 45.0) <= 6.0, f"缺口宽 {searched['w']} 与真值 45 差太多"
+    # 水平的那张不该被角度搜索带偏
+    ok = run_probe(exe, [flat], angle0=False)[str(flat)]
+    assert int(ok["found"]) == 1 and abs(float(ok["w"]) - 45.0) <= 6.0

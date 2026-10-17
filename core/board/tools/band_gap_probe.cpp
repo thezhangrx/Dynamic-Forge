@@ -17,6 +17,7 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -58,14 +59,21 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "用法: %s <a.ppm> [b.ppm ...]\n", argv[0]);
         return 2;
     }
-    for (int i = 1; i < argc; ++i) {
+    // `--angle0`：关掉角度搜索（只按 0° 跑）。用于与 `relative.py` 的
+    // `best_door()` 逐项对账 —— 那边是固定角度，两边必须在**同一条件**下比。
+    int first = 1;
+    const bool angle0 = (argc > 1 && std::string_view(argv[1]) == "--angle0");
+    if (angle0) first = 2;
+    for (int i = first; i < argc; ++i) {
         std::vector<uint8_t> rgb;
         int w = 0, h = 0;
         if (read_ppm(argv[i], &rgb, &w, &h) != 0) {
             std::printf("%s ERR\n", argv[i]);
             continue;
         }
-        const band_gap::Door d = band_gap::find(rgb.data(), w, h);
+        const band_gap::Door d = angle0
+            ? band_gap::find_at(rgb.data(), w, h, 0.0)
+            : band_gap::find(rgb.data(), w, h);
         const band_gap::Extent e = band_gap::field_extent(rgb.data(), w, h);
         std::printf("%s found=%d bands=%d y0=%d y1=%d x0=%d x1=%d cx=%d w=%d "
                     "support=%.2f snr=%.1f\n",
