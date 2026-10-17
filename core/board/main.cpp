@@ -1377,6 +1377,9 @@ int main(int argc, char** argv) {
         int sg_min_gap_px = 0;
         rectify::Homography sg_h;
         if (args.structural_gap && !rgb.empty() && pw > 0 && ph > 0) {
+            // 先用亮度边缘粗量（无标记时的回退）。如果下面用标记解出了单应，
+            // 会被 `field_bbox()` 覆盖 —— 那时这次的 1.5 ms 全图扫描就白花了。
+            // 真机上它大约占 15 ms 板子时间，先保留（逻辑简单、无标记的帧仍需要它）。
             sg_ext = band_gap::field_extent(rgb.data(), pw, ph,
                                             args.field_w, args.field_h,
                                             5.0, 3, args.image_squash);
@@ -1388,7 +1391,21 @@ int main(int argc, char** argv) {
                     static_cast<int>(0.5 * dia_px), static_cast<int>(2.0 * dia_px));
                 sg_min_gap_px = static_cast<int>(1.6 * dia_px);
             } else {
-                sg_player = band_gap::find_player(rgb.data(), pw, ph);
+                // **ROI 跟踪**：以上一帧的角色位置为中心开窗（±120 px），
+                // 找不到再退回全图。角色是逐帧连续的小目标，开窗能省掉大部分扫描。
+                static double last_px = -1, last_py = -1;
+                const int R = 120;
+                sg_player = last_px >= 0
+                    ? band_gap::find_player(rgb.data(), pw, ph, 0, 0, 0,
+                                            static_cast<int>(last_px) - R,
+                                            static_cast<int>(last_py) - R,
+                                            static_cast<int>(last_px) + R,
+                                            static_cast<int>(last_py) + R)
+                    : band_gap::find_player(rgb.data(), pw, ph);
+                if (!sg_player.found) {
+                    sg_player = band_gap::find_player(rgb.data(), pw, ph);
+                }
+                if (sg_player.found) { last_px = sg_player.x; last_py = sg_player.y; }
             // 四角标记 → 单应（吃掉旋转与透视），并给出场地四边形掩膜
             {
                 // 每 5 帧重算一次标记/单应，其余帧复用（相机与平台相对静止）

@@ -237,23 +237,37 @@ inline Door find_at(const uint8_t* rgb, int w, int h, double tan_a,
         int ba = 0, bb = 0;
         double wall_level = 0.0, bg_level = 0.0;
         const int wmax = 240;
-        for (int a = shoulder; a + shoulder + min_gap <= wn; ++a) {
+        // **粗到细**：先在 (起点, 宽度) 上按步长粗扫，再在最优附近细扫。
+        // 原来直接对 640×240 个组合逐个算（板子上 ~30 ms/帧）；粗扫步长 4 后
+        // 组合数降到 1/16，细扫只覆盖 ±4，精度不变。
+        auto evaluate = [&](int a, int width, double* sc, double* wl, double* bl) {
+            const int b2 = a + width - 1;
+            const double left = mean_col(a - shoulder, a - 1);
+            const double right = mean_col(b2 + 1, b2 + shoulder);
+            const double inside = mean_col(a, b2);
+            *sc = (left < right ? left : right) - inside;
+            *wl = left > right ? left : right;
+            *bl = inside;
+        };
+        int coarse_a = 0, coarse_w = 0;
+        for (int a = shoulder; a + shoulder + min_gap <= wn; a += 4) {
             const int lo = (a + wmax < wn - shoulder) ? wmax : (wn - shoulder - a);
-            for (int width = min_gap; width <= lo; ++width) {
-                const int b2 = a + width - 1;
-                const double left = mean_col(a - shoulder, a - 1);
-                const double right = mean_col(b2 + 1, b2 + shoulder);
-                const double inside = mean_col(a, b2);
-                const double l2 = left < right ? left : right;
-                const double score = l2 - inside;
-                if (score > best) {
-                    best = score;
-                    ba = a; bb = b2;
-                    wall_level = left > right ? left : right;
-                    bg_level = inside;
-                }
+            for (int width = min_gap; width <= lo; width += 4) {
+                double sc = 0.0, wl = 0.0, bl = 0.0;
+                evaluate(a, width, &sc, &wl, &bl);
+                if (sc > best) { best = sc; coarse_a = a; coarse_w = width; wall_level = wl; bg_level = bl; }
             }
         }
+        for (int a = coarse_a - 4; a <= coarse_a + 4; ++a) {
+            if (a < shoulder || a + shoulder + min_gap > wn) continue;
+            const int lo = (a + wmax < wn - shoulder) ? wmax : (wn - shoulder - a);
+            for (int width = std::max(min_gap, coarse_w - 4); width <= lo && width <= coarse_w + 4; ++width) {
+                double sc = 0.0, wl = 0.0, bl = 0.0;
+                evaluate(a, width, &sc, &wl, &bl);
+                if (sc > best) { best = sc; ba = a; bb = a + width - 1; wall_level = wl; bg_level = bl; }
+            }
+        }
+        if (ba == 0 && bb == 0) { ba = coarse_a; bb = coarse_a + coarse_w - 1; }
         if (best <= 0.0) continue;
         const double half = 0.5 * (wall_level + bg_level);
         int cxx = (ba + bb) / 2;
@@ -591,8 +605,19 @@ struct Player {
 /// `t_l` 传 0 就表示"阈值只相对本帧最亮像素"（`0.75·Lmax`）：曝光/白平衡是整幅图
 /// 一起变，`Lmax` 也跟着变，所以这条阈值天然跨曝光；真正区分角色与墙的是**形状**
 /// （`aspect < 2`：墙是长条，角色是圆）。
+//: `roi_*`：只在给定矩形里找（跟踪上一帧位置用）。默认整幅。
+//: 角色是小目标，全图扫连通域 + 每个候选的环状统计在板子上是第二大开销；
+//: 以上一帧位置为中心开一个窗口，通常能省掉 60~80% 的工作量。
 inline Player find_player(const uint8_t* rgb, int w, int h, int t_l = 0,
-                          int min_px = 0, int max_px = 0) {
+                          int min_px = 0, int max_px = 0,
+                          int roi_x0 = 0, int roi_y0 = 0,
+                          int roi_x1 = -1, int roi_y1 = -1) {
+    if (roi_x1 < 0) roi_x1 = w - 1;
+    if (roi_y1 < 0) roi_y1 = h - 1;
+    if (roi_x0 < 0) roi_x0 = 0;
+    if (roi_y0 < 0) roi_y0 = 0;
+    if (roi_x1 > w - 1) roi_x1 = w - 1;
+    if (roi_y1 > h - 1) roi_y1 = h - 1;
     Player out;
     if (!rgb || w < 16 || h < 16) return out;
     int lmax = 0;
@@ -614,18 +639,18 @@ inline Player find_player(const uint8_t* rgb, int w, int h, int t_l = 0,
     std::vector<Comp> comps;
     struct Run { int x0, x1, comp; };
     std::vector<Run> prev;
-    for (int y = 0; y < h; ++y) {
+    for (int y = roi_y0; y <= roi_y1; ++y) {
         const size_t base = static_cast<size_t>(y) * static_cast<size_t>(w);
         std::vector<Run> cur;
-        int x = 0;
-        while (x < w) {
+        int x = roi_x0;
+        while (x <= roi_x1) {
             int l = rgb[(base + static_cast<size_t>(x)) * 3];
             if (rgb[(base + static_cast<size_t>(x)) * 3 + 1] > l) l = rgb[(base + static_cast<size_t>(x)) * 3 + 1];
             if (rgb[(base + static_cast<size_t>(x)) * 3 + 2] > l) l = rgb[(base + static_cast<size_t>(x)) * 3 + 2];
             if (l <= thr) { ++x; continue; }
             const int s = x;
             int peak = l;
-            while (x < w) {
+            while (x <= roi_x1) {
                 const size_t i = base + static_cast<size_t>(x);
                 int v = rgb[i * 3];
                 if (rgb[i * 3 + 1] > v) v = rgb[i * 3 + 1];
