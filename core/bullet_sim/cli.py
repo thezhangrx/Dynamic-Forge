@@ -197,6 +197,8 @@ def _add_play_args(p: argparse.ArgumentParser, *, input_default: str = "manual")
     p.add_argument("--render-fps", type=float, default=60.0)
     p.add_argument("--sim-speed", type=float, default=1.0, help="sim seconds per real second")
     p.add_argument("--prediction", action="store_true", help="draw ballistic future trajectories")
+    p.add_argument("--no-hud", action="store_true",
+                   help="**不画 HUD 文字**：相机对着屏幕时，HUD 会被拍进画面、污染视觉输入")
     p.add_argument("--potential-every", type=int, default=30,
                    help="势场每 N 帧重算一次（默认 6）。每帧重算会把仿真拖到 14 帧/秒")
     p.add_argument("--potential", action="store_true",
@@ -1227,6 +1229,7 @@ def cmd_play(args: argparse.Namespace) -> int:
             predictor=predictor,
             prediction_horizon=args.horizon,
             show_danger=args.danger,
+            show_hud=not getattr(args, "no_hud", False),
             show_potential=getattr(args, "potential", False),
             potential_every=int(getattr(args, "potential_every", 30) or 30),
             interactive=False,
