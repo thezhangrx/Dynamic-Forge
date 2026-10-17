@@ -1376,6 +1376,7 @@ int main(int argc, char** argv) {
         band_gap::Player sg_player;
         int sg_min_gap_px = 0;
         rectify::Homography sg_h;
+        size_t sg_marker_count = 0;
         if (args.structural_gap && !rgb.empty() && pw > 0 && ph > 0) {
             // 先用亮度边缘粗量（无标记时的回退）。如果下面用标记解出了单应，
             // 会被 `field_bbox()` 覆盖 —— 那时这次的 1.5 ms 全图扫描就白花了。
@@ -1412,6 +1413,7 @@ int main(int argc, char** argv) {
                 static rectify::MarkerCache mcache;
                 const std::vector<rectify::Marker> ms =
                     mcache.update(rgb.data(), pw, ph, args.field_w, args.field_h);
+                sg_marker_count = ms.size();
                 // 不管找到几个标记，都先把"候选角色贴着标记"的情况排掉
                 // （标记只露出 2~3 个时也需要这条；否则会拿角标当角色）
                 if (sg_player.found && !ms.empty()) {
@@ -1653,12 +1655,15 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (args.verbose && (n_struct_seen <= 3 || n_struct_seen % 50 == 0)) {
-                    std::printf("  [结构] 角色=%d(%.0f,%.0f) 门=%d 带=%.0f..%.0f 缺口=%.0f..%.0f(宽%.0f) "
-                                "支撑=%.2f 比例尺=%.3f 场地=%.0fpx\n",
+                    std::printf("  [结构] 标记=%zu 角色=%d(%.0f,%.0f) 门=%d "
+                                "带=%.0f..%.0f 缺口=%.0f..%.0f(宽%.0f) "
+                                "支撑=%.2f 比例尺=%.3f 场地=%.0fpx h=%d\n",
+                                sg_marker_count,
                                 sg_player.found ? 1 : 0, sg_player.x, sg_player.y,
                                 sg_door.found ? 1 : 0, (double)sg_door.y0, (double)sg_door.y1,
                                 (double)sg_door.x0, (double)sg_door.x1, (double)sg_door.width,
-                                sg_door.support, sg_ext.scale_x, sg_ext.width_px);
+                                sg_door.support, sg_ext.scale_x, sg_ext.width_px,
+                                sg_h.ok ? 1 : 0);
                 }
             }
             const gap_avoid::Vec2 cmd =

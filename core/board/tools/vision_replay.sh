@@ -30,13 +30,15 @@ if [ "${SKIP_RECORD:-0}" != "1" ]; then
   bash core/board/tools/kill_sim.sh >/dev/null 2>&1
   rm -rf /tmp/vp; R 'rm -rf /tmp/vp && mkdir -p /tmp/vp'
   rm -f /tmp/mv.txt "$OUT/state.jsonl"; touch /tmp/mv.txt
-  (setsid sh -c "tail -f /tmp/mv.txt | $PY -u -m bullet_sim play --input auto --obstacle-type wall_with_gap --stage-seconds 0 --fullscreen --no-hud --plain-field --field-bg 000000 --duration $((SECS + 25)) --state-log $OUT/state.jsonl" > "$OUT/sim.log" 2>&1 &)
+  (setsid sh -c "tail -f /tmp/mv.txt | $PY -u -m bullet_sim play --input auto --obstacle-type wall_with_gap --stage-seconds 0 --fullscreen --duration $((SECS + 25)) --state-log $OUT/state.jsonl" > "$OUT/sim.log" 2>&1 &)
   sleep 4
 
   # ---- 录制前自检：拍一帧，看板子能不能认出场地 ----
   R 'ffmpeg -hide_banner -loglevel error -f v4l2 -input_format mjpeg -video_size 640x480 -i /dev/video0 -frames:v 1 -vf "scale=640:360" -y /tmp/pre.ppm'
   R '/root/board_src/build/vision_board_devmem --ppm /tmp/pre.ppm --frames 1 --structural-gap --verbose 2>&1' > "$OUT/precheck.log" 2>&1
-  if ! grep -aqE "场地=[1-9][0-9]*px" "$OUT/precheck.log" || ! grep -aq "门=1" "$OUT/precheck.log"; then
+  # 自检条件：**必须凑齐四角标记**（单应才对；只量到场地/门但没标记时，
+  # 识别坐标会飞出去 —— 上一轮就是因为这个把 (804,764) 这种坐标当成了角色）
+  if ! grep -aq "标记=4" "$OUT/precheck.log"; then
       echo "!! 自检失败：板子在这一帧里没看到场地（标记数≠4）。"
       echo "   常见原因：仿真窗口不在最前 / 相机没对着屏幕。"
       echo "   —— 先解决这个再录，否则录到的是无效素材。"
@@ -44,7 +46,7 @@ if [ "${SKIP_RECORD:-0}" != "1" ]; then
       bash core/board/tools/kill_sim.sh >/dev/null 2>&1
       exit 2
   fi
-  echo "    自检通过（场地已量出 + 门已找到）"
+  echo "    自检通过（四角标记齐全）"
 
   R "ffmpeg -hide_banner -loglevel error -f v4l2 -input_format mjpeg -video_size 640x480 -i /dev/video0 -t $SECS -r $FPS -vf scale=640:360 -start_number 0 /tmp/vp/%06d.ppm"
   bash core/board/tools/kill_sim.sh >/dev/null 2>&1
