@@ -65,6 +65,24 @@ def main(argv=None) -> int:
         return 1
     cand = [t for t in truth if t["ba"] >= 0] or truth
 
+    # **自动对齐偏置**：录制比仿真晚启动几秒，回放帧号与真值帧号之间有一个固定偏移。
+    # 不猜它，直接在所有候选偏移里挑"配对后 |Δ角色x| 中位数最小"的那个。
+    if args.time_scale > 0.0:
+        import statistics as _st
+        best_off, best_score = 0, 1e18
+        for off in range(0, 900, 10):
+            errs = []
+            for r in inj[:200]:
+                idx = int(round(int(r["seq"]) * args.time_scale)) + off
+                if 0 <= idx < len(truth):
+                    errs.append(abs(truth[idx]["player"][0] - float(r["cx"])))
+            if len(errs) >= 5:
+                sc = _st.median(errs)
+                if sc < best_score:
+                    best_score, best_off = sc, off
+        args._offset = best_off
+        print(f"（自动对齐：偏置 {best_off} 帧，|Δ缺口x| 中位 {best_score:.0f}）")
+
     def nearest(seq: int):
         # 板子的几何帧号与"仿真已收到的行数"不是严格相等（差一两帧），取最近的
         return min(cand, key=lambda t: abs(t["ba"] - seq)) if cand else None
@@ -74,7 +92,7 @@ def main(argv=None) -> int:
     for r in inj:
         seq = int(r["seq"])
         if args.time_scale > 0.0:
-            idx = int(round(seq * args.time_scale))
+            idx = int(round(seq * args.time_scale)) + int(getattr(args, "_offset", 0))
             if not (0 <= idx < len(truth)):
                 continue
             t = truth[idx]
