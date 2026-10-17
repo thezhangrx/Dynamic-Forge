@@ -406,6 +406,8 @@ struct DecisionState {
     int n_structural = 0;
     //: 看不到场地（边框显著性不足）的帧数；这些帧一律 stay（见 decide 顶部）
     int n_no_field_frames = 0;
+    //: 角色被**夹回场地内**的帧数（说明换算把它算到场外了，必须记账）
+    int n_clamped = 0;
     //: 门的时序平滑器（见 DoorSmoother 的注释）
     DoorSmoother door_sm;
     //: **目标墙锁定**：一旦选中某条墙带，就盯住它直到角色穿过它。
@@ -720,6 +722,19 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
             f.player.y = (f.player.y - oy) * s_scale_y;
             f.player.radius *= 0.5 * (s_scale + s_scale_y);
         }
+        // **角色一定在场地内**（平台契约）。越界只可能是换算误差 ——
+        // 夹回去并记账，否则 `limit_edges` 以为还没到边，就会一直往框上开。
+        if (f.player.present) {
+            const double rr = f.player.radius;
+            const double xmin = rr, xmax = args.field_w - rr;
+            const double ymin = rr, ymax = args.field_h - rr;
+            const double cx0 = f.player.x, cy0 = f.player.y;
+            if (f.player.x < xmin) f.player.x = xmin;
+            if (f.player.x > xmax) f.player.x = xmax;
+            if (f.player.y < ymin) f.player.y = ymin;
+            if (f.player.y > ymax) f.player.y = ymax;
+            if (f.player.x != cx0 || f.player.y != cy0) ++st.n_clamped;
+        }
         for (auto& o : f.obstacles) {
             o.x = (o.x - ox) * s_scale;
             o.y = (o.y - oy) * s_scale_y;
@@ -871,10 +886,14 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
             const double by = near_one ? sm_y : 0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale_y;
             const double hh = near_one ? sm_hh
                                        : 0.5 * (static_cast<double>(d.y1 - d.y0) + 1.0) * s_scale_y;
-            const double gl = near_one ? sm_cx - 0.5 * sm_w
-                                       : (static_cast<double>(d.x0) - ox) * s_scale;
-            const double gr = near_one ? sm_cx + 0.5 * sm_w
-                                       : (static_cast<double>(d.x1) - ox) * s_scale;
+            double gl = near_one ? sm_cx - 0.5 * sm_w
+                                 : (static_cast<double>(d.x0) - ox) * s_scale;
+            double gr = near_one ? sm_cx + 0.5 * sm_w
+                                 : (static_cast<double>(d.x1) - ox) * s_scale;
+            // 缺口只在**场地内**才有意义（场外不算可通行）
+            if (gl < 0.0) gl = 0.0;
+            if (gr > args.field_w) gr = args.field_w;
+            if (gr - gl < 1.0) continue;    // 整个缺口在场外 → 这扇门不可用
             auto push_seg = [&](double a, double b) {
                 gap_avoid::Rect r;
                 r.ent_id = ++ent;
@@ -1487,6 +1506,9 @@ int main(int argc, char** argv) {
                 std::printf("  ⚠ 一大半帧看不到场地 —— 这一轮**不能**用来判判据好坏"
                             "（先确认仿真窗口全屏在最前、相机对着它）\n");
             }
+        }
+        if (st.n_clamped > 0) {
+            std::printf("其中 %d 帧角色被**夹回场地内**（换算把它算到了场外）\n", st.n_clamped);
         }
         if (st.n_no_field_frames > 0) {
             std::printf("其中 %d 帧**看不到场地**（边框显著性不足）→ 一律 stay\n",
