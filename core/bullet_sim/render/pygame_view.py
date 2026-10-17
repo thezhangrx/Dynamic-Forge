@@ -94,6 +94,7 @@ class PygameRenderer:
         show_text: bool = False,
         show_prediction: bool = False,
         show_danger: bool = False,
+        show_potential: bool = False,
         show_target: bool = False,
         predictor: Any = None,
         prediction_horizon: int = 90,
@@ -127,6 +128,12 @@ class PygameRenderer:
         self.show_text = bool(show_text)
         self.show_prediction = bool(show_prediction)
         self.show_danger = bool(show_danger)
+        #: **决策势场**（移植自 core/cpu/field_demo.py）：分层等值带 + 膨胀障碍 + 目标点。
+        #: 与 `show_danger` 不同：那个是"未来子弹威胁"，这个是"朝缺口走的代价场"。
+        self.show_potential = bool(show_potential)
+        self._field_mem = None
+        self._field_cfg = None
+        self._gap_mem = None
         #: Draw the target zone marker.  Off by default: in an obstacle field the
         #: green ring reads as "something to reach / protect" and is mistaken for
         #: an obstacle, while it neither collides nor affects the reward unless a
@@ -352,9 +359,13 @@ class PygameRenderer:
                 )
 
         # --- 板子决策的目标点（`@TGT`）：画成准星 ---
+        # 开了决策势场时**不画**这个：`field_demo.draw_marks` 已经画了场的瞄准点，
+        # 两个准星各自算、会互相打架（用户看到的就是"目标点乱跳"）。
+        _skip_aim = getattr(self, "show_potential", False)
         # 用户要"看得见决策打的是哪个缺口"。这条只依赖输入源给的目标点，
         # 不改任何决策/物理逻辑。
-        for _cand in (self.input_source, getattr(self.input_source, "adapter", None)):
+        for _cand in (() if _skip_aim else (self.input_source,
+                                            getattr(self.input_source, "adapter", None))):
             _fn = getattr(_cand, "debug_target", None)
             if not callable(_fn):
                 continue
@@ -370,6 +381,14 @@ class PygameRenderer:
                 pygame.draw.line(screen, (255, 220, 60), (int(sx), int(sy) - 13),
                                  (int(sx), int(sy) + 13), 1)
             break
+
+        if self.show_potential:
+            try:
+                self._draw_potential(screen, world)
+            except Exception as exc:      # 可视化绝不能把主循环带崩
+                if not getattr(self, "_pot_warned", False):
+                    self._pot_warned = True
+                    print(f"⚠ 势场绘制失败：{exc!r}", file=sys.stderr)
 
         if self.show_danger and self.danger is not None:
             self._draw_danger(screen, world)
@@ -709,6 +728,42 @@ class PygameRenderer:
             pts = [vp.world_to_screen(float(x), float(y)) for x, y in line]
             if len(pts) >= 2:
                 pygame.draw.lines(screen, (70, 110, 170), False, pts, 1)
+
+    def _draw_potential(self, screen: Any, world: Any) -> None:
+        """把 `core/cpu/field_demo.py` 的**决策势场**画到同一块画布上。
+
+        为什么用它的实现而不是自己再画一套：那是用户看的基准可视化
+        （`python cpu_field_demo.py --goal auto`），分层色、等值带、膨胀障碍、
+        目标点都在里面；移植它才能保证"平台上看到的"和"那个 demo 里看到的"是
+        同一个东西，而不是两份近似。
+
+        目标点**只有一个来源**：`gap_avoid.plan()` 的 `aim_world`（与板子同一套
+        决策代码）。图上的准星、场的目标、平台执行的方向都从这里来。
+        """
+        from cpu.adapters.sim_adapter import observe_rects, view_from_world
+        from cpu.field_demo import draw_field, draw_marks, field_overlay
+        from cpu.gap_avoid import AlgoConfig, GapMemory, plan
+        from cpu.potential_field import FieldConfig, FieldMemory, FieldView
+
+        if self._field_mem is None:
+            self._field_mem = FieldMemory()
+            self._field_cfg = FieldConfig()
+            self._gap_mem = GapMemory()
+        env = world.state.env
+        dec = plan(view_from_world(world), self._gap_mem, AlgoConfig(), 1e9)
+        aim = None
+        ax, ay = float(dec.aim_world[0]), float(dec.aim_world[1])
+        if ax == ax and ay == ay and abs(ax) < 1e6 and abs(ay) < 1e6:
+            aim = (ax, ay)
+        view = FieldView(
+            player=[float(v) for v in world.player],
+            rects=observe_rects(world.state.bullets),
+            field_w=float(env.field_w), field_h=float(env.field_h),
+            goal=aim, step_index=int(env.step_index), dt=float(env.dt),
+        )
+        ov = field_overlay(view, self._field_mem, self._field_cfg, aim=aim)
+        draw_field(screen, self.viewport, ov)
+        draw_marks(screen, self.viewport, ov)
 
     def _draw_danger(self, screen: Any, world: Any) -> None:
         danger = self.danger
