@@ -128,6 +128,15 @@ class AlgoConfig:
     #: 保留这个旋钮的理由只是：它把外推误差限制在短时距内，更不容易出怪事；
     #: 嫌多一个参数的话，把它设大即可回到旧行为。
     aim_lookahead: float = 0.25
+    #: **边界余量**（场地单位，0 = 关）：不允许再往边界方向推。
+    #:
+    #: 为什么需要：缺口会扫到场地边缘，而"对齐缺口"会把角色一路推到边上；角色贴边时
+    #: 视觉会漏检（blob 被画面边缘裁掉），平台于是只发 stay → **卡在边上**（实测
+    #: 300 帧里角色检测位置几乎恒为 x=0）。
+    #:
+    #: 取值依据（不是拍脑袋）：视觉边缘裁切需要 >= 1.5 x 角色半径 ≈ 15；链路延迟
+    #: 46 ms x 200 单位/秒 ≈ 9.2 的位移；合计取 **25**（场宽 640 的 ~4%）。
+    edge_margin: float = 0.0
 
     #: 允许控制**前后**速度（含减到 0 停住）。
     #:
@@ -411,6 +420,8 @@ class Decision:
     aim_lat: float = math.nan
     s_hat: float = 0.0
     n_rects: int = 0
+    #: 这一帧的指令被**边界余量**削过（朝外分量被衰减）—— 只用于日志/统计。
+    edge_limited: bool = False
     gap_line: tuple[tuple[float, float], tuple[float, float]] = (
         (math.nan, math.nan), (math.nan, math.nan))
     aim_world: tuple[float, float] = (math.nan, math.nan)
@@ -626,10 +637,19 @@ def plan(world: Any, mem: GapMemory, cfg: AlgoConfig, horizon_remaining: float) 
             if abs(d) > lim:
                 a_new = a_old + math.copysign(lim, d)
                 wx, wy = mag * math.cos(a_new), mag * math.sin(a_new)
+    # 边界余量：只掐"朝外"的分量（见 limit_edges 的说明）
+    edge_limited = False
+    if cfg.edge_margin > 0.0:
+        wx0, wy0 = wx, wy
+        wx, wy = limit_edges(wx, wy, world.player, world.field_w, world.field_h,
+                             cfg.edge_margin)
+        edge_limited = (wx != wx0) or (wy != wy0)
+
     if math.hypot(wx, wy) > EPS:
         mem.last_dir = (wx, wy)
 
     return Decision(wx=wx, wy=wy, tier=tier, reason=reason,
+                    edge_limited=edge_limited,
                     t_arr=t_arr, clearance=clearance, gap=ap.gap_raw,
                     usable_half=ap.usable_half, e_lo=ap.e_lo, e_hi=ap.e_hi,
                     aim_lat=aim_lat, s_hat=s_hat, n_rects=len(wall.rects),
@@ -653,6 +673,38 @@ def __getattr__(name: str):
         from cpu.adapters import sim_adapter
         return getattr(sim_adapter, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def limit_edges(wx: float, wy: float, player, field_w: float, field_h: float,
+                margin: float) -> tuple:
+    """把指令里**朝外的分量**按"距边界的余量"线性衰减到 0，切向分量保留。
+
+    为什么是"投影"而不是"禁入"：位置硬夹只会让角色停在边上（视觉在边上漏检 →
+    卡在边上）；而"禁入"还会把"沿边滑向缺口"一起禁掉。这里只掐**朝外**那一半：
+
+        边界处（余量 0）朝外 = 0 ；余量外 = 原样 ；中间线性 → 连续、不抖
+
+    矩形边界的"外法向"就是坐标轴，所以按轴缩放等价于法向/切向分解；全是比较与
+    乘法，没有 hypot/atan2 —— Python 与 C++ 能逐位一致。
+    """
+    if margin <= 0.0 or field_w <= 0.0 or field_h <= 0.0:
+        return wx, wy
+    # 场地比 margin 还小时别把系数算翻
+    lim = min(float(margin), 0.5 * float(field_w), 0.5 * float(field_h))
+    if lim <= 0.0:
+        return wx, wy
+    x = float(player[P_X])
+    y = float(player[P_Y])
+    r = float(player[P_RADIUS])
+    if wx < 0.0:                                  # 朝左
+        wx *= max(0.0, min(1.0, (x - r) / lim))
+    elif wx > 0.0:                                # 朝右
+        wx *= max(0.0, min(1.0, ((field_w - r) - x) / lim))
+    if wy < 0.0:                                  # 朝"y 小"的一侧
+        wy *= max(0.0, min(1.0, (y - r) / lim))
+    elif wy > 0.0:                                # 朝"y 大"的一侧
+        wy *= max(0.0, min(1.0, ((field_h - r) - y) / lim))
+    return wx, wy
 
 
 def to_command(dec: Decision) -> tuple:
