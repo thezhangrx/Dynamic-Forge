@@ -19,6 +19,7 @@
 // `core/cpu/tests/test_cpp_gap_avoid.py`）。
 // ===========================================================================
 #include "auto_params.hpp"
+#include "band_gap.hpp"
 #include "fiducial_zone.hpp"
 #include "segment_merge.hpp"
 #include "gap_avoid.hpp"
@@ -152,6 +153,14 @@ struct Args {
     //: **全局统计量在这台相机上不成立**，必须走局部/结构判据（行带匹配滤波）。
     //: 所以默认关，留作对照实验的开关。
     bool auto_thresholds = false;
+    //: `--structural-gap`：用 `band_gap.hpp`（行带匹配滤波 + 缺口滞回）**从像素直接
+    //: 重建**"带缺口的墙"，并按场地边框量出的比例尺换算到场地单位，顶掉 RTL 的碎矩形。
+    //:
+    //: 为什么要这条：RTL 的矩形来自逐像素分类 + 游程/带检测。相机把墙拍成淡粉白时，
+    //: 它给出来的是**碎块**（实测一帧 3~8 个，真墙只有 2 条），`gap_avoid` 因此
+    //: 重建不出缺口 —— 真机 250 帧里 NO_GAP 181 次、指令几乎全是"不动"。
+    //: RTL 一个门都不改（`--verify-both` 照旧逐字节对账），这条全在 PS 侧。
+    bool structural_gap = false;
 
     std::string keyboard_dev = "/dev/ttyPS0";
     double action_deadzone = kDefaultDeadzone;
@@ -197,6 +206,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--stdin-rgb")    a.stdin_rgb = true;
         else if (k == "--timing")       a.timing = true;
         else if (k == "--skip-frames")  a.skip_frames = std::atoi(next());
+        else if (k == "--structural-gap") a.structural_gap = true;
         else if (k == "--auto-thresholds")    a.auto_thresholds = true;
         else if (k == "--no-auto-thresholds") a.auto_thresholds = false;
         else if (k == "--verify-both")  a.verify_both = true;
@@ -327,6 +337,8 @@ struct DecisionState {
     int n_edge_limited = 0;
     //: 本帧没检出障碍、于是**沿用上一条有效指令**的帧数（见 decide() 里的说明）
     int n_hold_cmd = 0;
+    //: 用结构判据重建几何的帧数（--structural-gap）
+    int n_structural = 0;
     int tier_count[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // 见 tier_bucket()
 };
 
@@ -567,7 +579,8 @@ private:
     long sent_ = 0, dropped_ = 0;
 };
 
-gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& st) {
+gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
+                       const band_gap::Door* door, const band_gap::Extent* ext) {
     // ---- dt：两帧 stamp 之差 ----
     double dt = args.dt_default;
     bool dt_is_default = true;
@@ -584,6 +597,27 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
     // 都被当成静止的 —— 而训练环境里它们是有速度的，两边判据就不是一回事了。
     const double t_now = static_cast<double>(f.header.stamp_ns) * 1e-9;
     double pvx = 0.0, pvy = 0.0;
+
+    // ---- 结构判据模式：先把几何**换算到场地单位** --------------------------
+    // 视觉给的是像素，而 `gap_avoid` 的 `player_speed / edge_margin / player_radius`
+    // 是场地单位（640x480）。比例尺从**场地边框在画面里的宽度**来（`field_extent`），
+    // 不是假设 1:1 —— 实测场地只占 564~570 px，比例尺 1.12~1.14。
+    const bool use_struct = args.structural_gap && ext && ext->ok;
+    const double s_scale = use_struct ? ext->scale_x : 1.0;
+    if (use_struct) {
+        const double ox = static_cast<double>(ext->x0), oy = static_cast<double>(ext->y0);
+        if (f.player.present) {
+            f.player.x = (f.player.x - ox) * s_scale;
+            f.player.y = (f.player.y - oy) * s_scale;
+            f.player.radius *= s_scale;
+        }
+        for (auto& o : f.obstacles) {
+            o.x = (o.x - ox) * s_scale;
+            o.y = (o.y - oy) * s_scale;
+            o.half_w *= s_scale;
+            o.half_h *= s_scale;
+        }
+    }
     //: 四角标定标记是**已知位置**的亮块（`standard.fiducial`：边长 48、离边 8，
     //: 留白边还有 8）—— 实测它们的填充度会偶尔越过 `player_min_fill_pct=45`，
     //: 于是几何帧里"角色"会突然跳到某个角落。板子如果照着那个位置发指令，
@@ -657,6 +691,44 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
         r.rotation = o.rotation;
         r.angular_velocity = 0.0;   // 决策不看自转（gap_avoid 里没用这个字段）
         rects.push_back(r);
+    }
+
+    // ---- 结构判据：用门的左右两段墙**顶掉**碎矩形 ------------------------
+    // 为什么不是"补充"：碎块每帧个数/位置都在变，混进去只会让 `group_walls`
+    // 把同一堵墙分成两组。结构判据给出的是**这堵墙的完整几何**（两段 + 缺口），
+    // 语义上就是 `gap_avoid` 想要的输入。
+    if (use_struct && door && door->found) {
+        rects.clear();
+        const double ox = static_cast<double>(ext->x0), oy = static_cast<double>(ext->y0);
+        const double by = 0.5 * ((door->y0 - oy) + (door->y1 - oy)) * s_scale;
+        const double hh = 0.5 * (static_cast<double>(door->y1 - door->y0) + 1.0) * s_scale;
+        const double gl = (static_cast<double>(door->x0) - ox) * s_scale;
+        const double gr = (static_cast<double>(door->x1) - ox) * s_scale;
+        if (gl > 1.0) {
+            gap_avoid::Rect r;
+            r.ent_id = 1;
+            r.x = 0.5 * gl;
+            r.y = by;
+            r.half_w = 0.5 * gl;
+            r.half_h = hh;
+            r.rotation = 0.0;
+            r.vx = r.vy = 0.0;
+            r.angular_velocity = 0.0;
+            rects.push_back(r);
+        }
+        if (args.field_w - gr > 1.0) {
+            gap_avoid::Rect r;
+            r.ent_id = 2;
+            r.x = 0.5 * (gr + args.field_w);
+            r.y = by;
+            r.half_w = 0.5 * (args.field_w - gr);
+            r.half_h = hh;
+            r.rotation = 0.0;
+            r.vx = r.vy = 0.0;
+            r.angular_velocity = 0.0;
+            rects.push_back(r);
+        }
+        ++st.n_structural;
     }
 
     // ---- 矩形层碎片合并（颜色分割 → 掩膜修复 → **形状/连通性** → 时序跟踪）----
@@ -903,7 +975,8 @@ int main(int argc, char** argv) {
     uint64_t stamp_ns = 0;
     double sum_read = 0, sum_push = 0, sum_wait = 0, sum_total = 0;
     long n_timed = 0;
-    long n_auto_frames = 0;      // 用本帧统计推出阈值的帧数（--no-auto-thresholds 时为 0）
+    long n_auto_frames = 0;
+    long n_struct_seen = 0;      // 走到结构判据的帧数（打印节流用，i 会因为热身帧不是 0）      // 用本帧统计推出阈值的帧数（--no-auto-thresholds 时为 0）
     // `--frames 0` = 不限帧数，一直跑到输入结束（实时采集用）
     const long want_frames = args.frames > 0 ? args.frames : 1000000000L;
     for (int i = 0; i < want_frames; ++i) {
@@ -940,6 +1013,17 @@ int main(int argc, char** argv) {
                     i, pw, ph, kPlWidth, kPlHeight);
                 ++bad; break;
             }
+        }
+
+        // ---- 结构判据：**必须在推像素之前**算 -----------------------------
+        // 踩过的坑：把这段放到 `decide` 那边（推像素之后）时 `rgb` 已经是空的
+        // （像素被 push 消费掉了）→ 结构判据从来没跑过，日志里一行都没有。
+        band_gap::Door sg_door;
+        band_gap::Extent sg_ext;
+        if (args.structural_gap && !rgb.empty() && pw > 0 && ph > 0) {
+            sg_door = band_gap::find(rgb.data(), pw, ph);
+            sg_ext = band_gap::field_extent(rgb.data(), pw, ph,
+                                            args.field_w, args.field_h);
         }
 
         // ---- 每帧自动阈值：用**这一帧自己的统计**推 7 个分类阈值 -----------
@@ -1068,7 +1152,17 @@ int main(int argc, char** argv) {
                         h.img_w, h.img_h,
                         static_cast<unsigned long long>(h.stamp_ns),
                         h.flags & 1u ? "  [player_valid]" : "");
-            const gap_avoid::Vec2 cmd = decide(frame, args, st);
+            if (args.structural_gap) {
+                ++n_struct_seen;
+                if (args.verbose && (n_struct_seen <= 3 || n_struct_seen % 50 == 0)) {
+                    std::printf("  [结构] 门=%d 带=%.0f..%.0f 缺口=%.0f..%.0f(宽%.0f) "
+                                "支撑=%.2f 比例尺=%.3f 场地=%.0fpx\n",
+                                sg_door.found ? 1 : 0, (double)sg_door.y0, (double)sg_door.y1,
+                                (double)sg_door.x0, (double)sg_door.x1, (double)sg_door.width,
+                                sg_door.support, sg_ext.scale_x, sg_ext.width_px);
+                }
+            }
+            const gap_avoid::Vec2 cmd = decide(frame, args, st, &sg_door, &sg_ext);
             const int action = vision_board::action_from_velocity(
                 cmd.x, cmd.y, args.action_deadzone);
             if (args.echo_action) {
@@ -1160,6 +1254,10 @@ int main(int argc, char** argv) {
         if (st.n_edge_limited > 0) {
             std::printf("其中 %d 帧被边界余量限速（朝外分量被削，切向保留）\n",
                         st.n_edge_limited);
+        }
+        if (st.n_structural > 0) {
+            std::printf("其中 %d 帧用**结构判据**重建几何（门 → 左右两段墙，场地单位）\n",
+                        st.n_structural);
         }
         if (n_auto_frames > 0) {
             std::printf("其中 %ld 帧用**本帧统计**推出分类阈值（自动阈值）\n", n_auto_frames);

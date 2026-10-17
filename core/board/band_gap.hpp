@@ -40,6 +40,7 @@ struct Door {
     float snr = 0.0f;         // 缺口显著性（分数/σ）
     float support = 0.0f;     // min(左墙长, 右墙长) / 缺口宽
     int  n_bands = 0;         // 找到几条墙带（诊断）
+    float angle_deg = 0.0f;   // 使带对比最大的剪切角（≈ 相机相对场地的旋转）
 };
 
 namespace detail {
@@ -65,18 +66,40 @@ inline double mad(const std::vector<double>& v, double med) {
     return median(std::move(d));
 }
 
-//: 逐行"暖度"：r-b 的行内均值，再 3 行平滑（抑制单行噪声）。
-inline std::vector<double> row_profile(const uint8_t* rgb, int w, int h) {
+//: 某列的斜向偏移：把行沿角度"拉直"用（小角度下 shear 与 rotate 等价，
+//: 而且**不用重采样整幅图** —— 只是每列查表时换一个 y）。
+inline int shear_dy(int x, int w, double tan_a) {
+    const double dx = static_cast<double>(x) - 0.5 * static_cast<double>(w);
+    return static_cast<int>(std::lround(dx * tan_a));
+}
+
+//: 逐行"暖度"（可剪切）：`ev[y] = mean_x d(x, y - dy(x))`，再 3 行平滑。
+//:
+//: 为什么要剪切：真机位画面相对场地**有旋转**（实测 ~5~10°）。一条斜墙在"水平
+//: 行带"里每行只剩很短一段 → 左右肩被带截断 → 支撑比永远过不了 1（实测 0.05~0.17）。
+//: 沿角度把行拉直之后，墙才重新变成"一横条"。
+inline std::vector<double> row_profile(const uint8_t* rgb, int w, int h,
+                                        double tan_a = 0.0) {
     std::vector<double> ev(static_cast<size_t>(h), 0.0);
-    for (int y = 0; y < h; ++y) {
-        const size_t base = static_cast<size_t>(y) * static_cast<size_t>(w);
-        double s = 0.0;
-        for (int x = 0; x < w; ++x) {
-            const size_t i = base + static_cast<size_t>(x);
-            s += static_cast<double>(rgb[i * 3]) - static_cast<double>(rgb[i * 3 + 2]);
+    std::vector<double> acc(static_cast<size_t>(h), 0.0);
+    std::vector<int> cnt(static_cast<size_t>(h), 0);
+    for (int x = 0; x < w; ++x) {
+        const int dy = shear_dy(x, w, tan_a);
+        for (int y = 0; y < h; ++y) {
+            int yy = y + dy;
+            if (yy < 0) yy = 0;
+            if (yy >= h) yy = h - 1;
+            const size_t i = static_cast<size_t>(yy) * static_cast<size_t>(w) +
+                             static_cast<size_t>(x);
+            acc[static_cast<size_t>(y)] +=
+                static_cast<double>(rgb[i * 3]) - static_cast<double>(rgb[i * 3 + 2]);
+            ++cnt[static_cast<size_t>(y)];
         }
-        ev[static_cast<size_t>(y)] = s / static_cast<double>(w);
     }
+    for (int y = 0; y < h; ++y)
+        ev[static_cast<size_t>(y)] = cnt[static_cast<size_t>(y)] > 0
+            ? acc[static_cast<size_t>(y)] / static_cast<double>(cnt[static_cast<size_t>(y)])
+            : 0.0;
     std::vector<double> out(ev.size(), 0.0);
     for (size_t y = 0; y < ev.size(); ++y) {
         const size_t a = y > 0 ? y - 1 : 0;
@@ -88,27 +111,35 @@ inline std::vector<double> row_profile(const uint8_t* rgb, int w, int h) {
 
 //: 同一列的"带内 - 带外"暖度差。
 inline std::vector<double> col_profile(const uint8_t* rgb, int w, int h,
-                                       int y0, int y1, int pad) {
+                                       int y0, int y1, int pad,
+                                       double tan_a = 0.0) {
     std::vector<double> prof(static_cast<size_t>(w), 0.0);
     const int ya = y0 - pad < 0 ? 0 : y0 - pad;
     const int yb = (y1 + pad < h) ? y1 + pad : h - 1;
     const int n_in = y1 - y0 + 1;
     for (int x = 0; x < w; ++x) {
+        const int dy = shear_dy(x, w, tan_a);
+        auto at = [&](int y) {
+            int yy = y + dy;
+            if (yy < 0) yy = 0;
+            if (yy >= h) yy = h - 1;
+            return static_cast<size_t>(yy) * static_cast<size_t>(w) + static_cast<size_t>(x);
+        };
         double inside = 0.0;
         for (int y = y0; y <= y1; ++y) {
-            const size_t i = (static_cast<size_t>(y) * w + static_cast<size_t>(x));
+            const size_t i = at(y);
             inside += static_cast<double>(rgb[i * 3]) - static_cast<double>(rgb[i * 3 + 2]);
         }
         inside /= static_cast<double>(n_in);
         double outside = 0.0;
         int n_out = 0;
         for (int y = ya; y < y0; ++y) {
-            const size_t i = (static_cast<size_t>(y) * w + static_cast<size_t>(x));
+            const size_t i = at(y);
             outside += static_cast<double>(rgb[i * 3]) - static_cast<double>(rgb[i * 3 + 2]);
             ++n_out;
         }
         for (int y = y1 + 1; y <= yb; ++y) {
-            const size_t i = (static_cast<size_t>(y) * w + static_cast<size_t>(x));
+            const size_t i = at(y);
             outside += static_cast<double>(rgb[i * 3]) - static_cast<double>(rgb[i * 3 + 2]);
             ++n_out;
         }
@@ -120,12 +151,13 @@ inline std::vector<double> col_profile(const uint8_t* rgb, int w, int h,
 
 }  // namespace detail
 
-//: 主入口：在当前帧里找"带缺口的横墙"，返回最像门的那一处。
-inline Door find(const uint8_t* rgb, int w, int h, int min_rows = 6,
-                 int max_rows = 40, int pad = 6, float k_sigma = 5.0f) {
+//: 在**给定剪切角**下找门（对 `find()` 而言是一次内层调用）。
+inline Door find_at(const uint8_t* rgb, int w, int h, double tan_a,
+                    int min_rows = 6, int max_rows = 40, int pad = 6,
+                    float k_sigma = 5.0f) {
     Door out;
     if (!rgb || w < 32 || h < min_rows + 2 * pad + 4) return out;
-    const std::vector<double> ev = detail::row_profile(rgb, w, h);
+    const std::vector<double> ev = detail::row_profile(rgb, w, h, tan_a);
     const int hn = static_cast<int>(ev.size());
     // σ：行剖面一阶差分的 MAD（缓慢的光照梯度被差分消掉）
     std::vector<double> diffs;
@@ -169,7 +201,8 @@ inline Door find(const uint8_t* rgb, int w, int h, int min_rows = 6,
 
     // ---- ② 每条带找缺口，取"支撑比"最大的那扇门 -------------------------
     for (const Band& b : bands) {
-        const std::vector<double> prof = detail::col_profile(rgb, w, h, b.y0, b.y1, pad);
+        const std::vector<double> prof =
+            detail::col_profile(rgb, w, h, b.y0, b.y1, pad, tan_a);
         const int wn = static_cast<int>(prof.size());
         const int thick = b.y1 - b.y0 + 1;
         int min_gap = thick < 4 ? 4 : thick;       // 几何先验：门洞不会比墙还窄
@@ -224,7 +257,12 @@ inline Door find(const uint8_t* rgb, int w, int h, int min_rows = 6,
         const float snr = static_cast<float>(best) / csigma;
         if (snr < k_sigma) continue;
         if (support < 1.0f) continue;
-        if (!out.found || support > out.support) {
+        // 选门：先比**宽度**，同宽再看支撑比。
+        // 教训：真机位帧上门洞宽 24~58 px，而角标洞/反光缝只有 10~18 px；
+        // 按支撑比挑会选中那些窄缝（它们的左右肩比值反而更高），
+        // 于是决策拿到一个"只有 10 px 的门" → NO_GAP。
+        if (!out.found || width > out.width ||
+            (width == out.width && support > out.support)) {
             out.found = true;
             out.support = support;
             out.snr = snr;
@@ -235,6 +273,181 @@ inline Door find(const uint8_t* rgb, int w, int h, int min_rows = 6,
         }
     }
     return out;
+}
+
+//: 主入口：在 ±`kMaxAngleDeg` 里搜"使墙带对比最大"的剪切角，再在该角下找门。
+//:
+//: 为什么要搜角度而不是先矫正：4 角标 homography 是**正确**的解法（CAR_MIGRATION
+//: C1），但它需要先可靠地找到 4 个角标；而这里只要求"相机大致正对场地、有一个
+//: 小旋转"。搜角度用的是同一把尺（带对比），不需要额外标定，也不改变场景契约。
+inline Door find(const uint8_t* rgb, int w, int h, int min_rows = 6,
+                 int max_rows = 40, int pad = 6, float k_sigma = 5.0f,
+                 float max_angle_deg = 10.0f, float step_deg = 2.5f) {
+    Door best;
+    // 先按 0° 跑一遍（绝大多数情况就是 0°），再按步长扫两侧
+    for (float ang = -max_angle_deg; ang <= max_angle_deg + 0.001f; ang += step_deg) {
+        const double tan_a = std::tan(ang * 3.14159265358979 / 180.0);
+        Door d = find_at(rgb, w, h, tan_a, min_rows, max_rows, pad, k_sigma);
+        if (!d.found) continue;
+        d.angle_deg = ang;
+        if (!best.found || d.support > best.support ||
+            (d.support == best.support && d.snr > best.snr)) {
+            best = d;
+        }
+    }
+    return best;
+}
+
+// ===========================================================================
+// 场地范围（= 几何标定的**比例尺**来源）
+// ===========================================================================
+// 为什么需要它：`gap_avoid` 里的 `player_speed / edge_margin / player_radius`
+// 都是**场地单位**（640x480），而视觉给的是**图像像素**。把像素直接当场地单位
+// 等于假设相机正好 1:1 正对着场地 —— 实测不是（场地在 640x360 的画面里只占
+// 约 560x340）。差的那 ~14% 会直接进"到达时间/边界余量"这些量里。
+//
+// 怎么量而不用标定：场地边框是**暖色**、而且沿 y 连续（一整列都是它），
+// 所以列剖面上边框那两列比任何横墙都强得多（横墙只在一两行里出现）。
+// 于是：
+//     colwarm[x] = mean_y d(x,y)        // 一整列的平均暖度
+//     边框 = 左右两侧**最强的两个持续峰**（要求连续若干列都超过背景 + kσ）
+// 同样的做法量出行方向，得到高度的比例尺。两个比例尺应当接近（各向同性近似），
+// 差得太多就说明透视/旋转明显 —— 报 `anisotropy` 交给上层决定信不信。
+struct Extent {
+    bool ok = false;
+    int x0 = 0, x1 = 0, y0 = 0, y1 = 0;   // 场地边框在图像里的包围盒
+    double width_px = 0.0, height_px = 0.0;
+    double scale_x = 1.0, scale_y = 1.0;  // 场地单位/像素（field_w/width_px ...）
+    double anisotropy = 1.0;              // scale_x / scale_y（≈1 才说明各向同性）
+};
+
+namespace detail {
+
+//: 1-D：把所有"持续峰"按强度排序 —— 峰值位置用于定位边框，强度用于挑选。
+struct Run {
+    int a = 0, b = 0;      // 列的闭区间
+    double peak = 0.0;     // 段内最大暖度
+};
+
+inline std::vector<Run> runs_above_background(const std::vector<double>& prof, double k,
+                                              int min_run) {
+    const int n = static_cast<int>(prof.size());
+    std::vector<Run> out;
+    if (n < 8) return out;
+    std::vector<double> diffs;
+    diffs.reserve(prof.size());
+    for (int i = 0; i + 1 < n; ++i) diffs.push_back(prof[i + 1] - prof[i]);
+    const double med = median(diffs);
+    double sd = mad(diffs, med) * kMadToSigma;
+    if (sd < 1.0) sd = 1.0;
+    double bg = 0.0;
+    for (double v : prof) bg += v;
+    bg /= static_cast<double>(n);
+    const double thr = bg + k * sd;
+    for (int i = 0; i < n; ++i) {
+        if (prof[static_cast<size_t>(i)] <= thr) continue;
+        int j = i;
+        double peak = prof[static_cast<size_t>(i)];
+        while (j + 1 < n && prof[static_cast<size_t>(j + 1)] > thr) {
+            ++j;
+            if (prof[static_cast<size_t>(j)] > peak) peak = prof[static_cast<size_t>(j)];
+        }
+        if (j - i + 1 >= min_run) out.push_back(Run{i, j, peak});
+        i = j;
+    }
+    return out;
+}
+
+inline std::vector<double> row_means(const uint8_t* rgb, int w, int h) {
+    std::vector<double> prof(static_cast<size_t>(w), 0.0);
+    for (int x = 0; x < w; ++x) {
+        double s = 0.0;
+        for (int y = 0; y < h; ++y) {
+            const size_t i = static_cast<size_t>(y) * static_cast<size_t>(w) +
+                             static_cast<size_t>(x);
+            s += static_cast<double>(rgb[i * 3]) - static_cast<double>(rgb[i * 3 + 2]);
+        }
+        prof[static_cast<size_t>(x)] = s / static_cast<double>(h);
+    }
+    return prof;
+}
+
+inline std::vector<double> col_means(const uint8_t* rgb, int w, int h) {
+    std::vector<double> prof(static_cast<size_t>(h), 0.0);
+    for (int y = 0; y < h; ++y) {
+        const size_t base = static_cast<size_t>(y) * static_cast<size_t>(w);
+        double s = 0.0;
+        for (int x = 0; x < w; ++x) {
+            const size_t i = base + static_cast<size_t>(x);
+            s += static_cast<double>(rgb[i * 3]) - static_cast<double>(rgb[i * 3 + 2]);
+        }
+        prof[static_cast<size_t>(y)] = s / static_cast<double>(w);
+    }
+    return prof;
+}
+
+}  // namespace detail
+
+//: 从画面里量出场地边框的范围 → 场地单位/像素的比例尺（field_w/h 由调用方给）。
+inline Extent field_extent(const uint8_t* rgb, int w, int h, double field_w = 640.0,
+                           double field_h = 480.0, double k = 5.0, int min_run = 3) {
+    Extent e;
+    if (!rgb || w < 32 || h < 32) return e;
+
+    //: 取"最强的一条峰"和"离它最远的另一条强峰"。
+    //: 踩过的坑：把"最左/最右的非背景段"当边框，会拿到 0..639（画面边缘的镜头辉光）
+    //: 和整幅宽度，比例尺直接错成 1.0。边框必须是**峰**，不是"最外侧的暖色"。
+    auto pick_pair = [](const std::vector<detail::Run>& runs, int* a, int* b) {
+        if (runs.size() < 2) return false;
+        size_t best = 0;
+        for (size_t i = 1; i < runs.size(); ++i)
+            if (runs[i].peak > runs[best].peak) best = i;
+        size_t other = runs.size();
+        int best_gap = 0;
+        for (size_t i = 0; i < runs.size(); ++i) {
+            if (i == best) continue;
+            const int gap = static_cast<int>(runs[i].a) > static_cast<int>(runs[best].a)
+                                ? static_cast<int>(runs[i].a) - static_cast<int>(runs[best].a)
+                                : static_cast<int>(runs[best].a) - static_cast<int>(runs[i].a);
+            if (other == runs.size() || gap > best_gap) { other = i; best_gap = gap; }
+        }
+        if (other == runs.size()) return false;
+        *a = static_cast<int>(best);
+        *b = static_cast<int>(other);
+        return true;
+    };
+
+    const std::vector<double> colp = detail::row_means(rgb, w, h);
+    const std::vector<detail::Run> cr = detail::runs_above_background(colp, k, min_run);
+    int ia = 0, ib = 0;
+    if (!pick_pair(cr, &ia, &ib)) return e;
+    const int cxa = (cr[static_cast<size_t>(ia)].a + cr[static_cast<size_t>(ia)].b) / 2;
+    const int cxb = (cr[static_cast<size_t>(ib)].a + cr[static_cast<size_t>(ib)].b) / 2;
+    if (std::abs(cxa - cxb) < w / 2) return e;      // 两条峰必须横跨大半幅画面
+    e.x0 = cxa < cxb ? cxa : cxb;
+    e.x1 = cxa < cxb ? cxb : cxa;
+
+    const std::vector<double> rowp = detail::col_means(rgb, w, h);
+    const std::vector<detail::Run> rr = detail::runs_above_background(rowp, k, min_run);
+    int ja = 0, jb = 0;
+    if (pick_pair(rr, &ja, &jb)) {
+        e.y0 = rr[static_cast<size_t>(ja)].a < rr[static_cast<size_t>(jb)].a
+                   ? rr[static_cast<size_t>(ja)].a : rr[static_cast<size_t>(jb)].a;
+        e.y1 = rr[static_cast<size_t>(ja)].a < rr[static_cast<size_t>(jb)].a
+                   ? rr[static_cast<size_t>(jb)].b : rr[static_cast<size_t>(ja)].b;
+    } else {
+        e.y0 = 0;
+        e.y1 = h - 1;
+    }
+
+    e.width_px = static_cast<double>(e.x1 - e.x0 + 1);
+    e.height_px = static_cast<double>(e.y1 - e.y0 + 1);
+    if (e.width_px < 32.0 || e.height_px < 24.0) return e;
+    e.scale_x = field_w / e.width_px;
+    e.scale_y = field_h / e.height_px;
+    e.anisotropy = e.scale_x > 0.0 ? e.scale_x / e.scale_y : 1.0;
+    e.ok = true;
+    return e;
 }
 
 }  // namespace band_gap

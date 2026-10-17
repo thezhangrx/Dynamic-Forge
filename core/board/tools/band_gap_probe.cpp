@@ -66,10 +66,15 @@ int main(int argc, char** argv) {
             continue;
         }
         const band_gap::Door d = band_gap::find(rgb.data(), w, h);
+        const band_gap::Extent e = band_gap::field_extent(rgb.data(), w, h);
         std::printf("%s found=%d bands=%d y0=%d y1=%d x0=%d x1=%d cx=%d w=%d "
                     "support=%.2f snr=%.1f\n",
                     argv[i], d.found ? 1 : 0, d.n_bands, d.y0, d.y1,
                     d.x0, d.x1, d.cx, d.width, d.support, d.snr);
+        std::printf("    extent ok=%d x=%d..%d y=%d..%d w_px=%.0f h_px=%.0f "
+                    "scale=%.3f/%.3f aniso=%.2f\n",
+                    e.ok ? 1 : 0, e.x0, e.x1, e.y0, e.y1, e.width_px, e.height_px,
+                    e.scale_x, e.scale_y, e.anisotropy);
     }
     return 0;
 }
