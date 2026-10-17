@@ -161,6 +161,9 @@ struct Args {
     //: 重建不出缺口 —— 真机 250 帧里 NO_GAP 181 次、指令几乎全是"不动"。
     //: RTL 一个门都不改（`--verify-both` 照旧逐字节对账），这条全在 PS 侧。
     bool structural_gap = false;
+    //: 画面纵向压缩比（`cam_live.sh` 用 scale=640:360 把 4:3 压成 16:9 → 0.75；
+    //: 用 CAM_CROP=1 时是 1.0）。纵向换算**靠它推**，不靠被截断的下边框。
+    double image_squash = 0.75;
 
     std::string keyboard_dev = "/dev/ttyPS0";
     double action_deadzone = kDefaultDeadzone;
@@ -207,6 +210,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--timing")       a.timing = true;
         else if (k == "--skip-frames")  a.skip_frames = std::atoi(next());
         else if (k == "--structural-gap") a.structural_gap = true;
+        else if (k == "--image-squash") a.image_squash = std::atof(next());
         else if (k == "--auto-thresholds")    a.auto_thresholds = true;
         else if (k == "--no-auto-thresholds") a.auto_thresholds = false;
         else if (k == "--verify-both")  a.verify_both = true;
@@ -836,7 +840,7 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
         if (!rects.empty()) ++st.n_structural;
         if (args.verbose && rects.size() >= 2) {
             static long shown = 0;
-            if ((++shown % 40) == 1) {
+            if ((++shown % 8) == 1) {
                 std::printf("  [注入] 角色=(%.0f,%.0f) r=%.1f | 门=(%.0f,%.0f) 宽=%.0f 带厚=%.1f"
                             " | 左墙 x=%.0f±%.0f 右墙 x=%.0f±%.0f\n",
                             f.player.x, f.player.y, f.player.radius,
@@ -1149,7 +1153,8 @@ int main(int argc, char** argv) {
         if (args.structural_gap && !rgb.empty() && pw > 0 && ph > 0) {
             sg_doors = band_gap::find_all(rgb.data(), pw, ph);
             sg_ext = band_gap::field_extent(rgb.data(), pw, ph,
-                                            args.field_w, args.field_h);
+                                            args.field_w, args.field_h,
+                                            5.0, 3, args.image_squash);
             sg_player = band_gap::find_player(rgb.data(), pw, ph);
             // 日志/回退用：仍然报"最宽的那扇门"
             for (const band_gap::Door& d : sg_doors)

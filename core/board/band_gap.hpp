@@ -352,7 +352,7 @@ inline Door find(const uint8_t* rgb, int w, int h, int min_rows = 6,
 // 差得太多就说明透视/旋转明显 —— 报 `anisotropy` 交给上层决定信不信。
 struct Extent {
     bool ok = false;
-    int x0 = 0, x1 = 0, y0 = 0, y1 = 0;   // 场地边框在图像里的包围盒
+    int x0 = 0, x1 = 0, y0 = 0, y1 = 0;   // 场地边框在图像里的包围盒（y 仅诊断）
     double width_px = 0.0, height_px = 0.0;
     double scale_x = 1.0, scale_y = 1.0;  // 场地单位/像素（field_w/width_px ...）
     double anisotropy = 1.0;              // scale_x / scale_y（≈1 才说明各向同性）
@@ -426,8 +426,17 @@ inline std::vector<double> col_means(const uint8_t* rgb, int w, int h) {
 }  // namespace detail
 
 //: 从画面里量出场地边框的范围 → 场地单位/像素的比例尺（field_w/h 由调用方给）。
+/// `squash`：画面纵向被压缩的比例（4:3 视野 → 16:9 流水线时 = 0.75；裁剪时 = 1.0）。
+///
+/// **纵向绝不能"量"**：实测场地边框的下边恒在被截断的画面上（`y1 == h-1`），
+/// 于是 `oy` 与 `scale_y` 一起错，真值对照直接把门报低了 140 个场地单位
+/// （真值 y≈479，板子报 340~380），闭环里就是照着错的行对齐然后擦墙。
+/// 所以纵向反过来推：
+///     scale_y = scale_x / squash          // 相机各向同性，压缩多少就补多少
+///     oy      = (h - field_h/scale_y)/2   // 场地在画面里居中
 inline Extent field_extent(const uint8_t* rgb, int w, int h, double field_w = 640.0,
-                           double field_h = 480.0, double k = 5.0, int min_run = 3) {
+                           double field_h = 480.0, double k = 5.0, int min_run = 3,
+                           double squash = 0.75) {
     Extent e;
     if (!rgb || w < 32 || h < 32) return e;
 
@@ -478,10 +487,17 @@ inline Extent field_extent(const uint8_t* rgb, int w, int h, double field_w = 64
     }
 
     e.width_px = static_cast<double>(e.x1 - e.x0 + 1);
-    e.height_px = static_cast<double>(e.y1 - e.y0 + 1);
-    if (e.width_px < 32.0 || e.height_px < 24.0) return e;
+    if (e.width_px < 32.0) return e;
     e.scale_x = field_w / e.width_px;
-    e.scale_y = field_h / e.height_px;
+    if (squash <= 0.0) squash = 1.0;
+    e.scale_y = e.scale_x / squash;
+    // 场地在画面里的纵向位置：按"居中"推，而不是相信那条被截断的下边框
+    const double field_h_px = field_h / e.scale_y;
+    e.y0 = static_cast<int>(std::lround(0.5 * (static_cast<double>(h) - field_h_px)));
+    e.y1 = static_cast<int>(std::lround(0.5 * (static_cast<double>(h) + field_h_px))) - 1;
+    if (e.y0 < 0) e.y0 = 0;
+    if (e.y1 >= h) e.y1 = h - 1;
+    e.height_px = static_cast<double>(e.y1 - e.y0 + 1);
     e.anisotropy = e.scale_x > 0.0 ? e.scale_x / e.scale_y : 1.0;
     e.ok = true;
     return e;
