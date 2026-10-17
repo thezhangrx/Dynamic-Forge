@@ -1431,9 +1431,13 @@ int main(int argc, char** argv) {
             }
             }
             // **性能**：`find_all` 会在 ±10° 里搜 25 个角度（每个角度都要重扫整幅图），
-            // 实测是整帧耗时的大头。有了四角标记的单应之后，旋转/透视都在**坐标变换**
-            // 里被吃掉了，行带检测不需要再搜角度 —— 直接按 0° 跑一遍。
-            if (sg_h.ok) {
+            // 实测是整帧耗时的大头（板子上 ~390 ms/帧）。有了四角标记的单应之后，
+            // 旋转/透视都在**坐标变换**里被吃掉了，行带检测不需要再搜角度。
+            // 关键细节：判据用"**曾经**有过单应"而不是"本帧有单应" —— 标记偶尔只露出
+            // 2~3 个，若这类帧回退到 25 角度搜索，帧率会周期性掉到 1 帧/秒。
+            static bool have_h_ever = false;
+            if (sg_h.ok) have_h_ever = true;
+            if (sg_h.ok || have_h_ever) {
                 std::vector<band_gap::Door> all;
                 band_gap::find_at(rgb.data(), pw, ph, 0.0, 6, 40, 6, 5.0f, &all,
                                   sg_min_gap_px);
