@@ -208,3 +208,179 @@ def classify_relative(frame: P.Frame, p: RelativeParams | None = None) -> P.Mask
         if tot[i] <= dark_thr:
             unknown[i] = 1
     return P.Masks(wall, bright, green, unknown)
+
+
+# ==========================================================================
+# 第二级证据：**行间台阶**（局部差分），不依赖颜色的绝对/相对阈值
+# ==========================================================================
+def row_profile(frame: P.Frame, *, window: int = 16) -> list:
+    """每行的"暖色证据"：`d = r - b` 先在行内做方框平均（噪声 /sqrt(N)），
+    再按 y 做一次 3 行平滑（抑制单行噪声）。
+
+    **为什么是差分而不是阈值**：真实场景里屏幕的亮度/色温在 y 方向是**缓慢变化**的，
+    而墙是"在某一行突然开始、突然结束"的**台阶**。差分把缓慢变化直接消掉，
+    留下台阶 —— 这一步与曝光、白平衡、色度强弱都无关。
+    """
+    w, h = frame.width, frame.height
+    if w <= 0 or h <= 0:
+        return []
+    d_row = []
+    for y in range(h):
+        base = y * w
+        s = 0
+        for x in range(w):
+            s += frame.r[base + x] - frame.b[base + x]
+        d_row.append(s / float(w))
+    # y 方向 3 行平滑
+    out = [0.0] * h
+    for y in range(h):
+        a = max(0, y - 1)
+        b = min(h - 1, y + 1)
+        out[y] = sum(d_row[a:b + 1]) / float(b - a + 1)
+    _ = window
+    return out
+
+
+def row_steps(profile: list, *, half: int = 3) -> list:
+    """行间台阶：`step[y] = ev[y+half] - ev[y-half]`（局部差分，缓慢光照被消掉）。"""
+    n = len(profile)
+    if n == 0:
+        return []
+    out = [0.0] * n
+    for y in range(n):
+        a = max(0, y - half)
+        b = min(n - 1, y + half)
+        out[y] = profile[b] - profile[a]
+    return out
+
+
+def wall_bands_from_step(frame: P.Frame, *, half: int = 3, k_step: float = 4.0,
+                         min_rows: int = 4) -> tuple:
+    """用**行间台阶**找出"墙带"（`[(y0, y1), ...]`），返回 `(bands, steps)`。
+
+    判据全是**统计量**：`|step|` 超过 `k_step` 个稳健标准差（MAD）的行算"边"，
+    两条边之间就是一条带。没有"墙应该多亮/多暖"的绝对值 —— 这正是为了跨曝光稳定。
+
+    返回的 `steps` 供调用方做诊断（画图 / 打日志）。
+    """
+    prof = row_profile(frame)
+    steps = row_steps(prof, half=half)
+    if not steps:
+        return ([], steps)
+    med = _median(steps)
+    mad = _mad(steps, med)
+    sd = DEFAULTS.mad_to_sigma * mad + DEFAULTS.eps
+    edges = [y for y, s in enumerate(steps) if abs(s - med) > k_step * sd]
+    bands: list[tuple[int, int]] = []
+    for a, b in zip(edges, edges[1:]):
+        if b - a + 1 >= min_rows:
+            bands.append((a, b))
+    return (bands, steps)
+
+
+def best_wall_band(frame: P.Frame, *, min_rows: int = 6, max_rows: int = 40,
+                   pad: int = 6, k_sigma: float = 5.0) -> dict:
+    """**匹配滤波**找横墙：在所有候选行带里挑"带内比带外暖得最多"的那条。
+
+    为什么这样最稳：墙是"两条平行长边 + 均匀内部"的结构，噪声是逐像素、逐行独立的。
+    于是把**整个带作为一个整体**去比对（带内均值 - 带外均值），信噪比按
+    `sqrt(带宽 * 行长)` 提升；而"挑最大"这一步是**结构匹配**，不需要知道墙有多暖。
+
+    返回 `{found, y0, y1, snr, contrast, sigma}`：`snr` 是"带内比带外暖几个稳健标准差"，
+    与曝光/白平衡无关；`k_sigma` 是判"有墙"的统计门槛（对**搜索后的最大值**取 5σ）。
+    """
+    prof = row_profile(frame)
+    h = len(prof)
+    out = {"found": False, "y0": 0, "y1": 0, "snr": 0.0, "contrast": 0.0, "sigma": 0.0}
+    if h < min_rows + 2 * pad + 2:
+        return out
+    # 噪声尺度：行剖面的**一阶差分**的 MAD（去掉缓慢趋势后的抖动）
+    diffs = [prof[i + 1] - prof[i] for i in range(h - 1)]
+    med_d = _median(diffs)
+    sigma = DEFAULTS.mad_to_sigma * _mad(diffs, med_d) + DEFAULTS.eps
+    best = (-1e18, 0, 0, 0.0)
+    for y0 in range(pad, h - min_rows - pad):
+        for y1 in range(y0 + min_rows, min(h - pad, y0 + max_rows + 1)):
+            inside = sum(prof[y0:y1 + 1]) / float(y1 - y0 + 1)
+            before = sum(prof[y0 - pad:y0]) / float(pad)
+            after = sum(prof[y1 + 1:y1 + 1 + pad]) / float(pad)
+            contrast = inside - 0.5 * (before + after)     # 带内比带外暖多少
+            if contrast > best[0]:
+                best = (contrast, y0, y1, contrast / sigma)
+    contrast, y0, y1, snr = best
+    out.update(found=snr >= k_sigma, y0=y0, y1=y1, snr=snr,
+               contrast=contrast, sigma=sigma)
+    return out
+
+
+def band_segments(frame: P.Frame, y0: int, y1: int, *,
+                  k_col: float = 4.0, min_seg_px: int = 8) -> dict:
+    """在已找到的**行带**里，用**列剖面**找墙段与缺口（同样是差分/匹配，不是颜色阈值）。
+
+    带内每列的 `d = r-b` 在 y 方向平均（噪声 /sqrt(带高)），再减去**带外**同一列的
+    基线（pad 行）—— 得到"这一列比背景暖多少"的 1 维剖面；然后：
+
+    * `> k_col` 个稳健标准差的列 = 墙列（游程 → 墙段，丢太短的）；
+    * 两段之间最宽的间隔 = **缺口**（宽度即缺口像素数）。
+
+    全是 1 维、平均过、差分过的量 → 跨曝光稳定；没有任何"墙该多暖"的绝对值。
+    """
+    w, h = frame.width, frame.height
+    out = {"segments": [], "gap": None, "gap_width": 0.0, "profile": []}
+    if w <= 0 or y1 < y0 or y0 < 0 or y1 >= h:
+        return out
+    pad = 6
+    ya = max(0, y0 - pad)
+    yb = min(h - 1, y1 + pad)
+    prof = []
+    for x in range(w):
+        inside = 0
+        for y in range(y0, y1 + 1):
+            i = y * w + x
+            inside += frame.r[i] - frame.b[i]
+        inside /= float(y1 - y0 + 1)
+        outside = 0
+        n_out = 0
+        for y in range(ya, y0):
+            i = y * w + x
+            outside += frame.r[i] - frame.b[i]
+            n_out += 1
+        for y in range(y1 + 1, yb + 1):
+            i = y * w + x
+            outside += frame.r[i] - frame.b[i]
+            n_out += 1
+        if n_out:
+            outside /= float(n_out)
+        prof.append(inside - outside)
+    out["profile"] = prof
+    # ⚠ 噪声尺度要用**相邻列的差分**来估：列剖面本身带着场景的大尺度结构
+    #   （左边界 -13、墙 30+），用它的 MAD 会把"结构"当成"噪声"，门槛高到永远
+    #   过不去（实测：中位 8.2、σ 12.0、4σ 门槛 56 —— 而最大值才 33）。
+    #   差分把缓慢的结构消掉，只留下抖动 —— 和 `best_wall_band` 里同一套做法。
+    diffs = [prof[i + 1] - prof[i] for i in range(len(prof) - 1)]
+    dmed = _median(diffs)
+    sd = DEFAULTS.mad_to_sigma * _mad(diffs, dmed) + DEFAULTS.eps
+    med = _median(prof)
+    flags = [1 if (v - med) > k_col * sd else 0 for v in prof]
+    # 游程 → 墙段（丢太短的）
+    segs = []
+    start = None
+    for x, f in enumerate(flags):
+        if f and start is None:
+            start = x
+        elif not f and start is not None:
+            if x - start >= min_seg_px:
+                segs.append((start, x - 1))
+            start = None
+    if start is not None and w - start >= min_seg_px:
+        segs.append((start, w - 1))
+    out["segments"] = segs
+    # 缺口：相邻两段之间最宽的间隔
+    best = (0, None)
+    for a, b in zip(segs, segs[1:]):
+        gap = b[0] - a[1] - 1
+        if gap > best[0]:
+            best = (gap, ((a[1] + b[0]) / 2.0))
+    out["gap"] = best[1]
+    out["gap_width"] = float(best[0])
+    return out
