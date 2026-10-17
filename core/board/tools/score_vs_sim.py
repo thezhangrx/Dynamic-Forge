@@ -67,7 +67,7 @@ def bands_of(walls: list) -> list:
     return bands
 
 
-INJ = re.compile(r"\[注入#(?P<idx>[0-9]+)\] 角色=\((?P<px>[-+0-9.]+),(?P<py>[-+0-9.]+)\) r=(?P<pr>[0-9.]+) "
+INJ = re.compile(r"\[注入#(?P<idx>[0-9]+) f=(?P<seq>[0-9]+)\] 角色=\((?P<px>[-+0-9.]+),(?P<py>[-+0-9.]+)\) r=(?P<pr>[0-9.]+) "
                  r"\| 门=\((?P<cx>[-+0-9.]+),(?P<cy>[-+0-9.]+)\) 宽=(?P<w>[0-9.]+) "
                  r"带厚=(?P<hh>[0-9.]+) \| 左墙 x=(?P<lw>[-+0-9.]+)±(?P<lwh>[0-9.]+) "
                  r"右墙 x=(?P<rw>[-+0-9.]+)±(?P<rwh>[0-9.]+)")
@@ -109,7 +109,7 @@ def main(argv=None) -> int:
         # 老日志没有这个字段时退回"角色位置最近"。
         _cand = [f for f in sim if f.get("ba", -1) >= 0]
         if _cand:
-            k = int(r.get("idx", 0))
+            k = int(r.get("seq", 0))     # 用**几何帧号**配对（与仿真收到的行号同源）
             best = min(_cand, key=lambda f: abs(f["ba"] - k))
         else:
             best = min(sim, key=lambda f: abs(f["player"][0] - r["px"])

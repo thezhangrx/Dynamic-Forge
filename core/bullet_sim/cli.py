@@ -1367,10 +1367,21 @@ def cmd_play(args: argparse.Namespace) -> int:
                                          float(getattr(_pool, "rotation", [0.0] * _n)[_i])])
                         except Exception:
                             continue
-                try:
-                    _na = int(getattr(source, "n_actions", -1))
-                except Exception:
-                    _na = -1
+                _na = -1
+                for _attr in ("n_actions", "board", "link", "_board", "_link", "adapter"):
+                    try:
+                        _obj = source if _attr == "n_actions" else getattr(source, _attr, None)
+                        if _obj is None:
+                            continue
+                        if _attr == "n_actions":
+                            _na = int(_obj)
+                            break
+                        _v = getattr(_obj, "n_actions", None)
+                        if _v is not None:
+                            _na = int(_v)
+                            break
+                    except Exception:
+                        continue
                 _state_log.write(json.dumps({
                     "frame": frame_index,
                     "board_actions": _na,
