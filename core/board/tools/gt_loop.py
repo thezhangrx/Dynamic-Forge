@@ -94,6 +94,10 @@ def main(argv=None) -> int:
     ap.add_argument("--state", default="/tmp/gt.jsonl")
     ap.add_argument("--out", default="/tmp/mv.txt")
     ap.add_argument("--decide", default="/tmp/gt_decide")
+    ap.add_argument("--ssh-key", default=None,
+                    help="给了就在**板子上**跑决策（真·板子决策）："
+                         "ssh -i KEY root@192.168.137.242 /root/tools/gt_decide_board")
+    ap.add_argument("--ssh-host", default="root@192.168.137.242")
     ap.add_argument("--max-seconds", type=float, default=120.0)
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--quiet", action="store_true")
@@ -106,7 +110,16 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 1
 
-    decide = subprocess.Popen([args.decide], stdin=subprocess.PIPE,
+    if args.ssh_key:
+        # **板子自己决策**：把 @GT 通过 ssh 喂给板子上的同一个可执行文件，
+        # 决策在板子上算（不是 PC 上的副本），输出再回传给仿真。
+        cmd = ["ssh", "-i", args.ssh_key, "-o", "StrictHostKeyChecking=no",
+               "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=8",
+               args.ssh_host, "/root/tools/gt_decide_board"]
+        print(f"决策在板子上跑：{args.ssh_host}:/root/tools/gt_decide_board", flush=True)
+    else:
+        cmd = [args.decide]
+    decide = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, text=True, bufsize=1)
     state_path, out_path = Path(args.state), Path(args.out)
     state_path.touch(exist_ok=True)
