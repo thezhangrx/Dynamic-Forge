@@ -14,6 +14,9 @@
 set -u
 cd "$(dirname "$0")/../../.." || exit 1
 SECS=${1:-120}
+#: 障碍速度（场地单位/秒）。默认场景偏慢（44~96），这里给一个"正常"值，
+#: 可用 `SPEED=60 bash ...` 调慢、或 `SPEED=180` 调快。
+SPEED=${SPEED:-120}
 PY=Env/bin/python
 DEC=/tmp/gt_decide
 
@@ -30,6 +33,7 @@ g++ -std=c++17 -O2 -I core/cpu/cpp -o "$DEC" \
 echo "[gt_demo] 起仿真（--danger，分层势图）..."
 (setsid sh -c "tail -f /tmp/mv.txt | $PY -u -m bullet_sim board-control \
     --stdin --nostop --duration $SECS --fullscreen \
+    --obstacle-speed $SPEED \
     --potential --state-pipe /tmp/state.pkt --state-log /tmp/gt.jsonl" > /tmp/sim_gt.log 2>&1 &)
 sleep 3
 echo '@MOVE 0' >> /tmp/mv.txt      # 喂一行，仿真才会开始跑（不等太久）
