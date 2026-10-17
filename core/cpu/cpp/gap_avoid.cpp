@@ -717,11 +717,20 @@ Decision plan(const WorldView& world, GapMemory& mem, const AlgoConfig& cfg,
             }
         }
     }
+    // 边界余量：只掐"朝外"的分量（Python 同步实现，见 limit_edges）
+    bool edge_limited = false;
+    if (cfg.edge_margin > 0.0) {
+        const double wx0 = wx, wy0 = wy;
+        limit_edges(wx, wy, world.player, world.field_w, world.field_h, cfg.edge_margin);
+        edge_limited = (wx != wx0) || (wy != wy0);
+    }
+
     if (std::hypot(wx, wy) > EPS) {
         mem.has_last_dir = true;
         mem.last_dir = Vec2{wx, wy};
     }
 
+    d.edge_limited = edge_limited;
     d.wx = wx; d.wy = wy;
     d.tier = tier; d.reason = reason;
     d.t_arr = t_arr;
@@ -738,6 +747,28 @@ Decision plan(const WorldView& world, GapMemory& mem, const AlgoConfig& cfg,
     d.aim_world = band_point(wall, aim_lat, band);
     d.wall_band = band;
     return d;
+}
+
+void limit_edges(double& wx, double& wy, const double* player,
+                 double field_w, double field_h, double margin) {
+    // Python: `limit_edges` —— 逐行照抄，运算顺序不许变（逐位对账）
+    if (margin <= 0.0 || field_w <= 0.0 || field_h <= 0.0) return;
+    double lim = std::min(margin, 0.5 * field_w);
+    lim = std::min(lim, 0.5 * field_h);
+    if (lim <= 0.0) return;
+    const double x = player[P_X];
+    const double y = player[P_Y];
+    const double r = player[P_RADIUS];
+    if (wx < 0.0) {
+        wx *= std::max(0.0, std::min(1.0, (x - r) / lim));
+    } else if (wx > 0.0) {
+        wx *= std::max(0.0, std::min(1.0, ((field_w - r) - x) / lim));
+    }
+    if (wy < 0.0) {
+        wy *= std::max(0.0, std::min(1.0, (y - r) / lim));
+    } else if (wy > 0.0) {
+        wy *= std::max(0.0, std::min(1.0, ((field_h - r) - y) / lim));
+    }
 }
 
 Vec2 to_command(const Decision& d) {

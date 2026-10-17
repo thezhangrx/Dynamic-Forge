@@ -85,6 +85,10 @@ struct AlgoConfig {
     bool   has_forward = false;
     Vec2   forward{0.0, 0.0};
     double max_turn_rate = 0.0;
+    //: **边界余量**（场地单位，0 = 关）：不允许再往边界方向推。语义与 Python 侧
+    //: `AlgoConfig.edge_margin` 完全一致 —— 决策出口把指令里**朝外的分量**按距边界的
+    //: 余量线性衰减到 0，**切向保留**（否则角色会僵在边上）。
+    double edge_margin = 0.0;
 };
 
 /// 一堵缺口墙：最多 2 段共线矩形 + 它的墙坐标系。
@@ -121,6 +125,8 @@ struct Decision {
     double aim_lat = NAN;
     double s_hat = 0.0;
     int    n_rects = 0;
+    /// 这一帧的指令被边界余量削过（只为日志/统计，不参与控制）。
+    bool   edge_limited = false;
     Vec2   gap_line[2]{{NAN, NAN}, {NAN, NAN}};
     Vec2   aim_world{NAN, NAN};
     double wall_band = NAN;
@@ -213,6 +219,12 @@ Aperture reconstruct_aperture(const Wall& wall, WallMemory& mem, double r_p,
 /// 每帧调用一次：世界状态 -> Decision。只读 world，不改；只改 `mem`。
 Decision plan(const WorldView& world, GapMemory& mem, const AlgoConfig& cfg,
               double horizon_remaining);
+
+/// 边界余量：把朝外的分量按"距边界的余量"线性衰减到 0，切向保留。
+/// Python 同名函数 `gap_avoid.limit_edges` —— 同一串比较与乘法（没有 hypot/atan2），
+/// 所以两边逐位一致。
+void limit_edges(double& wx, double& wy, const double* player,
+                 double field_w, double field_h, double margin);
 
 /// Decision -> 归一化速度指令。零向量 = 不动。
 Vec2 to_command(const Decision& d);

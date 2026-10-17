@@ -69,13 +69,13 @@ def cli() -> pathlib.Path:
 # ===========================================================================
 
 def _fmt_cfg(cfg: AlgoConfig) -> str:
-    return ("CFG %.17g %.17g %.17g %.17g %d %.17g %d %.17g %.17g %d %.17g %.17g %.17g"
+    return ("CFG %.17g %.17g %.17g %.17g %d %.17g %d %.17g %.17g %d %.17g %.17g %.17g %.17g"
             % (cfg.safety_margin, cfg.max_window, cfg.align_frac, cfg.dead_frac,
                1 if cfg.allow_cross else 0, cfg.aim_lookahead,
                1 if cfg.front_back else 0, cfg.fwd_speed, cfg.hold_clearance,
                1 if cfg.forward is not None else 0,
                *(cfg.forward if cfg.forward is not None else (0.0, 0.0)),
-               cfg.max_turn_rate))
+               cfg.max_turn_rate, cfg.edge_margin))
 
 
 def _fmt_frame(view: WorldView, horizon: float) -> str:
@@ -528,3 +528,54 @@ def test_naive_translations_are_actually_wrong():
     b = Rect(2, 5.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.9, 0.0)
     out = sorted([a, b], key=lambda r: r.x)
     assert out[0] is a and out[1] is b, "sorted 不再稳定，分桶的 û 来源会换人"
+
+
+# ===========================================================================
+# 边界余量（edge_margin）：C++ 与 Python 必须逐位一致
+# ===========================================================================
+def _edge_margin_trace() -> list[tuple[WorldView, float]]:
+    """贴着四条边、朝外推的一串帧 —— 专打 `limit_edges` 的斜坡与归零。
+
+    每帧换一个"距边界的余量"（0 / margin/4 / margin/2 / margin / 很远），
+    朝外分量分别应当是 0 / 25% / 50% / 100% / 100%；切向分量一律不变。
+    """
+    frames: list[tuple[WorldView, float]] = []
+    margin = 25.0
+    for d in (0.0, margin / 4.0, margin / 2.0, margin, 100.0):
+        # 左边界：中心 x = 半径 + d
+        frames.append((WorldView(player=_player(10.0 + d, 240.0),
+                                 rects=_wall(200.0, 320.0, 120.0),
+                                 dt=1.0 / 120.0, step_index=0,
+                                 field_w=640.0, field_h=480.0), 2.0))
+        # 右边界：中心 x = 场宽 - 半径 - d
+        frames.append((WorldView(player=_player(630.0 - d, 240.0),
+                                 rects=_wall(200.0, 320.0, 120.0),
+                                 dt=1.0 / 120.0, step_index=1,
+                                 field_w=640.0, field_h=480.0), 2.0))
+        # 上边界（y 小）
+        frames.append((WorldView(player=_player(320.0, 10.0 + d),
+                                 rects=_wall(200.0, 320.0, 120.0),
+                                 dt=1.0 / 120.0, step_index=2,
+                                 field_w=640.0, field_h=480.0), 2.0))
+        # 下边界（y 大）
+        frames.append((WorldView(player=_player(320.0, 470.0 - d),
+                                 rects=_wall(200.0, 320.0, 120.0),
+                                 dt=1.0 / 120.0, step_index=3,
+                                 field_w=640.0, field_h=480.0), 2.0))
+    return frames
+
+
+def test_cpp_port_matches_with_edge_margin(cli) -> None:
+    """`edge_margin > 0` 时两边必须逐位一致（斜坡是纯乘除，要求逐位相等）。"""
+    cfg = AlgoConfig(edge_margin=25.0)
+    frames = _edge_margin_trace()
+    tiers = _compare(cfg, frames, cli, tag="edge_margin")
+    assert sum(tiers.values()) == len(frames)
+
+
+def test_edge_margin_default_is_off_and_unchanged(cli) -> None:
+    """默认 `edge_margin=0` 必须与旧行为一致（同一条轨迹、两次运行结果相同）。"""
+    frames = _edge_margin_trace()
+    a = _compare(AlgoConfig(), frames, cli, tag="edge_off_a")
+    b = _compare(AlgoConfig(edge_margin=0.0), frames, cli, tag="edge_off_b")
+    assert a == b

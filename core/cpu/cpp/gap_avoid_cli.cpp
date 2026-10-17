@@ -125,6 +125,7 @@ int main() {
     cfg.forward.x = need_double(&ok);
     cfg.forward.y = need_double(&ok);
     cfg.max_turn_rate = need_double(&ok);
+    cfg.edge_margin = need_double(&ok);
     if (!ok) { std::fprintf(stderr, "CFG 解析失败：%s\n", g_err); return 2; }
 
     // ---- 逐帧 ----

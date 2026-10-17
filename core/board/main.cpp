@@ -82,6 +82,11 @@ struct Args {
     //: 默认开；`--merge-gap-px 0` 关掉。实测真缺口约 58 px，所以默认 6 px 有 10 倍余量。
     double merge_gap_px = 6.0;
     double merge_dy_px = 4.0;
+    //: 决策的**边界余量**（场地单位，见 `gap_avoid.hpp` 的 `limit_edges`）：
+    //: 距边界不足这个距离时，指令里朝外的分量会被线性削到 0（切向保留）。
+    //: 取值依据：视觉边缘裁切需 >= 1.5 x 角色半径 ≈ 15 + 延迟位移 46ms x 200 ≈ 9，
+    //: 合计取 25（场宽 640 的 ~4%）。`--edge-margin 0` 关掉。
+    double edge_margin = 25.0;
     //: 逐像素分类的 7 个阈值**覆盖**（负数 = 用 C 参考模型/Python 真值的默认值）。
     //:
     //: 为什么要有这个：判据是**绝对阈值**（`r-b>40` 这类），而相机拍屏幕会把
@@ -164,6 +169,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--fiducial-slack")  a.fiducial_slack = std::atof(next());
         else if (k == "--merge-gap-px")    a.merge_gap_px = std::atof(next());
         else if (k == "--merge-dy-px")     a.merge_dy_px = std::atof(next());
+        else if (k == "--edge-margin")     a.edge_margin = std::atof(next());
         // 分类阈值覆盖（--wall-rb 等；不给就用默认值）
         else if (k == "--wall-rb")        a.ov_wall_rb = std::atoi(next());
         else if (k == "--wall-min-r")     a.ov_wall_min_r = std::atoi(next());
@@ -289,6 +295,8 @@ struct DecisionState {
     int n_player_on_fiducial = 0;
     //: 矩形层碎片合并的次数（"一堵墙被切成几段"被并回来的总次数）。
     int n_merged_rects = 0;
+    //: 有几帧被**边界余量**削过（朝外分量被衰减）—— "别贴边走"到底生效没有。
+    int n_edge_limited = 0;
     int tier_count[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // 见 tier_bucket()
 };
 
@@ -633,7 +641,9 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
     world.field_w = args.field_w;
     world.field_h = args.field_h;
 
+    st.cfg.edge_margin = args.edge_margin;      // 边界余量（0 = 关）
     const gap_avoid::Decision d = gap_avoid::plan(world, st.mem, st.cfg, 2.0);
+    if (d.edge_limited) ++st.n_edge_limited;
     gap_avoid::Vec2 cmd = gap_avoid::to_command(d);
     if (!player_ok) {
         // 角色没检出来（或检出来的位置正好是四角标定标记）时，上面用的位置是
@@ -660,6 +670,7 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
                 d.n_rects);
     if (n_degenerate > 0) std::printf("（丢了 %d 个退化矩形）", n_degenerate);
     if (n_merged > 0) std::printf("（并了 %d 段碎墙）", n_merged);
+    if (d.edge_limited) std::printf("（边界限速）");
     // 推出来的速度也打出来：线协议不带它，"到底推没推、推得对不对"只能看这一行。
     // 墙速取**最大**的那个（有多面墙时逐个打会把日志淹掉）。
     double wall_v = 0.0;
@@ -1055,6 +1066,10 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("\n");
+        if (st.n_edge_limited > 0) {
+            std::printf("其中 %d 帧被边界余量限速（朝外分量被削，切向保留）\n",
+                        st.n_edge_limited);
+        }
         if (st.n_merged_rects > 0) {
             std::printf("其中矩形层碎片合并 %d 次（一堵墙被切成几段 → 并回一段）\n",
                         st.n_merged_rects);
