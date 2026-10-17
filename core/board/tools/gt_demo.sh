@@ -30,11 +30,13 @@ g++ -std=c++17 -O2 -I core/cpu/cpp -o "$DEC" \
 echo "[gt_demo] 起仿真（--danger，分层势图）..."
 (setsid sh -c "tail -f /tmp/mv.txt | $PY -u -m bullet_sim board-control \
     --stdin --nostop --duration $SECS --fullscreen \
-    --danger --danger-every 4 --state-log /tmp/gt.jsonl" > /tmp/sim_gt.log 2>&1 &)
+    --potential --state-log /tmp/gt.jsonl" > /tmp/sim_gt.log 2>&1 &)
 sleep 5
 echo '@MOVE 0' >> /tmp/mv.txt      # 喂一行，仿真才会开始跑
 sleep 2
 
 echo "[gt_demo] 起中继（真值 → 决策 → 动作）..."
+# 决策**在板子上**跑（真·板子决策）：@GT 经 ssh 喂给 /root/tools/gt_decide_board
+KEY=${KEY:-data/fpga/board_ssh/board_key}
 "$PY" core/board/tools/gt_loop.py --state /tmp/gt.jsonl --out /tmp/mv.txt \
-      --max-seconds "$SECS" --decide "$DEC"
+      --max-seconds "$SECS" --decide "$DEC" --ssh-key "$KEY"
