@@ -1138,8 +1138,17 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
 
     // 先把**决策真正用的**角色位置打出来（`f.player` 在 decide 里可能被结构判据覆盖）：
     // 之前这里只打几何帧里的角色，结构判据覆盖后日志里还是 (0,0)，符号校准没法做。
-    std::printf("        角色用=(%+.1f,%+.1f) r=%+.1f ", f.player.x, f.player.y,
+    std::printf("        角色用=(%+.1f,%+.1f) r=%+.1f\n", f.player.x, f.player.y,
                 f.player.radius);
+    // 给**平台 HUD** 的一行（`@DBG` 前缀由 board_link 解析）：视觉这条链路上
+    // 也能在屏幕上看到板子的决策，和真值链路一致。
+    std::printf("@DBG tier=%s cmd=(%.2f,%.2f) gap=%.1f rects=%d "
+                "player=(%.0f,%.0f) aim=(%.0f,%.0f)\n",
+                d.tier, cmd.x, cmd.y,
+                std::isfinite(d.gap) ? d.gap : -1.0, d.n_rects,
+                f.player.x, f.player.y,
+                d.aim_world.x == d.aim_world.x ? d.aim_world.x : 0.0,
+                d.aim_world.y == d.aim_world.y ? d.aim_world.y : 0.0);
     std::printf("决策: tier=%-7s 指令=(%+.3f, %+.3f)  "
                 "t_arr=%.2fs 间隙=%+.1f 可用半宽=%+.1f 矩形=%d",
                 d.tier, cmd.x, cmd.y,
