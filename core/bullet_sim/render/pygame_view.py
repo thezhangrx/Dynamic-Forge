@@ -95,6 +95,7 @@ class PygameRenderer:
         show_prediction: bool = False,
         show_danger: bool = False,
         show_potential: bool = False,
+        field_bg: tuple = (34, 40, 55),
         potential_every: int = 30,
         show_target: bool = False,
         predictor: Any = None,
@@ -132,6 +133,10 @@ class PygameRenderer:
         #: **决策势场**（移植自 core/cpu/field_demo.py）：分层等值带 + 膨胀障碍 + 目标点。
         #: 与 `show_danger` 不同：那个是"未来子弹威胁"，这个是"朝缺口走的代价场"。
         self.show_potential = bool(show_potential)
+        #: 场地底色。**相机对着屏幕时，底色也是视觉输入的一部分**：深蓝底会把
+        #: 墙/角色的对比压小（相机端还有增益/偏置），实测改成纯黑后板子的
+        #: 识别明显更稳。默认值保持平台原样，只有"给板子看"的演示才覆盖。
+        self.field_bg = tuple(field_bg)
         #: 势场**每 N 帧**重算一次（实测每帧重算是 14 帧/秒，把整个仿真拖慢 4 倍 ——
         #: 用户看到的就是"墙怎么变慢了"。势场是慢变量，没必要每帧算）。
         self.potential_every = max(1, int(potential_every))
@@ -332,7 +337,7 @@ class PygameRenderer:
         field_rect = pygame.Rect(
             int(min(x0, x1)), int(min(y0, y1)), int(abs(x1 - x0)), int(abs(y1 - y0))
         )
-        pygame.draw.rect(screen, (34, 40, 55), field_rect)
+        pygame.draw.rect(screen, self.field_bg, field_rect)
         if self.show_field_border:
             pygame.draw.rect(screen, (60, 70, 95), field_rect, 1)
         if self.show_world_axes:

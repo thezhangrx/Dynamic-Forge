@@ -11,7 +11,7 @@ bash core/board/tools/kill_sim.sh >/dev/null 2>&1
 : > /tmp/bv_stream.txt
 
 echo "[演示] 起仿真（全屏 + 势场 + HUD），${SECS}s ..."
-(setsid sh -c "tail -f /tmp/bv_stream.txt | $PY -u -m bullet_sim board-control --stdin --nostop --duration $((SECS + 30)) --fullscreen --no-hud" > /tmp/bv_sim.log 2>&1 &)
+(setsid sh -c "tail -f /tmp/bv_stream.txt | $PY -u -m bullet_sim board-control --stdin --nostop --duration $((SECS + 30)) --fullscreen --no-hud --plain-field --field-bg 000000" > /tmp/bv_sim.log 2>&1 &)
 sleep 4
 echo '@MOVE 0' >> /tmp/bv_stream.txt
 sleep 1

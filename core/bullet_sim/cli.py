@@ -197,6 +197,9 @@ def _add_play_args(p: argparse.ArgumentParser, *, input_default: str = "manual")
     p.add_argument("--render-fps", type=float, default=60.0)
     p.add_argument("--sim-speed", type=float, default=1.0, help="sim seconds per real second")
     p.add_argument("--prediction", action="store_true", help="draw ballistic future trajectories")
+    p.add_argument("--field-bg", default=None,
+                   help="场地底色（如 000000）。相机对着屏幕时底色也算视觉输入，"
+                        "深蓝底会压低对比；默认保持平台原样")
     p.add_argument("--no-hud", action="store_true",
                    help="**不画 HUD 文字**：相机对着屏幕时，HUD 会被拍进画面、污染视觉输入")
     p.add_argument("--potential-every", type=int, default=30,
@@ -1230,6 +1233,8 @@ def cmd_play(args: argparse.Namespace) -> int:
             prediction_horizon=args.horizon,
             show_danger=args.danger,
             show_hud=not getattr(args, "no_hud", False),
+            field_bg=(parse_hex_color(args.field_bg)
+                      if getattr(args, "field_bg", None) else (34, 40, 55)),
             show_potential=getattr(args, "potential", False),
             potential_every=int(getattr(args, "potential_every", 30) or 30),
             interactive=False,
