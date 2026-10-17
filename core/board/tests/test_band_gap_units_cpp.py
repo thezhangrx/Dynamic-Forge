@@ -43,11 +43,8 @@ def _gxx() -> bool:
 
 
 pytestmark = pytest.mark.skipif(not _gxx(), reason="没有 g++")
-# 已知缺陷（本轮由这个测试发现）：`field_extent` 假设"场地边框是暖色"，
-# 但仿真里边框是冷色 (60,70,95) —— 实测这张**已知场景**的合成图上 ext_ok=0。
-# 于是它报出的比例尺/原点全是从"随便两条暖色列"来的，这正是板子把门算偏
-# 200 场地单位的根因。修好后把 xfail 去掉。
-xfail = pytest.mark.xfail(reason="field_extent 依赖暖色边框，仿真边框是冷色（待修）", strict=False)
+# 台架原先用来记录两个已修好的缺陷（冷色边框被当暖色量、旋转时量错边界），
+# 现在 5 例全绿，xfail 已去掉 —— 它们现在是**回归护栏**，不是待办。
 
 
 def scene(*, wall_y=300.0, gap=(251.0, 327.0), player=(320.0, 240.0), field=(640.0, 480.0),
@@ -143,7 +140,6 @@ def probe(tmp_path: Path, rgb: bytes, size) -> dict:
             "ext_ok": int(e.group(1)), "ex0": int(e.group(2)), "ex1": int(e.group(3))}
 
 
-@xfail
 @pytest.mark.parametrize("kw", [
     {"rot_deg": 0.0, "gain": 1.0, "offset": 0.0},
     {"rot_deg": 0.0, "gain": 0.55, "offset": -8.0},

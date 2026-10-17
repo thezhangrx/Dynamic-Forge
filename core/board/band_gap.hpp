@@ -41,6 +41,11 @@ struct Door {
     float support = 0.0f;     // min(左墙长, 右墙长) / 缺口宽
     int  n_bands = 0;         // 找到几条墙带（诊断）
     float angle_deg = 0.0f;   // 使带对比最大的剪切角（≈ 相机相对场地的旋转）
+    //: 该角度下**墙带**本身的对比（以 σ 为单位）。
+    //: 角度搜索必须按它来选，而不是按"这角度下最好的门有多宽" ——
+    //: 队头角度上一条假窄缝就可能比正确角度下的真缺口更"宽"，
+    //: 于是搜索会停在错的角度（实测旋转 6° 时停在 0°）。
+    float band_score = 0.0f;
 };
 
 namespace detail {
@@ -199,6 +204,10 @@ inline Door find_at(const uint8_t* rgb, int w, int h, double tan_a,
         for (int y = b.y0 > 1 ? b.y0 - 1 : 0; y <= b.y1 + 1 && y < hn; ++y) taken[static_cast<size_t>(y)] = 1;
     }
     out.n_bands = static_cast<int>(bands.size());
+    for (const Band& b : bands) {
+        const float sc = static_cast<float>(b.contrast / sigma);
+        if (sc > out.band_score) out.band_score = sc;
+    }
 
     // ---- ② 每条带找缺口，取"支撑比"最大的那扇门 -------------------------
     for (const Band& b : bands) {
@@ -330,10 +339,12 @@ inline Door find(const uint8_t* rgb, int w, int h, int min_rows = 6,
     for (float ang = -max_angle_deg; ang <= max_angle_deg + 0.001f; ang += step_deg) {
         const double tan_a = std::tan(ang * 3.14159265358979 / 180.0);
         Door d = find_at(rgb, w, h, tan_a, min_rows, max_rows, pad, k_sigma);
-        if (!d.found) continue;
+        if (d.n_bands == 0) continue;
         d.angle_deg = ang;
-        if (!best.found || d.support > best.support ||
-            (d.support == best.support && d.snr > best.snr)) {
+        // 选角度看**墙带是否被拉平**（band_score），不看某个门的宽窄：
+        // 否则角度 0 上的一条假窄缝会把搜索钉死在 0°。
+        if (!best.found || d.band_score > best.band_score ||
+            (d.band_score == best.band_score && d.found && d.support > best.support)) {
             best = d;
         }
     }
