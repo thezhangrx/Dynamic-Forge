@@ -31,9 +31,9 @@ echo "[gt_demo] 起仿真（--danger，分层势图）..."
 (setsid sh -c "tail -f /tmp/mv.txt | $PY -u -m bullet_sim board-control \
     --stdin --nostop --duration $SECS --fullscreen \
     --potential --state-pipe /tmp/state.pkt --state-log /tmp/gt.jsonl" > /tmp/sim_gt.log 2>&1 &)
-sleep 5
-echo '@MOVE 0' >> /tmp/mv.txt      # 喂一行，仿真才会开始跑
-sleep 2
+sleep 3
+echo '@MOVE 0' >> /tmp/mv.txt      # 喂一行，仿真才会开始跑（不等太久）
+sleep 1
 
 echo "[gt_demo] 起中继（真值 → 决策 → 动作）..."
 # 决策**在板子上**跑（真·板子决策）：@GT 经 ssh 喂给 /root/tools/gt_decide_board

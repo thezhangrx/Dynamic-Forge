@@ -102,6 +102,9 @@ def main(argv=None) -> int:
                     help="给了就在**板子上**跑决策（真·板子决策）："
                          "ssh -i KEY root@192.168.137.242 /root/tools/gt_decide_board")
     ap.add_argument("--ssh-host", default="root@192.168.137.242")
+    ap.add_argument("--all-frames", action="store_true",
+                    help="逐帧处理所有积压的状态包（离线对比用）。"
+                         "默认只处理**最新一帧**（控制回路应当用最新状态，不排队）")
     ap.add_argument("--record-local", default=None,
                     help="同时把**本地决策**也跑一遍并记录到该文件（用于和板子对比）")
     ap.add_argument("--max-seconds", type=float, default=120.0)
@@ -169,6 +172,16 @@ def main(argv=None) -> int:
         if b"\n" not in pending:
             continue
         *complete, pending = pending.split(b"\n")
+        if packet_mode and not args.all_frames:
+            # **最新值优先**：积压的旧包直接丢。控制回路排队处理旧状态 = 延迟，
+            # 平台刚启动时会积压几百帧，串行处理就变成"角色半天不动"。
+            newest = None
+            for line in reversed(complete):
+                text = line.decode("utf-8", "replace").strip()
+                if text.startswith("@STATE"):
+                    newest = line
+                    break
+            complete = [] if newest is None else [newest]
         for line in complete:
             if packet_mode:
                 text = line.decode("utf-8", "replace").strip()
