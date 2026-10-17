@@ -51,6 +51,55 @@ struct Homography {
     }
 };
 
+/// 逆变换（3x3 伴随矩阵；单应可逆的假设在四点不共线时成立）。
+inline Homography invert(const Homography& H) {
+    Homography out;
+    if (!H.ok) return out;
+    const double* a = H.h.data();
+    const double det = a[0] * (a[4] * a[8] - a[5] * a[7])
+                     - a[1] * (a[3] * a[8] - a[5] * a[6])
+                     + a[2] * (a[3] * a[7] - a[4] * a[6]);
+    if (std::fabs(det) < 1e-12) return out;
+    out.h[0] = (a[4] * a[8] - a[5] * a[7]) / det;
+    out.h[1] = (a[2] * a[7] - a[1] * a[8]) / det;
+    out.h[2] = (a[1] * a[5] - a[2] * a[4]) / det;
+    out.h[3] = (a[5] * a[6] - a[3] * a[8]) / det;
+    out.h[4] = (a[0] * a[8] - a[2] * a[6]) / det;
+    out.h[5] = (a[2] * a[3] - a[0] * a[5]) / det;
+    out.h[6] = (a[3] * a[7] - a[4] * a[6]) / det;
+    out.h[7] = (a[1] * a[6] - a[0] * a[7]) / det;
+    out.h[8] = (a[0] * a[4] - a[1] * a[3]) / det;
+    out.ok = true;
+    return out;
+}
+
+/// 场地四角在**图像**里的包围盒（用单应的逆变换）。
+///
+/// 为什么用它代替"亮度边缘"：实测把相机录下来的帧回放时，墙上亮段的两端
+/// 会产生比场地边界更强的竖直亮度台阶，于是"取两条最强台阶"量出来的宽度只有
+/// 67 px（真值 544）。而四角标记是**已知场地坐标**的强特征，用它们反解出来的
+/// 包围盒不依赖"哪条边更亮"。
+inline bool field_bbox(const Homography& H, double field_w, double field_h, int w, int hh,
+                       int* x0, int* x1, int* y0, int* y1) {
+    const Homography inv = invert(H);
+    if (!inv.ok) return false;
+    const double corners[4][2] = {{0.0, 0.0}, {field_w, 0.0}, {field_w, field_h}, {0.0, field_h}};
+    double mnx = 1e18, mxx = -1e18, mny = 1e18, mxy = -1e18;
+    for (auto& c : corners) {
+        const auto q = inv.apply(c[0], c[1]);
+        if (q[0] < mnx) mnx = q[0];
+        if (q[0] > mxx) mxx = q[0];
+        if (q[1] < mny) mny = q[1];
+        if (q[1] > mxy) mxy = q[1];
+    }
+    *x0 = static_cast<int>(std::lround(mnx));
+    *x1 = static_cast<int>(std::lround(mxx));
+    *y0 = static_cast<int>(std::lround(mny));
+    *y1 = static_cast<int>(std::lround(mxy));
+    (void)w; (void)hh;
+    return true;
+}
+
 /// 4 点 → 单应（DLT，直接解 8×8 线性方程组；点序必须一致）。
 ///
 /// 为什么不用 SVD：只有 8 个未知数、8 个方程，高斯消元（带部分主元）就够，
