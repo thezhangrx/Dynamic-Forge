@@ -1430,8 +1430,18 @@ int main(int argc, char** argv) {
                 }
             }
             }
-            sg_doors = band_gap::find_all(rgb.data(), pw, ph, 6, 40, 6, 5.0f, 10.0f, 2.5f,
-                                          sg_min_gap_px);
+            // **性能**：`find_all` 会在 ±10° 里搜 25 个角度（每个角度都要重扫整幅图），
+            // 实测是整帧耗时的大头。有了四角标记的单应之后，旋转/透视都在**坐标变换**
+            // 里被吃掉了，行带检测不需要再搜角度 —— 直接按 0° 跑一遍。
+            if (sg_h.ok) {
+                std::vector<band_gap::Door> all;
+                band_gap::find_at(rgb.data(), pw, ph, 0.0, 6, 40, 6, 5.0f, &all,
+                                  sg_min_gap_px);
+                sg_doors = all;
+            } else {
+                sg_doors = band_gap::find_all(rgb.data(), pw, ph, 6, 40, 6, 5.0f, 10.0f, 2.5f,
+                                              sg_min_gap_px);
+            }
             // 场地范围要在**去剪切**的坐标系里量：先由角度搜索定角，再用同一个角
             // 重新量一次边界。顺序不能反（先量框会把旋转的信息烧掉，实测偏 150 单位）。
             {
