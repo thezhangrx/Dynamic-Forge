@@ -197,6 +197,8 @@ def _add_play_args(p: argparse.ArgumentParser, *, input_default: str = "manual")
     p.add_argument("--render-fps", type=float, default=60.0)
     p.add_argument("--sim-speed", type=float, default=1.0, help="sim seconds per real second")
     p.add_argument("--prediction", action="store_true", help="draw ballistic future trajectories")
+    p.add_argument("--potential-every", type=int, default=30,
+                   help="势场每 N 帧重算一次（默认 6）。每帧重算会把仿真拖到 14 帧/秒")
     p.add_argument("--potential", action="store_true",
                    help="画**决策势场**（移植自 core/cpu/field_demo.py：分层等值带 + "
                         "膨胀障碍 + 缺口目标点）。与 --danger（未来子弹威胁）不同")
@@ -1226,6 +1228,7 @@ def cmd_play(args: argparse.Namespace) -> int:
             prediction_horizon=args.horizon,
             show_danger=args.danger,
             show_potential=getattr(args, "potential", False),
+            potential_every=int(getattr(args, "potential_every", 30) or 30),
             interactive=False,
             input_source=play.source,
             controller=play.controller,

@@ -95,6 +95,7 @@ class PygameRenderer:
         show_prediction: bool = False,
         show_danger: bool = False,
         show_potential: bool = False,
+        potential_every: int = 30,
         show_target: bool = False,
         predictor: Any = None,
         prediction_horizon: int = 90,
@@ -131,6 +132,12 @@ class PygameRenderer:
         #: **决策势场**（移植自 core/cpu/field_demo.py）：分层等值带 + 膨胀障碍 + 目标点。
         #: 与 `show_danger` 不同：那个是"未来子弹威胁"，这个是"朝缺口走的代价场"。
         self.show_potential = bool(show_potential)
+        #: 势场**每 N 帧**重算一次（实测每帧重算是 14 帧/秒，把整个仿真拖慢 4 倍 ——
+        #: 用户看到的就是"墙怎么变慢了"。势场是慢变量，没必要每帧算）。
+        self.potential_every = max(1, int(potential_every))
+        self._pot_frame = -1
+        self._pot_ov = None
+        self._pot_surf = None
         self._field_mem = None
         self._field_cfg = None
         self._gap_mem = None
@@ -749,21 +756,46 @@ class PygameRenderer:
             self._field_mem = FieldMemory()
             self._field_cfg = FieldConfig()
             self._gap_mem = GapMemory()
+        import pygame
+
         env = world.state.env
-        dec = plan(view_from_world(world), self._gap_mem, AlgoConfig(), 1e9)
-        aim = None
-        ax, ay = float(dec.aim_world[0]), float(dec.aim_world[1])
-        if ax == ax and ay == ay and abs(ax) < 1e6 and abs(ay) < 1e6:
-            aim = (ax, ay)
-        view = FieldView(
-            player=[float(v) for v in world.player],
-            rects=observe_rects(world.state.bullets),
-            field_w=float(env.field_w), field_h=float(env.field_h),
-            goal=aim, step_index=int(env.step_index), dt=float(env.dt),
-        )
-        ov = field_overlay(view, self._field_mem, self._field_cfg, aim=aim)
-        draw_field(screen, self.viewport, ov)
-        draw_marks(screen, self.viewport, ov)
+        frame_no = int(env.step_index)
+        # 一切（决策瞄准点、场、绘制）都放进节流块：实测每帧做这些会把仿真从
+        # 60 帧/秒拖到 14~16 帧/秒，仿真时间轴随之变慢（用户感觉"墙变慢"）。
+        if self._pot_surf is None or (frame_no - self._pot_frame) >= self.potential_every:
+            self._pot_frame = frame_no
+            dec = plan(view_from_world(world), self._gap_mem, AlgoConfig(), 1e9)
+            aim = None
+            ax, ay = float(dec.aim_world[0]), float(dec.aim_world[1])
+            if ax == ax and ay == ay and abs(ax) < 1e6 and abs(ay) < 1e6:
+                aim = (ax, ay)
+            view = FieldView(
+                player=[float(v) for v in world.player],
+                rects=observe_rects(world.state.bullets),
+                field_w=float(env.field_w), field_h=float(env.field_h),
+                goal=aim, step_index=frame_no, dt=float(env.dt),
+            )
+            ov = field_overlay(view, self._field_mem, self._field_cfg, aim=aim)
+            # **半分辨率**画势场再放大贴回：势场本身是成块的，半分辨率几乎看不出差别，
+            # 但每帧的贴图量降到 1/4（实测整幅 SRCALPHA 贴图把 60 帧/秒压到 35）。
+            if self._pot_surf is None:
+                self._pot_scale = 0.5
+                self._pot_surf = pygame.Surface(
+                    (max(1, int(self._size[0] * self._pot_scale)),
+                     max(1, int(self._size[1] * self._pot_scale))), pygame.SRCALPHA)
+            else:
+                self._pot_surf.fill((0, 0, 0, 0))
+            from dataclasses import replace as _dc_replace
+            sub_vp = _dc_replace(self.viewport,
+                                 screen_w=self._pot_surf.get_width(),
+                                 screen_h=self._pot_surf.get_height(),
+                                 margin=max(0, int(self.viewport.margin * self._pot_scale)))
+            draw_field(self._pot_surf, sub_vp, ov)
+            draw_marks(self._pot_surf, sub_vp, ov)
+        if self._pot_surf.get_size() != self._size:
+            screen.blit(pygame.transform.smoothscale(self._pot_surf, self._size), (0, 0))
+        else:
+            screen.blit(self._pot_surf, (0, 0))
 
     def _draw_danger(self, screen: Any, world: Any) -> None:
         danger = self.danger
