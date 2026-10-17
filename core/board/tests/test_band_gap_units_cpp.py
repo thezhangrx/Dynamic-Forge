@@ -55,14 +55,21 @@ def scene(*, wall_y=479.0, gap=(251.0, 327.0), player=(320.0, 240.0), field=(640
     ow, oh = out
     buf = bytearray(ow * oh * 3)
 
+    # 场地在画面里**居中、等比**放置（和仿真一致：4:3 的场地放进 16:9 的窗口，
+    # 左右留黑边）。实测真机位：场地宽约 545/640 ≈ 0.85，压缩后高度 ≈ 0.85*360。
+    # 之前把场地铺满整幅图，等于造了一张"没有边界"的假图。
+    fld_w = 0.85 * ow
+    fld_h = fld_w * (fh / fw) * squash
+    fld_x = 0.5 * (ow - fld_w)
+    fld_y = 0.5 * (oh - fld_h)
+
     def to_img(fx: float, fy: float):
-        # 场地 → 画面：先绕场心旋转，再纵向压缩，最后按比例映射到 out
         cx, cy = 0.5 * fw, 0.5 * fh
         dx, dy = fx - cx, fy - cy
         t = math.radians(rot_deg)
         rx = dx * math.cos(t) - dy * math.sin(t) + cx
         ry = dx * math.sin(t) + dy * math.cos(t) + cy
-        return rx / fw * ow, ry * squash / fh * oh
+        return fld_x + rx / fw * fld_w, fld_y + ry / fh * fld_h
 
     def put(x: int, y: int, c):
         if 0 <= x < ow and 0 <= y < oh:
