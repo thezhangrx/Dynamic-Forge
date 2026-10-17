@@ -97,6 +97,11 @@ def main(argv=None) -> int:
         f["bands"] = bands_of(f["walls"])
 
     errs_cx, errs_w, errs_cy, same_band, no_band = [], [], [], 0, 0
+    #: 每条注入行到**任意**真值缺口的最小 2D 距离（场地单位）。
+    #: 为什么要有它：上一版只在"最近的那条带"里找缺口，一旦选错带，误差就被算到
+    #: 别的墙上（掩盖真实分布）。这个最近距离回答的是"板子报的门，在真值里
+    #: 到底有没有对应的缺口" —— 是判据质量，而不是选择质量。
+    near2d = []
     for r in rows:
         # 按角色位置找最近的真值帧
         best = min(sim, key=lambda f: abs(f["player"][0] - r["px"]) + abs(f["player"][1] - r["py"]))
@@ -111,6 +116,10 @@ def main(argv=None) -> int:
         gap = min(b["gaps"], key=lambda g: abs(0.5 * (g[0] + g[1]) - r["cx"]))
         tcx = 0.5 * (gap[0] + gap[1])
         tw = gap[1] - gap[0]
+        _d = min((((r["cx"] - 0.5 * (g[0] + g[1])) ** 2 +
+                   (r["cy"] - b2["y"]) ** 2) ** 0.5)
+                 for b2 in best["bands"] for g in b2["gaps"]) if any(b2["gaps"] for b2 in best["bands"]) else 1e9
+        near2d.append(_d)
         errs_cx.append(r["cx"] - tcx)
         errs_w.append(r["w"] - tw)
         errs_cy.append(r["cy"] - b["y"])
@@ -125,6 +134,9 @@ def main(argv=None) -> int:
           f"|P95| {abs(p95([abs(v) for v in errs_cx])):.1f}")
     print(f"门宽误差  ：均值 {mean(errs_w):+.1f}  P95 {p95([abs(v) for v in errs_w]):.1f}")
     print(f"门 y 误差  ：均值 {mean(errs_cy):+.1f}  P95 {p95([abs(v) for v in errs_cy]):.1f}")
+    ok30 = sum(1 for d in near2d if d <= 30.0)
+    print(f"到最近真值缺口的 2D 距离：中位 {sorted(near2d)[len(near2d)//2] if near2d else 0:.1f} "
+          f"P95 {p95(near2d):.1f} | ≤30 单位的占 {ok30}/{n} = {100.0*ok30/n:.0f}%")
     print(f"门的 y 带与真值墙带一致：{same_band}/{n} = {100.0*same_band/n:.0f}%")
     return 0
 
