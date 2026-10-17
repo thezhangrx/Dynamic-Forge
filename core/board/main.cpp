@@ -991,9 +991,21 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
         // 其余墙用原始几何（它们不是当前目标，抖动不影响指令）。
         for (const band_gap::Door& d : *doors) {
             const bool near_one = (&d == pick);
-            const double by = near_one ? sm_y : 0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale_y;
-            const double hh = near_one ? sm_hh
-                                       : 0.5 * (static_cast<double>(d.y1 - d.y0) + 1.0) * s_scale_y;
+            double by, hh;
+            if (hmap && hmap->ok) {
+                // 带中心行与上下沿都过单应：y 才和 x 在同一个坐标系里
+                const double band_row = 0.5 * (static_cast<double>(d.y0) + d.y1);
+                const double cx_img = 0.5 * (static_cast<double>(d.x0) + d.x1);
+                by = hmap->apply(cx_img, band_row)[1];
+                const double y_top = hmap->apply(cx_img, static_cast<double>(d.y0))[1];
+                const double y_bot = hmap->apply(cx_img, static_cast<double>(d.y1))[1];
+                hh = 0.5 * std::fabs(y_bot - y_top);
+                if (near_one) { by = sm_y; hh = sm_hh; }
+            } else {
+                by = near_one ? sm_y : 0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale_y;
+                hh = near_one ? sm_hh
+                              : 0.5 * (static_cast<double>(d.y1 - d.y0) + 1.0) * s_scale_y;
+            }
             double gl, gr;
             if (hmap && hmap->ok) {
                 const double band_row = 0.5 * (static_cast<double>(d.y0) + d.y1);
@@ -1372,11 +1384,23 @@ int main(int argc, char** argv) {
             {
                 const std::vector<rectify::Marker> ms =
                     rectify::find_markers(rgb.data(), pw, ph);
+                // 不管找到几个标记，都先把"候选角色贴着标记"的情况排掉
+                // （标记只露出 2~3 个时也需要这条；否则会拿角标当角色）
+                if (sg_player.found && !ms.empty()) {
+                    for (const rectify::Marker& mk : ms) {
+                        const double half = 2.0 * std::max(mk.w, mk.h);
+                        if (std::hypot(sg_player.x - mk.x, sg_player.y - mk.y) < half) {
+                            sg_player.found = false;
+                            break;
+                        }
+                    }
+                }
                 if (ms.size() == 4) {
                     // find_markers 按象限返回 TL,TR,BL,BR；单应要求 TL,TR,BR,BL
                     const std::array<std::array<double, 2>, 4> img = {{{ms[0].x, ms[0].y},
                         {ms[1].x, ms[1].y}, {ms[3].x, ms[3].y}, {ms[2].x, ms[2].y}}};
-                    sg_h = rectify::solve(img, rectify::contract_markers(args.field_w, args.field_h));
+                        sg_h = rectify::solve(img, rectify::contract_markers(args.field_w, args.field_h));
+
                 }
             }
             }
