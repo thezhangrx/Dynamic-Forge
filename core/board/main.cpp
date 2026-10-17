@@ -297,6 +297,8 @@ struct DecisionState {
     int n_merged_rects = 0;
     //: 有几帧被**边界余量**削过（朝外分量被衰减）—— "别贴边走"到底生效没有。
     int n_edge_limited = 0;
+    //: 本帧没检出障碍、于是**沿用上一条有效指令**的帧数（见 decide() 里的说明）
+    int n_hold_cmd = 0;
     int tier_count[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // 见 tier_bucket()
 };
 
@@ -657,6 +659,19 @@ gap_avoid::Vec2 decide(const GeometryFrame& f, const Args& args, DecisionState& 
                 ? "  ⚠ 本帧的「角色」落在四角标定标记上 → 只发 stay（不拿标记当角色）\n"
                 : "  ⚠ 本帧没检出角色 → 只发 stay（不拿兜底位置发指令）\n");
         }
+    }
+    // 本帧一个障碍都没检出：**不要**当成"该停"。
+    // 板子控平台时场景**只有一种障碍**（--obstacle-type 强约束），所以"这帧没检出"
+    // 是漏检，不是"墙没了"。实测 43% 的帧零矩形，指令就在"走"与"停"之间来回跳，
+    // 角色在出发点附近乱晃。物理事实是墙还在 —— 保持上一条有效指令。
+    static gap_avoid::Vec2 last_cmd{0.0, 0.0};
+    static bool have_cmd = false;
+    if (rects.empty() && have_cmd && player_ok && cmd.x == 0.0 && cmd.y == 0.0) {
+        cmd = last_cmd;
+        ++st.n_hold_cmd;
+    } else if (player_ok && (cmd.x != 0.0 || cmd.y != 0.0)) {
+        last_cmd = cmd;
+        have_cmd = true;
     }
     ++st.n_decisions;
     st.tier_count[tier_bucket(d.tier)] += 1;
@@ -1069,6 +1084,10 @@ int main(int argc, char** argv) {
         if (st.n_edge_limited > 0) {
             std::printf("其中 %d 帧被边界余量限速（朝外分量被削，切向保留）\n",
                         st.n_edge_limited);
+        }
+        if (st.n_hold_cmd > 0) {
+            std::printf("其中 %d 帧没检出障碍、沿用了上一条有效指令（漏检≠该停）\n",
+                        st.n_hold_cmd);
         }
         if (st.n_merged_rects > 0) {
             std::printf("其中矩形层碎片合并 %d 次（一堵墙被切成几段 → 并回一段）\n",
