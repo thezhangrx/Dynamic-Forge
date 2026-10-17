@@ -1,56 +1,63 @@
 #!/bin/bash
 # ===========================================================================
-# vision_replay.sh —— 视觉离线对账（相机在板子上，**视频留在板子、只回传日志**）
+# vision_replay.sh —— 视觉离线对账（相机在板子上：**直接录 PPM，不落 mkv**）
 #
 #     bash core/board/tools/vision_replay.sh [秒数]
+#     SKIP_RECORD=1 bash ...        # 复用板上已有 ppm 序列与真值，只重跑处理+对账
 #
-# 为什么这么分工（回答"本地处理还是板子处理"）：
-#   * 相机是 UVC 设备，**只有板子能打开**（PC 拿不到 /dev/video0）；
-#   * 视频 100 MB 级，来回传很慢；几何日志只有几十 KB；
-#   * 同一段视频要**反复跑**（改判据 → 重跑），留在板子上最省事。
-#   所以：**板子上录、板子上处理（板子自己的视觉程序）、只把日志传回本地对账**。
-#   需要看某几帧画面时，再单独取帧（几 MB），不必整段传。
+# 为什么直接录 PPM：
+#   * 先录 mkv 再抽帧，实测画面布满红紫噪声 —— 这块 UVC 的 MJPG 带非标准 APP 字段，
+#     "先存流再解码"这条路会坏；
+#   * cam_live 那条路（ffmpeg 直接输出 rgb24）是验证过可用的，所以这里也用同一种解码，
+#     只是把结果落成 PPM 序列。
 #
-# 步骤：
-#   1) 平台上跑起来 + 录一段（板子）/tmp/vis/video.mkv，同时真值写本地 state.jsonl
-#   2) 板子上抽帧 → vision_board_devmem --ppm-dir（PS 参考）与 --via-pl（PL）各跑
-#   3) 只把两个日志 scp 回来，与真值按时间对账
+# 录制前**先自检**：拍一帧跑一遍板子视觉，确认能看到场地（标记数=4）。
+# 看不到就直接报错退出 —— 之前多次是"相机对着浏览器在跑视觉"，白跑。
 # ===========================================================================
 set -u
 cd "$(dirname "$0")/../../.." || exit 1
-SECS=${1:-30}
+SECS=${1:-12}
 OUT=${OUT:-/tmp/vis}
 KEY=${KEY:-data/fpga/board_ssh/board_key}
 HOST=${HOST:-root@192.168.137.242}
 PY=Env/bin/python
 FPS=${FPS:-30}
 mkdir -p "$OUT"
-
 R() { ssh -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 "$HOST" "$@"; }
 
-echo "[1/3] 平台上跑起来 + 板子录 ${SECS}s ..."
-if [ "${SKIP_RECORD:-0}" = "1" ] && [ -f "$OUT/state.jsonl" ]; then
-    echo "    跳过录制与真值（SKIP_RECORD=1，复用已有视频+真值）"
-elif [ "${REUSE:-0}" = "1" ] && R 'test -f /tmp/vis_video.mkv' 2>/dev/null; then
-    echo "    复用板子上已有视频（REUSE=1）"
+echo "[1/3] 起平台 + 自检 + 录 PPM（${SECS}s）..."
+if [ "${SKIP_RECORD:-0}" != "1" ]; then
+  bash core/board/tools/kill_sim.sh >/dev/null 2>&1
+  rm -rf /tmp/vp; R 'rm -rf /tmp/vp && mkdir -p /tmp/vp'
+  rm -f /tmp/mv.txt "$OUT/state.jsonl"; touch /tmp/mv.txt
+  (setsid sh -c "tail -f /tmp/mv.txt | $PY -u -m bullet_sim play --input auto --obstacle-type wall_with_gap --stage-seconds 0 --fullscreen --no-hud --plain-field --field-bg 000000 --duration $((SECS + 25)) --state-log $OUT/state.jsonl" > "$OUT/sim.log" 2>&1 &)
+  sleep 4
+
+  # ---- 录制前自检：拍一帧，看板子能不能认出场地 ----
+  R 'ffmpeg -hide_banner -loglevel error -f v4l2 -input_format mjpeg -video_size 640x480 -i /dev/video0 -frames:v 1 -vf "scale=640:360" -y /tmp/pre.ppm'
+  R '/root/board_src/build/vision_board_devmem --ppm /tmp/pre.ppm --frames 1 --structural-gap --verbose 2>&1' > "$OUT/precheck.log" 2>&1
+  if ! grep -aqE "场地=[1-9][0-9]*px" "$OUT/precheck.log" || ! grep -aq "门=1" "$OUT/precheck.log"; then
+      echo "!! 自检失败：板子在这一帧里没看到场地（标记数≠4）。"
+      echo "   常见原因：仿真窗口不在最前 / 相机没对着屏幕。"
+      echo "   —— 先解决这个再录，否则录到的是无效素材。"
+      grep -a "标记=" "$OUT/precheck.log" | head -2
+      bash core/board/tools/kill_sim.sh >/dev/null 2>&1
+      exit 2
+  fi
+  echo "    自检通过（场地已量出 + 门已找到）"
+
+  R "ffmpeg -hide_banner -loglevel error -f v4l2 -input_format mjpeg -video_size 640x480 -i /dev/video0 -t $SECS -r $FPS -vf scale=640:360 -start_number 0 /tmp/vp/%06d.ppm"
+  bash core/board/tools/kill_sim.sh >/dev/null 2>&1
 else
-bash core/board/tools/kill_sim.sh >/dev/null 2>&1
-rm -f /tmp/mv.txt "$OUT/state.jsonl"; touch /tmp/mv.txt
-(setsid sh -c "tail -f /tmp/mv.txt | $PY -u -m bullet_sim play --input auto --obstacle-type wall_with_gap --stage-seconds 0 \
-    --fullscreen --duration $((SECS + 25)) --state-log $OUT/state.jsonl" \
-    > "$OUT/sim.log" 2>&1 &)
-sleep 4
-R 'ffmpeg -hide_banner -loglevel error -f v4l2 -input_format mjpeg -video_size 1280x720 -i /dev/video0 -t '"$SECS"' -r '"$FPS"' -y /tmp/vis_video.mkv; ls -l /tmp/vis_video.mkv' || exit 1
-bash core/board/tools/kill_sim.sh >/dev/null 2>&1
+  echo "    SKIP_RECORD=1：复用板上已有 ppm 序列与真值"
 fi
-echo "    真值帧: $(wc -l < "$OUT/state.jsonl" 2>/dev/null || echo 0)"
+N=$(R 'ls /tmp/vp | wc -l')
+echo "    帧数 $N，真值帧 $(wc -l < "$OUT/state.jsonl" 2>/dev/null || echo 0)"
 
-echo "[2/3] 板子抽帧 + 视觉处理 ..."
-R 'rm -rf /tmp/vis_ppm && mkdir -p /tmp/vis_ppm && ffmpeg -hide_banner -loglevel error -i /tmp/vis_video.mkv -vf "scale=640:360" -start_number 0 /tmp/vis_ppm/%06d.ppm && ls /tmp/vis_ppm | wc -l'
-N=$(R 'ls /tmp/vis_ppm | wc -l')
-echo "    抽帧 $N"
-R "/root/board_src/build/vision_board_devmem --ppm-dir /tmp/vis_ppm --frames $N --structural-gap --verbose 2>&1" > "$OUT/board_ps.log" 2>&1
-echo "    注入行: $(grep -c '注入#' "$OUT/board_ps.log" 2>/dev/null || echo 0)"
+echo "[2/3] 板子视觉处理（PS 参考模型）..."
+R "/root/board_src/build/vision_board_devmem --ppm-dir /tmp/vp --frames $N --structural-gap --verbose 2>&1" > "$OUT/board_ps.log" 2>&1
+echo "    注入行: $(grep -ac '注入#' "$OUT/board_ps.log" 2>/dev/null || echo 0)"
+echo "    标记=4 的帧: $(grep -ao '标记=4' "$OUT/board_ps.log" | wc -l) / $(grep -ac '结构\]' "$OUT/board_ps.log" 2>/dev/null || echo 0)"
 
-echo "[3/3] 与真值对账（本地）..."
-$PY core/board/tools/compare_frames.py "$OUT/state.jsonl" "$OUT/board_ps.log" --rows 12 || true
+echo "[3/3] 与真值对账..."
+$PY core/board/tools/compare_frames.py "$OUT/state.jsonl" "$OUT/board_ps.log" --time-scale "$(echo "60/$FPS" | bc)" --rows 10 || true
