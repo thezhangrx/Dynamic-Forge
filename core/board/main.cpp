@@ -1400,6 +1400,23 @@ int main(int argc, char** argv) {
                     const std::array<std::array<double, 2>, 4> img = {{{ms[0].x, ms[0].y},
                         {ms[1].x, ms[1].y}, {ms[3].x, ms[3].y}, {ms[2].x, ms[2].y}}};
                         sg_h = rectify::solve(img, rectify::contract_markers(args.field_w, args.field_h));
+                    // **场地范围以四角标记为准**：`field_extent` 在真机帧上会去量
+                    // 墙端（亮墙 vs 暗底产生更强台阶），实测宽度只量出 67 px（真值 544）。
+                    // 标记是已知场地坐标的强特征，反解出来的包围盒不受"哪条边更亮"影响。
+                    if (sg_h.ok) {
+                        int bx0 = 0, bx1 = 0, by0 = 0, by1 = 0;
+                        if (rectify::field_bbox(sg_h, args.field_w, args.field_h,
+                                                pw, ph, &bx0, &bx1, &by0, &by1)) {
+                            sg_ext.ok = true;
+                            sg_ext.x0 = bx0; sg_ext.x1 = bx1;
+                            sg_ext.y0 = by0; sg_ext.y1 = by1;
+                            sg_ext.width_px = static_cast<double>(bx1 - bx0 + 1);
+                            sg_ext.height_px = static_cast<double>(by1 - by0 + 1);
+                            sg_ext.scale_x = args.field_w / sg_ext.width_px;
+                            sg_ext.scale_y = args.field_h / sg_ext.height_px;
+                            sg_ext.anisotropy = sg_ext.scale_y > 0 ? sg_ext.scale_x / sg_ext.scale_y : 1.0;
+                        }
+                    }
 
                 }
             }

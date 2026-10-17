@@ -233,43 +233,51 @@ inline bool field_region_bbox(const uint8_t* rgb, int w, int h,
 }
 
 
-//: 用"**黑块 + 亮环**"找四角标记。
+//: 用**内部纹理**找四角标记（黑底 + 白图案 = 高频图案）。
 //:
-//: 判据只用几何/亮度关系，不含像素常数：
-//:   * 标记 = 一块**暗**（黑底）；
-//:   * 它的**周围是亮的**（标定标记贴在场地上，四周是场地底色/网格）；
-//:   * 尺寸接近"场地宽 × 48/640"（契约：边长 48、场地 640）。
+//: 为什么不用亮度/暗度：这台相机拍下来，墙是"均匀亮"、场地是"均匀灰"、
+//: 屏幕边框是"均匀黑"、键盘是"暗"，几类东西在亮度上挤在一起 —— 实测只能用
+//: 亮度特征凑到 3/4 个标记（贴右边那个总丢）。
 //:
-//: 这条"亮环"判据正好把**屏幕黑边/键盘/边框**排掉 —— 那些也是暗的，但四周也是暗的。
-//: 踩过的坑：只看"暗块"，屏幕黑边会和标记的黑框连成一片，底部两个标记直接被滤掉。
+//: 标记独有的特征是**块内黑白高频图案**：
+//:   * 能量图：`E = |L(x+2,y) − L(x,y)| + |L(x,y+2) − L(x,y)|`
+//:     （同一个像素的增益/偏置在差分里抵消，所以与曝光无关）；
+//:   * 只有**密集**的高能量块才算标记：墙边/网格线是 1~2 px 的细线，
+//:     块内高能量占比很低；标记的图案铺满整块，占比高。
+//: 判据全是"占比"和"尺寸窗口（用场地宽换算）"，没有像素常数。
 inline std::vector<Marker> find_markers_dark(const uint8_t* rgb, int w, int h) {
     std::vector<Marker> res;
     if (!rgb || w < 32 || h < 32) return res;
-    auto lum = [&](int x, int y) {
+    auto lum = [&](int x, int y) -> int {
         const size_t i = (static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)) * 3;
         int l = rgb[i];
         if (rgb[i + 1] > l) l = rgb[i + 1];
         if (rgb[i + 2] > l) l = rgb[i + 2];
         return l;
     };
-    // 全场亮度中位数（用于"暗"的判据：低于中位数的一半）
-    std::vector<int> hh(256, 0);
-    for (int i = 0; i < w * h; ++i) {
-        int l = rgb[i * 3];
-        if (rgb[i * 3 + 1] > l) l = rgb[i * 3 + 1];
-        if (rgb[i * 3 + 2] > l) l = rgb[i * 3 + 2];
-        ++hh[static_cast<size_t>(l)];
+    // 能量图
+    std::vector<int> energy(static_cast<size_t>(w) * h, 0);
+    std::vector<int> ehist(256, 0);
+    for (int y = 0; y + 2 < h; ++y) {
+        for (int x = 0; x + 2 < w; ++x) {
+            const int l = lum(x, y);
+            int e = std::abs(lum(x + 2, y) - l) + std::abs(lum(x, y + 2) - l);
+            if (e > 255) e = 255;
+            energy[static_cast<size_t>(y) * w + x] = e;
+            ++ehist[static_cast<size_t>(e)];
+        }
     }
-    long acc = 0;
-    int med = 0;
+    // 阈值：能量的 97 分位（"显著比周围有纹理"）
     const long total = static_cast<long>(w) * h;
+    long acc = 0;
+    int thr = 255;
     for (int v = 0; v < 256; ++v) {
-        acc += hh[static_cast<size_t>(v)];
-        if (acc * 2 >= total) { med = v; break; }
+        acc += ehist[static_cast<size_t>(v)];
+        if (acc * 100 >= total * 97) { thr = v; break; }
     }
-    const int thr = med / 2;              // "暗"= 低于全场中位数的一半
+    if (thr < 6) thr = 6;
 
-    struct Comp { int x0, y0, x1, y1; long area, sx, sy; };
+    struct Comp { int x0, y0, x1, y1; long area, sx, sy, on; };
     std::vector<Comp> comps;
     struct Run { int a, b, id; };
     std::vector<Run> prev;
@@ -277,14 +285,14 @@ inline std::vector<Marker> find_markers_dark(const uint8_t* rgb, int w, int h) {
         std::vector<Run> cur;
         int x = 0;
         while (x < w) {
-            if (lum(x, y) > thr) { ++x; continue; }
+            if (energy[static_cast<size_t>(y) * w + x] < thr) { ++x; continue; }
             const int s0 = x;
-            while (x < w && lum(x, y) <= thr) ++x;
+            while (x < w && energy[static_cast<size_t>(y) * w + x] >= thr) ++x;
             int id = -1;
             for (const Run& r : prev)
                 if (r.a <= x - 1 && r.b >= s0) { id = r.id; break; }
             if (id < 0) {
-                comps.push_back(Comp{s0, y, x - 1, y, 0, 0, 0});
+                comps.push_back(Comp{s0, y, x - 1, y, 0, 0, 0, 0});
                 id = static_cast<int>(comps.size()) - 1;
             }
             Comp& c = comps[static_cast<size_t>(id)];
@@ -292,58 +300,36 @@ inline std::vector<Marker> find_markers_dark(const uint8_t* rgb, int w, int h) {
             if (x - 1 > c.x1) c.x1 = x - 1;
             c.y1 = y;
             c.area += x - s0;
+            c.on += x - s0;
             c.sx += static_cast<long>(s0 + x - 1) * (x - s0) / 2;
             c.sy += static_cast<long>(y) * (x - s0);
             cur.push_back(Run{s0, x - 1, id});
         }
         prev = cur;
     }
+    // 尺寸窗口：标记边长 ≈ 场地宽 × 48/640；场地宽先用"亮列跨度"粗估
+    int rx0 = 0, rx1 = w - 1, ry0 = 0, ry1 = h - 1;
+    if (!field_region_bbox(rgb, w, h, &rx0, &rx1, &ry0, &ry1)) {
+        rx0 = 0; rx1 = w - 1; ry0 = 0; ry1 = h - 1;
+    }
+    const double expect = static_cast<double>(rx1 - rx0) * (48.0 / 640.0);
     std::vector<Marker> cands;
     for (const Comp& c : comps) {
         const int bw = c.x1 - c.x0 + 1, bh = c.y1 - c.y0 + 1;
-        const double side = 0.5 * (bw + bh);
-        if (side < 12.0 || side > 120.0) continue;
-        if (c.area < 0.4 * side * side) continue;          // 方块（不是细线）
+        // **两个方向都要够大**：墙边是 36x1、网格线是 5x101 这种细长条，
+        // 它们的"填补率"是 1.0，只靠 fill 过滤会全部漏过（实测就是这样）。
+        if (bw < 10 || bh < 10) continue;
         const double asp = static_cast<double>(bw > bh ? bw : bh) /
                            static_cast<double>(bw < bh ? bw : bh);
-        if (asp >= 2.0) continue;
-        // **亮环**：取 bbox 外扩 8 px 的一圈，均值要明显高于块本身
-        const int gx0 = c.x0 - 8, gx1 = c.x1 + 8, gy0 = c.y0 - 8, gy1 = c.y1 + 8;
-        long ring_sum = 0, ring_n = 0, in_sum = 0, in_n = 0;
-        for (int y = gy0; y <= gy1; ++y) {
-            if (y < 0 || y >= h) continue;
-            for (int x = gx0; x <= gx1; ++x) {
-                if (x < 0 || x >= w) continue;
-                const int l = lum(x, y);
-                const bool inside = (x >= c.x0 && x <= c.x1 && y >= c.y0 && y <= c.y1);
-                if (inside) { in_sum += l; ++in_n; }
-                // 环上只统计**亮**的部分：标记贴边时环里会混进屏幕黑边，
-                // 把"四周是亮的"这条判据的整体均值拉低，导致贴边的标记被丢掉。
-                else if (l > med / 2) { ring_sum += l; ++ring_n; }
-            }
-        }
-        if (ring_n == 0 || in_n == 0) continue;
-        const double in_mean = static_cast<double>(in_sum) / in_n;
-        const double ring_mean = static_cast<double>(ring_sum) / ring_n;
-        if (ring_mean < 1.6 * in_mean + 8.0) continue;      // 四周要明显更亮
-        // 环上"亮"的比例不能太低（否则只是块边上的一点反光）
-        {
-            long lit = 0, all = 0;
-            for (int y = gy0; y <= gy1; ++y) {
-                if (y < 0 || y >= h) continue;
-                for (int x = gx0; x <= gx1; ++x) {
-                    if (x < 0 || x >= w) continue;
-                    if (x >= c.x0 && x <= c.x1 && y >= c.y0 && y <= c.y1) continue;
-                    ++all;
-                    if (lum(x, y) > med / 2) ++lit;
-                }
-            }
-            if (all == 0 || lit * 4 < all) continue;
-        }
+        if (asp >= 2.0) continue;                     // 标记是方的
+        const double side = 0.5 * (bw + bh);
+        if (side < std::max(12.0, 0.3 * expect) || side > 3.0 * expect) continue;
+        const double fill = static_cast<double>(c.on) / (static_cast<double>(bw) * bh);
+        if (fill < 0.20) continue;                    // 内部要"铺满"纹理
         cands.push_back(Marker{static_cast<double>(c.sx) / c.area + 0.5,
                                static_cast<double>(c.sy) / c.area + 0.5, bw, bh});
     }
-    // 四象限各取一个"离该象限的场角最近"的候选
+    // 四象限各取"离该象限场角最近"的一个
     std::vector<Marker> quad(4);
     std::vector<double> best(4, 1e18);
     const double mx = 0.5 * w, my = 0.5 * h;
@@ -364,6 +350,7 @@ inline std::vector<Marker> find_markers_dark(const uint8_t* rgb, int w, int h) {
 
 inline std::vector<Marker> find_markers(const uint8_t* rgb, int w, int h) {
     std::vector<Marker> out;
+    std::vector<Marker> tex_all;
     if (!rgb || w < 32 || h < 32) return out;
     int lmax = 0;
     for (int y = 0; y < h; ++y) {
@@ -460,21 +447,58 @@ inline std::vector<Marker> find_markers(const uint8_t* rgb, int w, int h) {
         out.push_back(Marker{static_cast<double>(c.sx) / c.area + 0.5,
                              static_cast<double>(c.sy) / c.area + 0.5, bw, bh});
     }
-    // 每个象限取**离场地亮区四角最近**的候选（标记就在四角）。
-    // 用亮区包围盒而不是画面边界：画面四角附近常有屏幕边框/键盘反光。
+    // **纹理候选优先，亮块补齐**：实测纹理检测能稳定找到左上/左下/右下（标记图案
+    // 铺满整块），右上那个常和墙的高光粘在一起、纹理被稀释；而亮块检测恰好能补上它。
+    // 两边按象限合并：某象限有纹理候选就用它，否则用亮块候选。
+    {
+        tex_all = find_markers_dark(rgb, w, h);
+        std::vector<Marker>& tex = tex_all;
+        std::vector<int> taken(4, 0);
+        for (const Marker& m : tex) {
+            const int q = (m.x < 0.5 * w ? 0 : 1) + (m.y < 0.5 * h ? 0 : 2);
+            if (taken[static_cast<size_t>(q)]) continue;
+            taken[static_cast<size_t>(q)] = 1;
+            out.push_back(m);
+        }
+    }
+
+    // ---- 按象限合并两种候选：**纹理优先，亮块补齐** ---------------------
+    // 实测：纹理检测能稳定找到左上/左下/右下（标记图案铺满整块），右上那个常和墙的
+    // 高光粘在一起、纹理被稀释；亮块检测恰好能补上它。反过来只靠亮块则会选到
+    // 屏幕边框（画面四角附近有更亮的杂物）。
     int rx0 = 0, rx1 = w - 1, ry0 = 0, ry1 = h - 1;
     if (!field_region_bbox(rgb, w, h, &rx0, &rx1, &ry0, &ry1)) {
         rx0 = 0; rx1 = w - 1; ry0 = 0; ry1 = h - 1;
     }
     const double mx = 0.5 * (rx0 + rx1), my = 0.5 * (ry0 + ry1);
+    auto quadrant_of = [&](const Marker& m) {
+        return (m.x < mx ? 0 : 1) + (m.y < my ? 0 : 2);
+    };
+    auto corner_of = [&](int q) {
+        return std::pair<double, double>{
+            (q % 2 == 0) ? static_cast<double>(rx0) : static_cast<double>(rx1),
+            (q / 2 == 0) ? static_cast<double>(ry0) : static_cast<double>(ry1)};
+    };
     std::vector<Marker> quad(4);
     std::vector<double> best(4, 1e18);
+    // 第一轮：纹理候选
+    for (const Marker& m : tex_all) {
+        if (m.x < rx0 || m.x > rx1 || m.y < ry0 || m.y > ry1) continue;
+        const int q = quadrant_of(m);
+        const auto c = corner_of(q);
+        const double d = std::hypot(m.x - c.first, m.y - c.second);
+        if (d < best[static_cast<size_t>(q)]) {
+            best[static_cast<size_t>(q)] = d;
+            quad[static_cast<size_t>(q)] = m;
+        }
+    }
+    // 第二轮：亮块候选只补**还没填上**的象限
     for (const Marker& m : out) {
         if (m.x < rx0 || m.x > rx1 || m.y < ry0 || m.y > ry1) continue;
-        const int q = (m.x < mx ? 0 : 1) + (m.y < my ? 0 : 2);
-        const double cx = (q % 2 == 0) ? static_cast<double>(rx0) : static_cast<double>(rx1);
-        const double cy = (q / 2 == 0) ? static_cast<double>(ry0) : static_cast<double>(ry1);
-        const double d = std::hypot(m.x - cx, m.y - cy);
+        const int q = quadrant_of(m);
+        if (best[static_cast<size_t>(q)] < 1e17) continue;      // 已有纹理候选
+        const auto c = corner_of(q);
+        const double d = std::hypot(m.x - c.first, m.y - c.second);
         if (d < best[static_cast<size_t>(q)]) {
             best[static_cast<size_t>(q)] = d;
             quad[static_cast<size_t>(q)] = m;
