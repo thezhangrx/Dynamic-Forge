@@ -1345,7 +1345,12 @@ def cmd_play(args: argparse.Namespace) -> int:
                         env.simulate_future(0, horizon=8, include_initial=True),
                         resolution=16.0,
                     )
-                except Exception:  # pragma: no cover - overlay must never break the loop
+                except Exception as exc:  # pragma: no cover - overlay must never break the loop
+                    # 以前这里是静默吞掉：势图不显示时完全看不出原因（用户会以为"没改"）。
+                    # 现在第一次失败就报出来（只报一次，避免刷屏）。
+                    if not getattr(args, "_danger_warned", False):
+                        args._danger_warned = True
+                        print(f"⚠ 势图计算失败（--danger 不会显示）：{exc!r}", file=sys.stderr)
                     renderer.danger = None
             frame_index += 1
             if _state_log is not None:
