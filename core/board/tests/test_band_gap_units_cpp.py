@@ -71,8 +71,16 @@ def scene(*, wall_y=479.0, gap=(251.0, 327.0), player=(320.0, 240.0), field=(640
             buf[i + 1] = max(0, min(255, int(c[1] * gain + offset)))
             buf[i + 2] = max(0, min(255, int(c[2] * gain + offset)))
 
+    # 场外是**黑边**（仿真窗口里只有场地那一块被填底色），这正是 `field_extent`
+    # 用来量范围的亮度边界。之前这里把整幅图都填成场地底色，等于**没有边界**，
+    # 于是台架自己造出了一个"量不到场地"的假故障。
     for y in range(oh):
         for x in range(ow):
+            put(x, y, (0, 0, 0))
+    fx0, fy0 = to_img(0.0, 0.0)
+    fx1, fy1 = to_img(fw, fh)
+    for y in range(max(0, int(min(fy0, fy1))), min(oh, int(max(fy0, fy1)) + 1)):
+        for x in range(max(0, int(min(fx0, fx1))), min(ow, int(max(fx0, fx1)) + 1)):
             put(x, y, BG)
     # 网格（每 64 场地单位一条，冷色，不应被当成墙）
     for gx in range(0, int(fw) + 1, 64):

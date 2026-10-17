@@ -444,200 +444,108 @@ inline Extent field_extent(const uint8_t* rgb, int w, int h, double field_w = 64
                            double squash = 0.75) {
     Extent e;
     if (!rgb || w < 32 || h < 32) return e;
+    (void)k;
+    (void)min_run;
 
-    //: 取"最强的一条峰"和"离它最远的另一条强峰"。
-    //: 踩过的坑：把"最左/最右的非背景段"当边框，会拿到 0..639（画面边缘的镜头辉光）
-    //: 和整幅宽度，比例尺直接错成 1.0。边框必须是**峰**，不是"最外侧的暖色"。
-    auto pick_pair = [](const std::vector<detail::Run>& runs, int* a, int* b) {
-        if (runs.size() < 2) return false;
-        size_t best = 0;
-        for (size_t i = 1; i < runs.size(); ++i)
-            if (runs[i].peak > runs[best].peak) best = i;
-        size_t other = runs.size();
-        int best_gap = 0;
-        for (size_t i = 0; i < runs.size(); ++i) {
-            if (i == best) continue;
-            const int gap = static_cast<int>(runs[i].a) > static_cast<int>(runs[best].a)
-                                ? static_cast<int>(runs[i].a) - static_cast<int>(runs[best].a)
-                                : static_cast<int>(runs[best].a) - static_cast<int>(runs[i].a);
-            if (other == runs.size() || gap > best_gap) { other = i; best_gap = gap; }
+    // -------------------------------------------------------------------
+    // 用**亮度的边缘**量场地范围，而不是"找暖色的边框列"。
+    //
+    // 踩过的坑（由无相机台架 test_band_gap_units_cpp.py 抓出）：仿真把场地边框
+    // 画成冷色 (60,70,95)，而这里原来只找**暖色列**。于是所谓"最强的两条暖色列"
+    // 其实是墙端/反光 —— 比例尺与原点全错，门的位置偏出约 200 场地单位
+    // （宽度是差值，原点抵消，所以只有位置错、宽度看着还对，非常具有迷惑性）。
+    //
+    // 场地与场外的区别在**亮度**上（场地底色 vs 黑边），这跟配色无关：
+    // 取逐列/逐行亮度均值，找两条最强的**亮度台阶**，它们就是场地的左右/上下边。
+    // -------------------------------------------------------------------
+    auto luminance_profile = [&](bool vertical) {
+        const int n = vertical ? w : h;
+        const int m = vertical ? h : w;
+        std::vector<double> prof(static_cast<size_t>(n), 0.0);
+        for (int i = 0; i < n; ++i) {
+            double acc = 0.0;
+            for (int j = 0; j < m; ++j) {
+                const int x = vertical ? i : j;
+                const int y = vertical ? j : i;
+                const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(w) +
+                                   static_cast<size_t>(x);
+                int l = rgb[idx * 3];
+                if (rgb[idx * 3 + 1] > l) l = rgb[idx * 3 + 1];
+                if (rgb[idx * 3 + 2] > l) l = rgb[idx * 3 + 2];
+                acc += static_cast<double>(l);
+            }
+            prof[static_cast<size_t>(i)] = acc / static_cast<double>(m);
         }
-        if (other == runs.size()) return false;
-        *a = static_cast<int>(best);
-        *b = static_cast<int>(other);
+        return prof;
+    };
+    //: 两条最强台阶的位置（台阶 = 相邻列的亮度差）。
+    auto two_edges = [](const std::vector<double>& prof, int* lo, int* hi, double* step) {
+        const int n = static_cast<int>(prof.size());
+        if (n < 8) return false;
+        double best1 = -1e18, best2 = -1e18;
+        int i1 = -1, i2 = -1;
+        for (int i = 1; i < n; ++i) {
+            const double g = std::fabs(prof[static_cast<size_t>(i)] -
+                                       prof[static_cast<size_t>(i - 1)]);
+            if (g > best1) { best2 = best1; i2 = i1; best1 = g; i1 = i; }
+            else if (g > best2) { best2 = g; i2 = i; }
+        }
+        if (i1 < 0 || i2 < 0) return false;
+        const int a = i1 < i2 ? i1 : i2;
+        const int b = i1 < i2 ? i2 : i1;
+        if (b - a < n / 2) return false;          // 两条边必须横跨大半幅画面
+        *lo = a;
+        *hi = b;
+        *step = best2;
         return true;
     };
 
-    const std::vector<double> colp = detail::row_means(rgb, w, h);
-    const std::vector<detail::Run> cr = detail::runs_above_background(colp, k, min_run);
-    int ia = 0, ib = 0;
-    if (!pick_pair(cr, &ia, &ib)) return e;
-    const int cxa = (cr[static_cast<size_t>(ia)].a + cr[static_cast<size_t>(ia)].b) / 2;
-    const int cxb = (cr[static_cast<size_t>(ib)].a + cr[static_cast<size_t>(ib)].b) / 2;
-    if (std::abs(cxa - cxb) < w / 2) return e;      // 两条峰必须横跨大半幅画面
-    // **显著性**门槛：边框峰必须显著高于背景。
-    // 实测挡镜头时，`field_extent` 仍会在噪声里凑出"两条峰"（40 帧里 39 帧都报
-    // ok、场地 600 px），于是后续一切判据都在噪声上工作 —— 平台照样开。
-    // 这里用"几个稳健标准差"（统计显著性），不是像素常数。
-    {
-        std::vector<double> cd;
-        cd.reserve(colp.size());
-        for (size_t i = 0; i + 1 < colp.size(); ++i) cd.push_back(colp[i + 1] - colp[i]);
-        const double med = detail::median(cd);
-        double sd = detail::mad(cd, med) * detail::kMadToSigma;
-        if (sd < 0.5) sd = 0.5;
-        const double pa = colp[static_cast<size_t>(cxa)] - med;
-        const double pb = colp[static_cast<size_t>(cxb)] - med;
-        const double amin = pa < pb ? pa : pb;
-        if (amin / sd < 8.0) return e;      // 8σ 显著性（与 5σ 检测同一把尺）
-    }
-    e.x0 = cxa < cxb ? cxa : cxb;
-    e.x1 = cxa < cxb ? cxb : cxa;
-
-    const std::vector<double> rowp = detail::col_means(rgb, w, h);
-    const std::vector<detail::Run> rr = detail::runs_above_background(rowp, k, min_run);
-    int ja = 0, jb = 0;
-    if (pick_pair(rr, &ja, &jb)) {
-        e.y0 = rr[static_cast<size_t>(ja)].a < rr[static_cast<size_t>(jb)].a
-                   ? rr[static_cast<size_t>(ja)].a : rr[static_cast<size_t>(jb)].a;
-        e.y1 = rr[static_cast<size_t>(ja)].a < rr[static_cast<size_t>(jb)].a
-                   ? rr[static_cast<size_t>(jb)].b : rr[static_cast<size_t>(ja)].b;
-    } else {
-        e.y0 = 0;
-        e.y1 = h - 1;
-    }
-
+    const std::vector<double> colL = luminance_profile(true);
+    int xa = 0, xb = 0;
+    double step_x = 0.0;
+    if (!two_edges(colL, &xa, &xb, &step_x)) return e;
+    e.x0 = xa;
+    e.x1 = xb;
     e.width_px = static_cast<double>(e.x1 - e.x0 + 1);
     if (e.width_px < 32.0) return e;
     e.scale_x = field_w / e.width_px;
+
     if (squash <= 0.0) squash = 1.0;
     e.scale_y = e.scale_x / squash;
-    // 场地在画面里的纵向位置：按"居中"推，而不是相信那条被截断的下边框
-    const double field_h_px = field_h / e.scale_y;
-    e.y0 = static_cast<int>(std::lround(0.5 * (static_cast<double>(h) - field_h_px)));
-    e.y1 = static_cast<int>(std::lround(0.5 * (static_cast<double>(h) + field_h_px))) - 1;
+
+    // 纵向：优先用**亮度的行边缘**（上下边框）；量不到就按"居中等高"推。
+    // 为什么不再相信"量出来的下边框"：它常常落在画面之外（被裁掉），
+    // 于是 y 会整体偏 100 多场地单位。亮度边缘只在两侧都清楚时才算数。
+    const std::vector<double> rowL = luminance_profile(false);
+    int ya = 0, yb = 0;
+    double step_y = 0.0;
+    if (two_edges(rowL, &ya, &yb, &step_y) && step_y > 0.25 * step_x) {
+        e.y0 = ya;
+        e.y1 = yb;
+        e.scale_y = field_h / static_cast<double>(e.y1 - e.y0 + 1);
+    } else {
+        const double field_h_px = field_h / e.scale_y;
+        e.y0 = static_cast<int>(std::lround(0.5 * (static_cast<double>(h) - field_h_px)));
+        e.y1 = static_cast<int>(std::lround(0.5 * (static_cast<double>(h) + field_h_px))) - 1;
+    }
     if (e.y0 < 0) e.y0 = 0;
     if (e.y1 >= h) e.y1 = h - 1;
     e.height_px = static_cast<double>(e.y1 - e.y0 + 1);
+
+    // 显著性：两条边的台阶要明显高于"列剖面自身的抖动"（噪声挡镜头过不了）
+    {
+        std::vector<double> dif;
+        dif.reserve(colL.size());
+        for (size_t i = 1; i < colL.size(); ++i) dif.push_back(colL[i] - colL[i - 1]);
+        const double med = detail::median(dif);
+        double sd = detail::mad(dif, med) * detail::kMadToSigma;
+        if (sd < 0.5) sd = 0.5;
+        if (step_x / sd < 6.0) return e;
+    }
+
     e.anisotropy = e.scale_x > 0.0 ? e.scale_x / e.scale_y : 1.0;
     e.ok = true;
     return e;
-}
-
-
-// ===========================================================================
-// 角色：**最亮的圆**（PS 侧，RTL 不动）
-// ===========================================================================
-// 为什么不能只靠 RTL 的玩家检测：它按"亮 + 低饱和"分类，而真机位把橙墙拍成了
-// **淡粉白**（饱和也很低），于是墙和角色被同一类接走 —— 角色要么被墙吞掉、
-// 要么因为合并后的面积超过 `player_max_area` 被丢掉。实测板上 28/40 帧"无角色"，
-// 而板子的规矩是"没角色就 stay"，于是平台永远不动。
-//
-// 这里的判据只用到两个**契约事实**：场景里只有角色是**圆的**，而且它是**最亮**的东西。
-//   1. 阈值取 `t_l + 0.75*(Lmax - t_l)`（t_l 是场地边框量出的背景/亮物分界，
-//      Lmax 是本帧最亮像素）—— 相对量，不含"这台相机"的常数；
-//   2. 连通域按 4 邻域扫两遍（并查集就够），保留 fill ∈ [0.4, 0.95]、aspect < 2、
-//      面积 ∈ [16, 4000] 的那几个，取**最亮**的一个的质心。
-struct Player {
-    bool found = false;
-    double x = 0.0, y = 0.0;   // 图像坐标（质心）
-    int w = 0, h = 0;          // 外接框
-    double fill = 0.0;
-};
-
-/// `t_l` 传 0 就表示"阈值只相对本帧最亮像素"（`0.75·Lmax`）：曝光/白平衡是整幅图
-/// 一起变，`Lmax` 也跟着变，所以这条阈值天然跨曝光；真正区分角色与墙的是**形状**
-/// （`aspect < 2`：墙是长条，角色是圆）。
-//: `min_px`/`max_px`：外接框长边的允许范围（像素）。
-//: 调用方用**场地比例尺 + 契约半径**算出来传进来 —— 这样 `r=32` 那种"抓到大块
-//: 方形亮物（墙角/角标）"的帧会被直接丢掉，而不是被当成角色去发指令。
-inline Player find_player(const uint8_t* rgb, int w, int h, int t_l = 0,
-                          int min_px = 0, int max_px = 0) {
-    Player out;
-    if (!rgb || w < 16 || h < 16) return out;
-    int lmax = 0;
-    for (int y = 0; y < h; ++y) {
-        const size_t base = static_cast<size_t>(y) * static_cast<size_t>(w);
-        for (int x = 0; x < w; ++x) {
-            const size_t i = base + static_cast<size_t>(x);
-            int l = rgb[i * 3];
-            if (rgb[i * 3 + 1] > l) l = rgb[i * 3 + 1];
-            if (rgb[i * 3 + 2] > l) l = rgb[i * 3 + 2];
-            if (l > lmax) lmax = l;
-        }
-    }
-    const int thr = t_l + static_cast<int>(0.75 * static_cast<double>(lmax - t_l));
-    if (lmax - t_l < 24 || thr <= 0) return out;   // 整帧没有"更亮的东西"
-
-    // 连通域：逐行游程 + 与上一行重叠合并（和 Python 的 scanline_blobs 同一套）
-    struct Comp { int x0, y0, x1, y1; long area; long sum_x; long sum_y; int peak; };
-    std::vector<Comp> comps;
-    struct Run { int x0, x1, comp; };
-    std::vector<Run> prev;
-    for (int y = 0; y < h; ++y) {
-        const size_t base = static_cast<size_t>(y) * static_cast<size_t>(w);
-        std::vector<Run> cur;
-        int x = 0;
-        while (x < w) {
-            int l = rgb[(base + static_cast<size_t>(x)) * 3];
-            if (rgb[(base + static_cast<size_t>(x)) * 3 + 1] > l) l = rgb[(base + static_cast<size_t>(x)) * 3 + 1];
-            if (rgb[(base + static_cast<size_t>(x)) * 3 + 2] > l) l = rgb[(base + static_cast<size_t>(x)) * 3 + 2];
-            if (l <= thr) { ++x; continue; }
-            const int s = x;
-            int peak = l;
-            while (x < w) {
-                const size_t i = base + static_cast<size_t>(x);
-                int v = rgb[i * 3];
-                if (rgb[i * 3 + 1] > v) v = rgb[i * 3 + 1];
-                if (rgb[i * 3 + 2] > v) v = rgb[i * 3 + 2];
-                if (v <= thr) break;
-                if (v > peak) peak = v;
-                ++x;
-            }
-            int id = -1;
-            for (const Run& r : prev) {
-                if (r.x0 <= x - 1 && r.x1 >= s) { id = r.comp; break; }
-            }
-            if (id < 0) {
-                comps.push_back(Comp{s, y, x - 1, y, 0, 0, 0, peak});
-                id = static_cast<int>(comps.size()) - 1;
-            }
-            Comp& c = comps[static_cast<size_t>(id)];
-            if (s < c.x0) c.x0 = s;
-            if (x - 1 > c.x1) c.x1 = x - 1;
-            c.y1 = y;
-            c.area += x - s;
-            c.sum_x += static_cast<long>(s + x - 1) * (x - s) / 2;
-            c.sum_y += static_cast<long>(y) * (x - s);
-            if (peak > c.peak) c.peak = peak;
-            cur.push_back(Run{s, x - 1, id});
-        }
-        prev = cur;
-    }
-
-    double best_peak = -1.0;
-    for (const Comp& c : comps) {
-        const int bw = c.x1 - c.x0 + 1;
-        const int bh = c.y1 - c.y0 + 1;
-        if (c.area < 16 || c.area > 4000) continue;
-        const int longest = bw > bh ? bw : bh;
-        if (min_px > 0 && longest < min_px) continue;
-        if (max_px > 0 && longest > max_px) continue;
-        const double fill = static_cast<double>(c.area) / (static_cast<double>(bw) * bh);
-        const double aspect = static_cast<double>(bw > bh ? bw : bh) /
-                              static_cast<double>(bw < bh ? bw : bh);
-        if (fill < 0.40 || fill > 0.98 || aspect >= 2.0) continue;
-        if (c.peak > best_peak) {
-            best_peak = static_cast<double>(c.peak);
-            out.found = true;
-            out.x = static_cast<double>(c.sum_x) / static_cast<double>(c.area) + 0.5;
-            out.y = static_cast<double>(c.sum_y) / static_cast<double>(c.area) + 0.5;
-            out.w = bw;
-            out.h = bh;
-            out.fill = fill;
-        }
-    }
-    return out;
 }
 
 }  // namespace band_gap
