@@ -35,10 +35,20 @@ int main() {
     while (std::fgets(line, sizeof(line), stdin)) {
         double px = 0, py = 0, pr = 10;
         int n = 0;
-        if (std::sscanf(line, "@GT %lf %lf %lf %d", &px, &py, &pr, &n) != 4) continue;
+        // 状态包协议：`@STATE <ver> <px> <py> <pr> <n> ...`（仿真侧的实时状态输出），
+        // 旧测试用的 `@GT` 仍然接受 —— 两者内容相同，只是版本号字段。
+        int ver = 0;
+        if (std::sscanf(line, "@STATE %d %lf %lf %lf %d", &ver, &px, &py, &pr, &n) == 5) {
+            /* ok */
+        } else if (std::sscanf(line, "@GT %lf %lf %lf %d", &px, &py, &pr, &n) == 4) {
+            /* ok（兼容旧格式）*/
+        } else {
+            continue;
+        }
         std::vector<gap_avoid::Rect> rects;
         const char* p = std::strchr(line, ' ');
-        for (int k = 0; k < 4; ++k) {           // 跳过 @GT px py pr n
+        const int skip = (std::strncmp(line, "@STATE", 6) == 0) ? 5 : 4;
+        for (int k = 0; k < skip; ++k) {
             if (!p) break;
             p = std::strchr(p + 1, ' ');
         }

@@ -206,6 +206,13 @@ def _add_play_args(p: argparse.ArgumentParser, *, input_default: str = "manual")
                    help="recompute the danger field every N rendered frames")
     p.add_argument("--horizon", type=int, default=90)
     p.add_argument(
+        "--state-pipe",
+        default=None,
+        metavar="FILE",
+        help="**实时状态包输出**：每帧一行 `@STATE`（场地单位），供外部决策端消费。"
+             "与 --state-log（JSON 日志）不同：这是控制回路用的紧凑协议，逐行 flush",
+    )
+    p.add_argument(
         "--state-log",
         default=None,
         metavar="FILE",
@@ -1176,6 +1183,9 @@ def cmd_play(args: argparse.Namespace) -> int:
     _state_log = None
     if getattr(args, "state_log", None):
         _state_log = open(args.state_log, "w", encoding="utf-8")
+    _state_pipe = None
+    if getattr(args, "state_pipe", None):
+        _state_pipe = open(args.state_pipe, "w", encoding="utf-8")
 
     mode = "manual" if args.interactive else args.input
     switchable = not args.no_switch
@@ -1357,6 +1367,30 @@ def cmd_play(args: argparse.Namespace) -> int:
                         print(f"⚠ 势图计算失败（--danger 不会显示）：{exc!r}", file=sys.stderr)
                     renderer.danger = None
             frame_index += 1
+            if _state_pipe is not None:
+                _pl = env.world.player
+                _obs = []
+                _pool = getattr(getattr(env.world, "state", None), "bullets", None)
+                if _pool is not None:
+                    try:
+                        _n = int(getattr(_pool, "count", len(_pool.alive)))
+                    except Exception:
+                        _n = 0
+                    for _i in range(min(_n, int(getattr(_pool, "capacity", _n)))):
+                        try:
+                            if not bool(_pool.alive[_i]):
+                                continue
+                            _x = float(_pool.x[_i]); _y = float(_pool.y[_i])
+                            _hw = float(_pool.half_w[_i]); _hh = float(_pool.half_h[_i])
+                            if _hw <= _hh:          # 只报矩形（墙）；圆另计
+                                continue
+                            _obs.append(f"{_x:.1f} {_y:.1f} {_hw:.1f} {_hh:.1f} 0.0")
+                        except Exception:
+                            continue
+                _state_pipe.write(
+                    f"@STATE 0 {float(_pl[0]):.1f} {float(_pl[1]):.1f} {float(_pl[4]):.1f} "
+                    f"{len(_obs)} " + (" ".join(_obs) if _obs else "") + "\n")
+                _state_pipe.flush()
             if _state_log is not None:
                 # 真值：角色 + 所有障碍（矩形带 half_w/half_h/rotation，圆带半径）
                 _pl = env.world.player

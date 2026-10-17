@@ -92,6 +92,9 @@ def gt_line(obj: dict) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--packets", default=None,
+                    help="**实时状态包**文件（仿真 --state-pipe 的输出）："
+                         "读 `@STATE ...` 行并原样转发给决策端（本地或板子）")
     ap.add_argument("--state", default="/tmp/gt.jsonl")
     ap.add_argument("--out", default="/tmp/mv.txt")
     ap.add_argument("--decide", default="/tmp/gt_decide")
@@ -99,6 +102,8 @@ def main(argv=None) -> int:
                     help="给了就在**板子上**跑决策（真·板子决策）："
                          "ssh -i KEY root@192.168.137.242 /root/tools/gt_decide_board")
     ap.add_argument("--ssh-host", default="root@192.168.137.242")
+    ap.add_argument("--record-local", default=None,
+                    help="同时把**本地决策**也跑一遍并记录到该文件（用于和板子对比）")
     ap.add_argument("--max-seconds", type=float, default=120.0)
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--quiet", action="store_true")
@@ -120,9 +125,19 @@ def main(argv=None) -> int:
         print(f"决策在板子上跑：{args.ssh_host}:/root/tools/gt_decide_board", flush=True)
     else:
         cmd = [args.decide]
+    local_proc = None
+    local_fh = None
+    if args.record_local:
+        # 同一份状态包，**同一时刻**也喂给本地决策端：两边吃的是同一个包流，
+        # 输出逐帧记下来才能对比"板子 vs 本地"是否真的一致（以及延迟差多少）。
+        local_proc = subprocess.Popen([args.decide], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, text=True, bufsize=1)
+        local_fh = open(args.record_local, "w", encoding="utf-8")
     decide = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, text=True, bufsize=1)
-    state_path, out_path = Path(args.state), Path(args.out)
+    packet_mode = args.packets is not None
+    state_path = Path(args.packets) if packet_mode else Path(args.state)
+    out_path = Path(args.out)
     state_path.touch(exist_ok=True)
     out_path.touch(exist_ok=True)
     # ⚠ 增量读：以前每轮都 `read_text()` 把整个状态日志读一遍，日志越长越慢 ——
@@ -155,11 +170,25 @@ def main(argv=None) -> int:
             continue
         *complete, pending = pending.split(b"\n")
         for line in complete:
-            try:
-                obj = json.loads(line.decode("utf-8", "replace"))
-            except Exception:
-                continue
-            decide.stdin.write(gt_line(obj) + "\n")
+            if packet_mode:
+                text = line.decode("utf-8", "replace").strip()
+                if not text.startswith("@STATE"):
+                    continue
+                pkt = text
+            else:
+                try:
+                    obj = json.loads(line.decode("utf-8", "replace"))
+                except Exception:
+                    continue
+                pkt = gt_line(obj)
+            if local_proc is not None:
+                local_proc.stdin.write(pkt + "\n")
+                local_proc.stdin.flush()
+                loc = local_proc.stdout.readline().strip()
+                if loc:
+                    local_fh.write(loc + "\n")
+                    local_fh.flush()
+            decide.stdin.write(pkt + "\n")
             decide.stdin.flush()
             dec = decide.stdout.readline().strip()
             if not dec:
@@ -174,6 +203,8 @@ def main(argv=None) -> int:
             act = action_from_cmd(vx, vy)
             with out_path.open("a", encoding="utf-8") as fh:
                 tgt = None
+                if not packet_mode:
+                    tgt = None
                 for tok in dec.split():
                     if tok.startswith("aim=("):
                         try:
@@ -182,6 +213,8 @@ def main(argv=None) -> int:
                                 tgt = (ax, ay)
                         except Exception:
                             tgt = None
+                if not packet_mode:
+                    tgt = None
                 if tgt is not None:
                     fh.write(f"@TGT {tgt[0]:.1f} {tgt[1]:.1f}\n")
                 fh.write(f"@DBG {dec} | 动作 {act}\n")
