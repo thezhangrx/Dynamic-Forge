@@ -490,6 +490,48 @@ inline Extent field_extent(const uint8_t* rgb, int w, int h, double field_w = 64
         const double pb = colp[static_cast<size_t>(cxb)] - med;
         const double amin = pa < pb ? pa : pb;
         if (amin / sd < 8.0) return e;      // 8σ 显著性（与 5σ 检测同一把尺）
+        // **一致性**（这一条才是挡镜头时真正起作用的）：
+        // 真实边框是"整条竖线"，所以它的暖色在**几乎所有行**上都成立；
+        // 噪声列只是随机起伏，在行方向上没有一致的符号。
+        // 做法：算出全场 d 的稳健中位数/σ，再数这一列有多少行的 d 超过 med+2σ。
+        // 门槛 0.5 是"过半"——和"边框是竖线"这个几何事实等价，不是相机常数。
+        std::vector<int> hd(511, 0);
+        for (int y = 0; y < h; ++y) {
+            const size_t base = static_cast<size_t>(y) * static_cast<size_t>(w);
+            for (int x = 0; x < w; ++x) {
+                const size_t i = base + static_cast<size_t>(x);
+                int dv = static_cast<int>(rgb[i * 3]) - static_cast<int>(rgb[i * 3 + 2]);
+                if (dv < -255) dv = -255;
+                if (dv > 255) dv = 255;
+                ++hd[static_cast<size_t>(dv + 255)];
+            }
+        }
+        auto q = [](const std::vector<int>& hh, long total, double f) {
+            const double want = f * static_cast<double>(total);
+            long acc = 0;
+            for (size_t i = 0; i < hh.size(); ++i) {
+                acc += hh[i];
+                if (static_cast<double>(acc) >= want) return static_cast<int>(i);
+            }
+            return static_cast<int>(hh.size()) - 1;
+        };
+        const long total = static_cast<long>(w) * static_cast<long>(h);
+        const int med_d = q(hd, total, 0.5) - 255;
+        const int mad_d = q(hd, total, 0.75) - (med_d + 255);
+        int sd_d = static_cast<int>(1.4826 * static_cast<double>(mad_d));
+        if (sd_d < 1) sd_d = 1;
+        const int thr_d = med_d + 2 * sd_d;
+        for (int xc : {cxa, cxb}) {
+            if (xc < 0 || xc >= w) return e;
+            int warm_rows = 0;
+            for (int y = 0; y < h; ++y) {
+                const size_t i = static_cast<size_t>(y) * static_cast<size_t>(w) +
+                                 static_cast<size_t>(xc);
+                if (static_cast<int>(rgb[i * 3]) - static_cast<int>(rgb[i * 3 + 2]) > thr_d)
+                    ++warm_rows;
+            }
+            if (warm_rows * 2 < h) return e;   // 这条"边"在行方向不一致 → 不是边框
+        }
     }
     e.x0 = cxa < cxb ? cxa : cxb;
     e.x1 = cxa < cxb ? cxb : cxa;

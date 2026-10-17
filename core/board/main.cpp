@@ -404,6 +404,8 @@ struct DecisionState {
     uint64_t last_geom_ns = 0;
     //: 用结构判据重建几何的帧数（--structural-gap）
     int n_structural = 0;
+    //: 看不到场地（边框显著性不足）的帧数；这些帧一律 stay（见 decide 顶部）
+    int n_no_field_frames = 0;
     //: 门的时序平滑器（见 DoorSmoother 的注释）
     DoorSmoother door_sm;
     //: **目标墙锁定**：一旦选中某条墙带，就盯住它直到角色穿过它。
@@ -689,6 +691,16 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
     // 视觉给的是像素，而 `gap_avoid` 的 `player_speed / edge_margin / player_radius`
     // 是场地单位（640x480）。比例尺从**场地边框在画面里的宽度**来（`field_extent`），
     // 不是假设 1:1 —— 实测场地只占 564~570 px，比例尺 1.12~1.14。
+    // **看不到场地就一律 stay**：`field_extent` 的边框峰要 ≥8σ 显著，
+    // 挡镜头/相机没对准时过不了这一关。这时任何几何（包括 RTL 的矩形）都不可信 ——
+    // 实测挡镜头时 RTL 仍会吐噪声矩形，于是平台继续开（40/40 帧 @MOVE 1）。
+    // 这条是硬规矩，不因为"也许能看见一点"而放宽。
+    if (args.structural_gap && ext && !ext->ok) {
+        ++st.n_no_field_frames;
+        st.last_geom_ns = 0;          // 连"沿用上一条指令"也不许
+        st.door_locked = false;
+        return gap_avoid::Vec2{0.0, 0.0};
+    }
     const bool use_struct = args.structural_gap && ext && ext->ok;
     const double s_scale = use_struct ? ext->scale_x : 1.0;
     const double s_scale_y = use_struct ? ext->scale_y : 1.0;
@@ -1475,6 +1487,10 @@ int main(int argc, char** argv) {
                 std::printf("  ⚠ 一大半帧看不到场地 —— 这一轮**不能**用来判判据好坏"
                             "（先确认仿真窗口全屏在最前、相机对着它）\n");
             }
+        }
+        if (st.n_no_field_frames > 0) {
+            std::printf("其中 %d 帧**看不到场地**（边框显著性不足）→ 一律 stay\n",
+                        st.n_no_field_frames);
         }
         if (st.n_structural > 0) {
             std::printf("其中 %d 帧用**结构判据**重建几何（门 → 左右两段墙，场地单位）\n",
