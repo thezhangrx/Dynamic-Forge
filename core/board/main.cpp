@@ -391,6 +391,16 @@ struct DecisionState {
     int n_structural = 0;
     //: 门的时序平滑器（见 DoorSmoother 的注释）
     DoorSmoother door_sm;
+    //: 构造时把"前后可控"打开（见构造函数）。
+    DecisionState() {
+        // ⚠ **这是本轮最关键的一行**：`AlgoConfig::front_back` 默认 false，
+        //   而 false 时 `gap_avoid` 把**法向（前进）分量置 0**，只输出切向分量 ——
+        //   于是指令永远是 (±1, 0)：贴着墙左右滑，永远不穿缺口，最后撞墙/撞角。
+        //   真机闭环 13~14 次碰撞、指令无竖直分量，根因就是这里。
+        //   平台的 9 个离散动作里有 N/S（前后），所以"前后可控"对它成立；
+        //   这是**平台能力**，不是调参。
+        cfg.front_back = true;
+    }
     int tier_count[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // 见 tier_bucket()
 };
 
