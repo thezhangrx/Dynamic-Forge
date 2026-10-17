@@ -24,6 +24,9 @@
 #include <vector>
 
 int main() {
+    // 行缓冲：这个工具是**管道里的一环**，不 flush 的话下游 readline 会一直等
+    // （踩过：stdout 是管道时是块缓冲，中继读不到任何决策，看起来像死循环）
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     gap_avoid::AlgoConfig cfg;
     cfg.front_back = true;          // 平台 9 个动作里有前后
     gap_avoid::GapMemory mem;
