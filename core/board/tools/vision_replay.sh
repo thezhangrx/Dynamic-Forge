@@ -31,10 +31,17 @@ if [ "${SKIP_RECORD:-0}" != "1" ]; then
   rm -rf /tmp/vp; R 'rm -rf /tmp/vp && mkdir -p /tmp/vp'
   rm -f /tmp/mv.txt "$OUT/state.jsonl"; touch /tmp/mv.txt
   (setsid sh -c "tail -f /tmp/mv.txt | $PY -u -m bullet_sim play --input auto --obstacle-type wall_with_gap --stage-seconds 0 --fullscreen --duration $((SECS + 25)) --state-log $OUT/state.jsonl" > "$OUT/sim.log" 2>&1 &)
-  sleep 4
+  sleep 8
+
+  # **相机控制要和 cam_live 一致**：之前我自己用裸 ffmpeg 采集，没设 gain/brightness，
+  # 相机用自动增益 → 彩噪 17~19（干净基准 2.0）。cam_live 一直设 gain=4+brightness=70，
+  # 这条链路实测标记 100% 能找到。教训：采集参数不同，测出来的"相机坏了"就是假的。
+  R 'v4l2-ctl -d /dev/video0 -c exposure_auto=3 -c white_balance_temperature_auto=1 -c gain=4 -c brightness=70 -c saturation=100 -c contrast=32 -c gamma=120 -c backlight_compensation=0' >/dev/null 2>&1
 
   # ---- 录制前自检：拍一帧，看板子能不能认出场地 ----
-  R 'ffmpeg -hide_banner -loglevel error -f v4l2 -input_format mjpeg -video_size 640x480 -i /dev/video0 -frames:v 1 -vf "scale=640:360" -y /tmp/pre.ppm'
+  # 取**多帧、留最后一帧**：第 1 帧常常是相机旧缓冲（实测前两帧完全相同），
+  # 单帧自检会误判"没有场地"。
+  R 'ffmpeg -hide_banner -loglevel error -f v4l2 -input_format mjpeg -video_size 640x480 -i /dev/video0 -frames:v 12 -vf "scale=640:360" -y /tmp/pre_%02d.ppm; cp /tmp/pre_12.ppm /tmp/pre.ppm'
   R '/root/board_src/build/vision_board_devmem --ppm /tmp/pre.ppm --frames 1 --structural-gap --verbose 2>&1' > "$OUT/precheck.log" 2>&1
   # 自检条件：**必须凑齐四角标记**（单应才对；只量到场地/门但没标记时，
   # 识别坐标会飞出去 —— 上一轮就是因为这个把 (804,764) 这种坐标当成了角色）

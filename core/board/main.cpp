@@ -20,6 +20,7 @@
 // ===========================================================================
 #include "auto_params.hpp"
 #include "band_gap.hpp"
+#include "denoise.hpp"
 #include "rectify.hpp"
 #include "fiducial_zone.hpp"
 #include "segment_merge.hpp"
@@ -166,6 +167,9 @@ struct Args {
     //: 画面纵向压缩比（`cam_live.sh` 用 scale=640:360 把 4:3 压成 16:9 → 0.75；
     //: 用 CAM_CROP=1 时是 1.0）。纵向换算**靠它推**，不靠被截断的下边框。
     double image_squash = 0.75;
+    //: 推像素前的方框滤波半径（0=关）。真机位相机彩噪很强（噪声度量 17~19，
+    //: 干净基准 2.0），去噪前标记只能找到 3 个，r=1 后 4 个全对（实测）。
+    int denoise_radius = 0;
     //: 契约里的角色半径（场地单位）。用作**尺寸先验**：结构判据抓到的角色，
     //: 其外接框必须在"契约半径 × 比例尺"附近；抓到大块方形亮物（墙角/角标）
     //: 必须丢掉，否则会照着错的位置发指令（实测出现过 r=32.4，契约是 10）。
@@ -217,6 +221,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--skip-frames")  a.skip_frames = std::atoi(next());
         else if (k == "--structural-gap") a.structural_gap = true;
         else if (k == "--image-squash") a.image_squash = std::atof(next());
+        else if (k == "--denoise") a.denoise_radius = std::atoi(next());
         else if (k == "--player-radius") a.player_radius = std::atof(next());
         else if (k == "--auto-thresholds")    a.auto_thresholds = true;
         else if (k == "--no-auto-thresholds") a.auto_thresholds = false;
@@ -1324,6 +1329,9 @@ int main(int argc, char** argv) {
     long n_timed = 0;
     long n_auto_frames = 0;
     long n_struct_seen = 0;
+    //: 判据 ②/③ 的统计：结构判据帧数、标记=4 的帧数（用于验收，不是调试输出）
+    long n_struct_all = 0;
+    long n_marker4 = 0;
     long n_model_frames = 0;   // 靠世界模型外推给出几何的帧数
     //: 场地不可见的帧数（`field_extent` 失败 = 相机没看到场地边框）。
     //: 闭环测试里这个数就是"这一轮算不算数"的判据：窗口被盖住时它会一路涨，
@@ -1365,6 +1373,11 @@ int main(int argc, char** argv) {
                     i, pw, ph, kPlWidth, kPlHeight);
                 ++bad; break;
             }
+        }
+
+        // ---- 去噪：推像素前做，PL 与结构判据都吃同一份干净缓冲 ---------------
+        if (args.denoise_radius > 0 && !rgb.empty() && pw > 0 && ph > 0) {
+            denoise::box_blur_rgb(rgb, pw, ph, args.denoise_radius);
         }
 
         // ---- 结构判据：**必须在推像素之前**算 -----------------------------
@@ -1414,6 +1427,8 @@ int main(int argc, char** argv) {
                 const std::vector<rectify::Marker> ms =
                     mcache.update(rgb.data(), pw, ph, args.field_w, args.field_h);
                 sg_marker_count = ms.size();
+                ++n_struct_all;
+                if (ms.size() == 4) ++n_marker4;
                 // 不管找到几个标记，都先把"候选角色贴着标记"的情况排掉
                 // （标记只露出 2~3 个时也需要这条；否则会拿角标当角色）
                 if (sg_player.found && !ms.empty()) {
@@ -1775,6 +1790,11 @@ int main(int argc, char** argv) {
         }
         if (st.n_clamped > 0) {
             std::printf("其中 %d 帧角色被**夹回场地内**（换算把它算到了场外）\n", st.n_clamped);
+        }
+        if (n_struct_all > 0) {
+            std::printf("标记=4 的帧：%ld / %ld = %.0f%%\n",
+                        n_marker4, n_struct_all,
+                        n_struct_all ? 100.0 * n_marker4 / n_struct_all : 0.0);
         }
         if (st.n_no_field_frames > 0) {
             std::printf("其中 %d 帧**看不到场地**（边框显著性不足）→ 一律 stay\n",
