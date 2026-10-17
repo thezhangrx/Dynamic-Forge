@@ -1396,6 +1396,10 @@ def cmd_play(args: argparse.Namespace) -> int:
                     "board_actions": _na,
                     "t": steps_done * float(env.spec.dt) if hasattr(env, "spec") else steps_done,
                     "player": [float(_pl[0]), float(_pl[1]), float(_pl[4])],
+                    # 仿真**实际执行**的动作（离散码）——用来区分"指令没到"和
+                    # "指令到了但没执行"，这是判断延迟/断流的关键字段
+                    "applied": int(getattr(last_action, "code", -1))
+                    if hasattr(last_action, "code") else -1,
                     "obstacles": _obs,
                 }) + "\n")
                 _state_log.flush()
