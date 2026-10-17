@@ -52,6 +52,9 @@ def main(argv=None) -> int:
     ap.add_argument("state")
     ap.add_argument("board")
     ap.add_argument("--rows", type=int, default=24)
+    ap.add_argument("--time-scale", type=float, default=0.0,
+                    help="按帧号配对时的倍率：真值帧号 = round(回放帧号 × 倍率)。"
+                         "视频 30fps / 仿真 60Hz 时给 2.0（离线回放用）")
     args = ap.parse_args(argv)
     truth = truth_frames(Path(args.state))
     text = Path(args.board).read_text(encoding="utf-8", errors="replace")
@@ -60,7 +63,7 @@ def main(argv=None) -> int:
     if not truth or not inj:
         print(f"数据不足：真值 {len(truth)} 帧，注入 {len(inj)} 条")
         return 1
-    cand = [t for t in truth if t["ba"] >= 0]
+    cand = [t for t in truth if t["ba"] >= 0] or truth
 
     def nearest(seq: int):
         # 板子的几何帧号与"仿真已收到的行数"不是严格相等（差一两帧），取最近的
@@ -70,9 +73,15 @@ def main(argv=None) -> int:
     rows = 0
     for r in inj:
         seq = int(r["seq"])
-        t = nearest(seq)
-        if t is None or abs(t["ba"] - seq) > 4:
-            continue
+        if args.time_scale > 0.0:
+            idx = int(round(seq * args.time_scale))
+            if not (0 <= idx < len(truth)):
+                continue
+            t = truth[idx]
+        else:
+            t = nearest(seq)
+            if t is None or abs(t["ba"] - seq) > 4:
+                continue
         px, py = float(r["px"]), float(r["py"])
         dpx, dpy = px - t["player"][0], py - t["player"][1]
         if t["gaps"]:

@@ -29,7 +29,9 @@ mkdir -p "$OUT"
 R() { ssh -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 "$HOST" "$@"; }
 
 echo "[1/3] 平台上跑起来 + 板子录 ${SECS}s ..."
-if [ "${REUSE:-0}" = "1" ] && R 'test -f /tmp/vis_video.mkv' 2>/dev/null; then
+if [ "${SKIP_RECORD:-0}" = "1" ] && [ -f "$OUT/state.jsonl" ]; then
+    echo "    跳过录制与真值（SKIP_RECORD=1，复用已有视频+真值）"
+elif [ "${REUSE:-0}" = "1" ] && R 'test -f /tmp/vis_video.mkv' 2>/dev/null; then
     echo "    复用板子上已有视频（REUSE=1）"
 else
 bash core/board/tools/kill_sim.sh >/dev/null 2>&1
