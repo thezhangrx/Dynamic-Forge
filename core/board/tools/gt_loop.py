@@ -146,7 +146,15 @@ def main(argv=None) -> int:
                         vx = vy = 0.0
             act = action_from_cmd(vx, vy)
             with out_path.open("a", encoding="utf-8") as fh:
-                tgt = target_point(obj)
+                tgt = None
+                for tok in dec.split():
+                    if tok.startswith("aim=("):
+                        try:
+                            ax, ay = (float(v) for v in tok[5:-1].split(","))
+                            if ax == ax and ay == ay:      # 不是 NaN
+                                tgt = (ax, ay)
+                        except Exception:
+                            tgt = None
                 if tgt is not None:
                     fh.write(f"@TGT {tgt[0]:.1f} {tgt[1]:.1f}\n")
                 fh.write(f"@DBG {dec} | 动作 {act}\n")

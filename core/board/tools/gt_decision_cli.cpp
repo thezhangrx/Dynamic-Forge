@@ -65,8 +65,12 @@ int main() {
         w.field_h = 480.0;
         const gap_avoid::Decision d = gap_avoid::plan(w, mem, cfg, 2.0);
         const gap_avoid::Vec2 c = gap_avoid::to_command(d);
-        std::printf("frame %4d tier=%-7s cmd=(%+.2f,%+.2f) gap=%+.1f rects=%zu\n",
-                    frame, d.tier, c.x, c.y, d.gap, rects.size());
+        // `aim_world` 是**决策自己选定的瞄准点**（墙上的缺口方向），
+        // 显示端必须用它，而不是另算一个"最近的缺口" —— 后者会跟真缺口脱节。
+        std::printf("frame %4d tier=%-7s cmd=(%+.2f,%+.2f) gap=%+.1f rects=%zu "
+                    "aim=(%.1f,%.1f) band=%.1f\n",
+                    frame, d.tier, c.x, c.y, d.gap, rects.size(),
+                    d.aim_world.x, d.aim_world.y, d.wall_band);
         ++frame;
     }
     return 0;

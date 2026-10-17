@@ -487,6 +487,8 @@ class PygameRenderer:
             )
             colour = self.wall_color
             pygame.draw.polygon(screen, colour, pts)
+            # 黑边：墙的轮廓（纯视觉，帮助看清"墙是一条带"）
+            pygame.draw.polygon(screen, (0, 0, 0), pts, 2)
             if self.show_hitboxes:
                 pygame.draw.polygon(screen, (255, 255, 255), pts, 1)
         circles = ~rects
@@ -713,16 +715,27 @@ class PygameRenderer:
         if danger is None:
             return
         vp = self.viewport
+        # **分层色**：把连续的危险值量化成 4 档，每档一个颜色（用户要的"分层"观感）。
+        # 只是显示方式，不改变势图数值本身。
         layer = pygame.Surface(self._size, pygame.SRCALPHA)
+        levels = ((0.15, (60, 200, 120, 40)),     # 低：青绿
+                  (0.35, (230, 220, 70, 55)),     # 中：黄
+                  (0.55, (240, 150, 50, 70)),     # 高：橙
+                  (0.75, (230, 60, 60, 95)))      # 极高：红
         for r, c, v in danger_cells(danger, step=0, threshold=0.15):
-            alpha = int(min(1.0, v) * 90)
+            colour = None
+            for thr, col in levels:
+                if v >= thr:
+                    colour = col
+            if colour is None:
+                continue
             wx = (c + 0.5) * danger.field_w / danger.cols
             wy = (r + 0.5) * danger.field_h / danger.rows
             px, py = vp.world_to_screen(wx, wy)
             half_w = max(1, int(vp.len_to_screen(danger.field_w / danger.cols) / 2))
             half_h = max(1, int(vp.len_to_screen(danger.field_h / danger.rows) / 2))
             pygame.draw.rect(
-                layer, (255, 80, 80, alpha),
+                layer, colour,
                 pygame.Rect(int(px - half_w), int(py - half_h), 2 * half_w, 2 * half_h),
             )
         screen.blit(layer, (0, 0))
