@@ -60,7 +60,31 @@ struct Params {
     double min_span_frac = 0.25;
     //: 行带内"亮列占比"下限：真墙是一条连续亮条（实测 0.9~1.0），网格线 0.5 左右。
     double min_bright_frac = 0.72;
+
+    // ---- 颜色门（P2）------------------------------------------------------
+    //: 墙像素的"暖度"下限：``r - b >= min_warmth``。**只加这一个门**，就够把
+    //: 网格线/外框/标记/角色全部排掉 —— 唯一依据是**墙是暖色**：
+    //:
+    //:   墙（`WALL_COLOR` (255,120,0)）：相机里 r−b 实测 118~200
+    //:   网格线 / 场地边框 / 四角标记 / 角色：都是中性（r−b ≈ 0~15，角色偏粉 ~57）
+    //:
+    //: 为什么不用亮度门：亮度**随曝光整体漂**（自动曝光第 3~4 帧会跳一档），
+    //: 而"暖度"是色差、与亮度近似无关；实测空场地上亮度判据 100% 的帧都报出
+    //: 两道"墙"（网格线），加了这道门之后为 0。
+    //:
+    //: 兜底：整幅暖像素太少（< 0.2%）时**退回亮度判据** —— 万一以后把墙改成中性色，
+    //: 这里不会静默变成"永远没有墙"，而是保持老行为（日志里 `wall_px` 会掉到 0）。
+    int min_warmth = 60;
+    //: 整幅画面里"墙像素"少于这个比例就认为"这一帧没有暖色墙"，退回亮度判据。
+    double warm_fallback_frac = 0.002;
 };
+
+//: 墙像素判据：**暖**（r−b 大）。不加亮度条件：暖度本身已经足够区分，
+//: 再叠亮度只会把"墙在阴影里/过曝"两种极端重新变成漏检。
+inline bool is_wall_pixel(int r, int g, int b, int min_warmth) {
+    (void)g;
+    return (r - b) >= min_warmth;
+}
 
 //: 一帧里的一道墙（含它的缺口）。
 struct Wall {
@@ -132,13 +156,30 @@ inline std::vector<Wall> find_walls(const uint8_t* rgb, int w, int h, const Para
     const int T = p.l_bright > 0 ? p.l_bright : auto_bright(rgb, w, h);
     if (out_lbright) *out_lbright = T;
 
-    // ---- 1) 每行的亮像素个数 ----
+    // ---- 0) 颜色门：整幅暖像素够不够多？不够就退回亮度判据（见 Params::min_warmth）----
+    long n_warm = 0;
+    if (p.min_warmth > 0) {
+        for (int y = 0; y < h; y += 2) {
+            const uint8_t* row = rgb + static_cast<size_t>(y) * w * 3;
+            for (int x = 0; x < w; x += 2) {
+                if (is_wall_pixel(row[x * 3], row[x * 3 + 1], row[x * 3 + 2], p.min_warmth))
+                    n_warm += 4;      // 每 2x2 采样点代表 4 个像素
+            }
+        }
+    }
+    const bool use_colour = (p.min_warmth > 0) &&
+                            (n_warm >= p.warm_fallback_frac * static_cast<double>(w) * h);
+    const int min_warmth = use_colour ? p.min_warmth : 0;
+
+    // ---- 1) 每行的"墙像素"个数 ----
+    // 颜色门：计数的是**暖**像素；回退：计数的是**亮**像素（老行为）。
     std::vector<int> row_cnt(static_cast<size_t>(h), 0);
     for (int y = 0; y < h; ++y) {
         const uint8_t* row = rgb + static_cast<size_t>(y) * w * 3;
         int c = 0;
         for (int x = 0; x < w; ++x) {
-            if (luma(row[x * 3], row[x * 3 + 1], row[x * 3 + 2]) >= T) ++c;
+            const int r = row[x * 3], g = row[x * 3 + 1], b = row[x * 3 + 2];
+            if (min_warmth > 0 ? is_wall_pixel(r, g, b, min_warmth) : (luma(r, g, b) >= T)) ++c;
         }
         row_cnt[static_cast<size_t>(y)] = c;
     }
@@ -199,9 +240,11 @@ inline std::vector<Wall> find_walls(const uint8_t* rgb, int w, int h, const Para
         for (int yy = wl.y0; yy <= wl.y1; ++yy) {
             const uint8_t* row = rgb + static_cast<size_t>(yy) * w * 3;
             for (int x = 0; x < w; ++x) {
-                if (luma(row[x * 3], row[x * 3 + 1], row[x * 3 + 2]) >= Tloc) {
-                    cnt[static_cast<size_t>(x)] += 1;
-                }
+                const int r = row[x * 3], g = row[x * 3 + 1], b = row[x * 3 + 2];
+                const bool hit = (min_warmth > 0)
+                    ? is_wall_pixel(r, g, b, min_warmth)
+                    : (luma(r, g, b) >= Tloc);
+                if (hit) cnt[static_cast<size_t>(x)] += 1;
             }
         }
         // 墙的列应该有"墙那么厚"的行数；取各列计数的 p75 当作墙厚度估计
