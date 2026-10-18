@@ -106,6 +106,19 @@ public:
     //: 而决策的 `t_arr = 距离 / v_n` 直接吃这个数。让读线程在读完后打时间戳，
     //: 才是真正的"采集间隔"，也把"处理耗时"排除在 dt 之外（同 `to_standard.py` 的纪律）。
     uint64_t last_stamp_ns() const { return last_stamp_ns_; }
+    //: 排队里还有几帧（诊断用：这个数长期 > 0 就说明处理比采集慢，延迟在堆）。
+    size_t queued() {
+        std::lock_guard<std::mutex> lk(m_);
+        return ready_.size();
+    }
+    //: **只取最新的一帧**（丢掉排队里的旧帧）。
+    //:
+    //: 为什么默认要开：读线程按相机 60 帧/秒在跑，我们处理只有约 10 帧/秒 ——
+    //: 队列里等的永远是最多 2 帧**已经过期**的画面。取最旧的那一帧等于给闭环
+    //: 白加 (队深-1)×处理周期 ≈ 190 ms 的延迟（实测），而延迟正是"板子看到的
+    //: 位置"和"平台现在的位置"对不上的直接原因。丢帧不是损失：本来也处理不过来。
+    void set_drop_stale(bool on) { drop_stale_ = on; }
+    long dropped() const { return dropped_; }
     //: 把用完的缓冲还回空闲池（省一次分配；不还也不影响正确性）。
     void recycle(std::vector<uint8_t>&& buf);
     int skipped() const { return skipped_; }
@@ -127,6 +140,8 @@ private:
     bool done_ = false;
     std::string why_;
     uint64_t last_stamp_ns_ = 0;
+    bool drop_stale_ = true;
+    long dropped_ = 0;
 };
 
 }   // namespace vision_board

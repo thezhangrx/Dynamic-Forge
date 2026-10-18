@@ -21,6 +21,11 @@
 #include "auto_params.hpp"
 #include "band_gap.hpp"
 #include "denoise.hpp"
+#include "geometry.hpp"
+#include "marker_refine.hpp"
+#include "player.hpp"
+#include "robust.hpp"
+#include "wall_gap.hpp"
 #include "rectify.hpp"
 #include "fiducial_zone.hpp"
 #include "segment_merge.hpp"
@@ -170,6 +175,31 @@ struct Args {
     //: 推像素前的方框滤波半径（0=关）。真机位相机彩噪很强（噪声度量 17~19，
     //: 干净基准 2.0），去噪前标记只能找到 3 个，r=1 后 4 个全对（实测）。
     int denoise_radius = 0;
+    //: 取"排队里最旧的那一帧"（默认关：默认只取最新帧，见 StdinPump::set_drop_stale）
+    bool keep_stale = false;
+    //: 是否还每帧调用亮度台阶法（`field_extent`）。默认关：P1 之后它只为参考，
+    //: 而实测每帧要 9.6 ms —— 在 13 fps 的闭环里这是 13% 的帧时间。
+    bool extent_fallback = false;
+    //: `--no-pl`：不推像素到 PL、不等几何帧。用作对照实验：
+    //: PL 那段（推 17.3 + 等 6.4 = 23.7 ms）目前唯一还在用的是它给的角色
+    //: （实测 67/1238 帧），而 PS 侧角色已经覆盖 78%+。
+    bool no_pl = false;
+    //: `--host-epoch <秒>`：由**主机**在启动本进程前写入的墙钟时刻。
+    //: 有了它，每帧就能算出"这一帧发生在主机时间的哪一刻"，从而和仿真时间**直接**
+    //: 对齐 —— 不用猜偏移、也不依赖板子时钟（实测它与主机差 1.5 s 且会漂）。
+    double host_epoch = 0.0;
+    //: `--no-player-pred`：关掉"局部精修 + 短时预测"，只用全局检测。
+    //: 用作 A/B：局部精修以**上一帧**为种子，一旦种到墙上就会逐帧漂移。
+    bool no_player_pred = false;
+    //: `--local-refine`：全局检测失败时用"上一帧位置"做局部精修。
+    //: **默认关**：离线动态语料（同一批帧）显示全局检测已经能到 96% 检出、误差中位
+    //: 10 px；而局部精修在平坦场地上会沿亮带漂移，把它打开反而让命中率从
+    //: 离线 62.7% 掉到在线 19%（`ps_new` 里混着一半是局部精修的结果）。
+    bool local_refine = false;
+    //: `--legacy-gap`：退回旧的 `band_gap::find_at` 门检测（对照用）。
+    //: 默认用 `wall_gap::find_walls`（每道墙一扇门、静态 1 px、动态目视验证过）。
+    bool legacy_gap = false;
+    std::string diag_log;
     //: 契约里的角色半径（场地单位）。用作**尺寸先验**：结构判据抓到的角色，
     //: 其外接框必须在"契约半径 × 比例尺"附近；抓到大块方形亮物（墙角/角标）
     //: 必须丢掉，否则会照着错的位置发指令（实测出现过 r=32.4，契约是 10）。
@@ -178,6 +208,18 @@ struct Args {
     std::string keyboard_dev = "/dev/ttyPS0";
     double action_deadzone = kDefaultDeadzone;
     bool echo_action = false;       // 把动作号也打到 stdout（人看）
+    //: `--cal <秒>`：**开场标定窗口**。这段时间里决策层被旁路，改发一段
+    //: 已知的动作序列（停 → 左右上下 → 四个对角，各 2 s，段间停 0.4 s），
+    //: 同时仿真用 `--obstacle-delay` 保证场上没有障碍。用途：
+    //:
+    //:   1. 停住那 1 s 给出"角色静止位置"的多帧样本（取稳健均值当初始位置）；
+    //:   2. 每个 2 s 的匀速段给出 `位移/时间` = **平台真实速度**
+    //:      （以前用的 158.7 是拍的，实际是契约里的 200 还是别的，必须量）；
+    //:   3. 段起点到"位移真正开始"的滞后 = **指令→动作延迟**
+    //:      （以前只量到过 0.457 s 这个总数，没把它拆成可标定的量）。
+    //:
+    //: 旁路只在标定窗口内生效：窗口一过立刻恢复决策层，行为和平时完全一样。
+    double cal_seconds = 0.0;
 };
 
 Args parse_args(int argc, char** argv) {
@@ -222,6 +264,18 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--structural-gap") a.structural_gap = true;
         else if (k == "--image-squash") a.image_squash = std::atof(next());
         else if (k == "--denoise") a.denoise_radius = std::atoi(next());
+        else if (k == "--keep-stale") a.keep_stale = true;
+        else if (k == "--extent-fallback") a.extent_fallback = true;
+        else if (k == "--no-pl") a.no_pl = true;
+        else if (k == "--host-epoch") a.host_epoch = std::atof(next());
+        else if (k == "--cal") a.cal_seconds = std::atof(next());
+        else if (k == "--no-player-pred") a.no_player_pred = true;
+        else if (k == "--local-refine") a.local_refine = true;
+        else if (k == "--legacy-gap") a.legacy_gap = true;
+        //: `--diag-log <path>`：每帧一条 JSON 的结构化诊断记录（见 docs/VISION_OVERHAUL.md §4）。
+        //: 为什么要它：以前"识别不出"只能靠肉眼看日志里几个数字猜是相机、几何、角色还是
+        //: 选墙出了问题；有了这份记录，每一帧的判定链条都能被机读地数出来。
+        else if (k == "--diag-log") a.diag_log = next();
         else if (k == "--player-radius") a.player_radius = std::atof(next());
         else if (k == "--auto-thresholds")    a.auto_thresholds = true;
         else if (k == "--no-auto-thresholds") a.auto_thresholds = false;
@@ -351,6 +405,9 @@ struct DoorSmoother {
     double vx = 0.0, vy = 0.0;
     double prev_cx = 0.0, prev_y = 0.0, prev_t = 0.0;
     bool has_prev = false;
+    //: 跳变等待状态（见 update() 里"连续两帧才采纳"）
+    int jump_pending = 0;
+    double pend_cx = 0.0, pend_width = 0.0, pend_y = 0.0, pend_hh = 0.0;
 
     /// 返回平滑后的 (cx, width, y, hh)，并更新速度估计。
     void update(double ncx, double nwidth, double ny, double nhh, double t_now = 0.0) {
@@ -363,10 +420,27 @@ struct DoorSmoother {
         const bool same = std::fabs(ncx - cx) <= (width > 1.0 ? width : 1.0) &&
                           std::fabs(nwidth - width) <= (0.5 * width + 1.0) &&
                           std::fabs(ny - y) <= (2.0 * hh + 1.0);
-        if (!same) {                     // 换了一扇门：直接采纳，不混旧值
-            cx = ncx; width = nwidth; y = ny; hh = nhh;
+        if (!same) {
+            // **目标跳变要"连续两帧"才采纳**。
+            // 为什么：检测器在同一条墙带上会在几个候选缺口之间来回选，一帧跳到别处、
+            // 下一帧又跳回来。原来的实现遇到"不是同一扇门"就**立即采纳**，于是
+            // 平滑后的目标也跟着跳 —— 实测这正是"平台左右乱晃"的主因：
+            // 缺口跳变 >20 单位的帧里，指令方向翻转率 **29%**，而缺口平稳的帧只有 **8%**。
+            // 现在：同一处跳变连续出现 2 帧才认（≈120 ms），单帧毛刺不再改变目标。
+            if (jump_pending > 0 &&
+                std::fabs(ncx - pend_cx) <= (pend_width > 1.0 ? pend_width : 1.0)) {
+                ++jump_pending;
+            } else {
+                jump_pending = 1;
+            }
+            pend_cx = ncx; pend_width = nwidth; pend_y = ny; pend_hh = nhh;
+            if (jump_pending >= 2) {
+                cx = ncx; width = nwidth; y = ny; hh = nhh;
+                jump_pending = 0;
+            }
             return;
         }
+        jump_pending = 0;               // 回到同一扇门：清掉跳变计数
         constexpr double kAlpha = 1.0 / 3.0;   // 三帧等效平均：够快跟手，又能压抖动
         cx += kAlpha * (ncx - cx);
         width += kAlpha * (nwidth - width);
@@ -466,6 +540,12 @@ struct WorldModel {
 
 struct DecisionState {
     gap_avoid::GapMemory mem;
+    //: P3 审计：本帧选中的墙（doors 下标）和选择理由。直接进诊断日志 ——
+    //: "为什么瞄这扇门"必须是可读的一句话，不能只体现在最终指令里。
+    int selected_door = -1;
+    const char* select_reason = "none";
+    //: `gap_avoid` 本帧的决策档位（"为什么不动"必须能从日志直接看出来）
+    const char* last_tier = "none";
     gap_avoid::AlgoConfig cfg;
     //: 线协议**不带速度**，所以 PS 侧自己推（见 `core/cpu/cpp/motion.hpp`）。
     //: 角色与障碍各一个跟踪器：关联是"最近邻 + 门限"，两类目标的运动模型
@@ -758,11 +838,20 @@ private:
     long sent_ = 0, dropped_ = 0;
 };
 
+//: 延迟分解（板子内部那一段）：像素交到手上的时刻、取帧时的队深、累计丢掉的旧帧数。
+//: 光看"采集→决策"一个总数分不清是**排队**还是**算得慢**，而这两者的修法完全不同。
+struct FrameLat {
+    uint64_t got_ns = 0;
+    size_t queued = 0;
+    long dropped = 0;
+};
+
 gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
                        const std::vector<band_gap::Door>* doors,
                        const band_gap::Extent* ext,
                        const band_gap::Player* splayer,
-                       const rectify::Homography* hmap) {
+                       const rectify::Homography* hmap,
+                       const FrameLat& lat) {
     // ---- dt：两帧 stamp 之差 ----
     double dt = args.dt_default;
     bool dt_is_default = true;
@@ -822,6 +911,28 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
                 f.player.x = splayer->x;
                 f.player.y = splayer->y;
                 f.player.radius = 0.25 * static_cast<double>(splayer->w + splayer->h);
+            }
+        } else if (f.player.present) {
+            // **PS 角色缺失时退回 RTL 角色 —— 必须换单位**。
+            // RTL 几何帧里的角色是**图像像素（y 朝下）**，而下游 `gap_avoid` 要的是
+            // 场地单位（y 朝上）。以前这里直接沿用，等于把一个 ~550px 的图像坐标当成
+            // 场地坐标喂进规划器（差一个比例尺 + 一个上下镜像），
+            // 表现是"PS 一失效就乱开"，而日志里看不出任何异常。
+            if (hmap && hmap->ok) {
+                const auto q = hmap->apply(f.player.x, f.player.y);
+                const double rr = std::max(1.0, f.player.radius);
+                const auto qx = hmap->apply(f.player.x + rr, f.player.y);
+                const auto qy = hmap->apply(f.player.x, f.player.y + rr);
+                const double rx = std::hypot(qx[0] - q[0], qx[1] - q[1]);
+                const double ry = std::hypot(qy[0] - q[0], qy[1] - q[1]);
+                f.player.x = q[0];
+                f.player.y = q[1];
+                f.player.radius = 0.5 * (rx + ry);
+                if (!hmap->inside(f.player.x, f.player.y, args.field_w, args.field_h, 0.0)) {
+                    f.player.present = false;
+                }
+            } else {
+                f.player.present = false;   // 没有几何 → 图像坐标不能当真
             }
         }
         const double ox = static_cast<double>(ext->x0), oy = static_cast<double>(ext->y0);
@@ -956,19 +1067,45 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
                     // 还在这堵墙的这一侧：继续盯住它
                     st.lock_y = wy;
                     pick = &d;
+                    st.select_reason = "locked";
+                    st.selected_door = static_cast<int>(&d - &(*doors)[0]);
                 }
             }
         }
         if (pick == nullptr) {
-            double best_dy = 1e18;
-            for (const band_gap::Door& d : *doors) {
-                const double wy = 0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale_y;
-                const double dy = std::fabs(wy - f.player.y);
-                if (dy < best_dy) {
-                    best_dy = dy;
-                    pick = &d;
-                }
+            // **P3**：选"角色前方最近的那道墙"，而不是"图像里最近的那道"。
+            // 两者的差别在"角色已经越过某道墙"时才显现：按 |wy - player.y| 选，
+            // 刚过身后的那道墙距离最小 → 平台会回头去瞄一扇已经过去的门。
+            // 定义与单测在 `wall_gap::select_threat_wall`（12 条断言覆盖单墙/双墙/
+            // 顺序互换/已越过/迟滞五种情形）。
+            std::vector<wall_gap::WallInField> wf;
+            for (size_t di = 0; di < doors->size(); ++di) {
+                const band_gap::Door& d = (*doors)[di];
+                wall_gap::WallInField w;
+                w.id = static_cast<int>(di);
+                w.y_center = 0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale_y;
+                w.half_h = 0.5 * (static_cast<double>(d.y1 - d.y0) + 1.0) * s_scale_y;
+                w.has_gap = d.found && d.width > 0;
+                w.gap_cx = 0.5 * ((d.x0 - ox) + (d.x1 - ox)) * s_scale;
+                w.gap_w = static_cast<double>(d.width) * s_scale;
+                wf.push_back(w);
             }
+            const int sel = wall_gap::select_threat_wall(wf, f.player.y);
+            if (sel >= 0) {
+                pick = &(*doors)[static_cast<size_t>(sel)];
+                st.select_reason = "ahead_nearest";
+            } else {
+                // 没有"前方"的墙（全被越过/全无缺口）→ 退回最近的那道，
+                // 而不是乱选；这一步保留旧行为，避免在边缘情形下反而无目标。
+                double best_dy = 1e18;
+                for (const band_gap::Door& d : *doors) {
+                    const double wy = 0.5 * ((d.y0 - oy) + (d.y1 - oy)) * s_scale_y;
+                    const double dy = std::fabs(wy - f.player.y);
+                    if (dy < best_dy) { best_dy = dy; pick = &d; }
+                }
+                if (pick != nullptr) st.select_reason = "fallback_nearest";
+            }
+            if (pick != nullptr) st.selected_door = static_cast<int>(pick - &(*doors)[0]);
             if (pick != nullptr) {
                 const double wy = 0.5 * ((pick->y0 - oy) + (pick->y1 - oy)) * s_scale_y;
                 st.door_locked = true;
@@ -986,9 +1123,16 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
             const double nhh = 0.5 * (static_cast<double>(pick->y1 - pick->y0) + 1.0) * s_scale_y;
             st.door_sm.update(ncx, nwidth, ny, nhh, t_now);
         }
-        const double sm_cx = st.door_sm.cx;
+        // **缺口中心也要"范围"而不是"点值"**：缺口帧间跳变 p90 28 场地单位，
+        // 而横向可用宽度只有 25 单位 —— 目标抖一点就"左一下右一下"。
+        // 在 α-β 平滑之外再套一层时间窗鲁棒均值（截尾 + MAD 剔离群）。
+        static robust::Window s_win_gap_cx(0.35, 10);
+        static robust::Window s_win_gap_y(0.35, 10);
+        s_win_gap_cx.push(st.door_sm.cx, t_now);
+        s_win_gap_y.push(st.door_sm.y, t_now);
+        const double sm_cx = s_win_gap_cx.enough(3) ? s_win_gap_cx.robust_mean() : st.door_sm.cx;
         const double sm_w = st.door_sm.width;
-        const double sm_y = st.door_sm.y;
+        const double sm_y = s_win_gap_y.enough(3) ? s_win_gap_y.robust_mean() : st.door_sm.y;
         const double sm_hh = st.door_sm.hh;
         // 注入**所有**墙（每扇门各自带缺口），但把"角色正对着的那扇"用平滑后的几何。
         // 只注入一扇会漏掉另一堵墙 —— 规划器看不见它，于是直直撞上去
@@ -1140,11 +1284,26 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
     }
     ++st.n_decisions;
     st.tier_count[tier_bucket(d.tier)] += 1;
+    st.last_tier = d.tier;
 
     // 先把**决策真正用的**角色位置打出来（`f.player` 在 decide 里可能被结构判据覆盖）：
     // 之前这里只打几何帧里的角色，结构判据覆盖后日志里还是 (0,0)，符号校准没法做。
     std::printf("        角色用=(%+.1f,%+.1f) r=%+.1f\n", f.player.x, f.player.y,
                 f.player.radius);
+    // **端到端延迟（板子内部这一段）**：从相机给帧的 stamp 到本帧决策算完，
+    // 用板子自己的单调时钟量，不跨机器、不需要对时。
+    {
+        const auto now_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        const uint64_t cam_ns = f.header.stamp_ns;
+        if (cam_ns != 0 && lat.got_ns > cam_ns && now_ns > cam_ns) {
+            const double age = (lat.got_ns > cam_ns) ? (lat.got_ns - cam_ns) * 1e-6 : 0.0;
+            const double proc = (now_ns > lat.got_ns) ? (now_ns - lat.got_ns) * 1e-6 : 0.0;
+            std::printf("        @LAT 取帧滞后 %.1f + 处理 %.1f = 采集→决策 %.1f ms"
+                        "（取帧时队列=%zu，累计丢旧帧=%ld）\n",
+                        age, proc, (now_ns - cam_ns) * 1e-6, lat.queued, lat.dropped);
+        }
+    }
     // 给**平台 HUD** 的一行（`@DBG` 前缀由 board_link 解析）：视觉这条链路上
     // 也能在屏幕上看到板子的决策，和真值链路一致。
     std::printf("@DBG tier=%s cmd=(%.2f,%.2f) gap=%.1f rects=%d "
@@ -1206,6 +1365,125 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
     return cmd;
 }
 
+// ---------------------------------------------------------------------------
+// 开场标定（`--cal <秒>`）：用**已知动作序列**量平台的速度和指令延迟
+//
+// 为什么必须单独做这一件事：虚拟真值（把 `@MOVE` 积分成平台位置）依赖两个数——
+// 平台速度、指令→动作延迟。以前的 158.7 单位/秒是从离线语料反推的，延迟只量到
+// 一个总数（0.457 s，混着串口、键盘桥、采集三处）。这两个数一旦错，积分就会
+// 系统性偏离真值，而"用视觉去修积分"看起来永远像视觉有问题。
+//
+// 序列设计（一段 20.2 s，可重复）：
+//   * 头 1 s 停住 —— 静止位置样本（多帧取稳健均值）；
+//   * 之后 8 个匀速段各 2 s：左、右、下、上、左上、右上、左下、右下，
+//     段间停 0.4 s —— 停顿让"上一段减速→下一段起步"的边界清晰，
+//     每段的位移/时间就是速度，起步滞后就是延迟；
+//   * 顺序上先水平后垂直，覆盖 8 个方向（含对角 0.7071 分量，用来验
+//     "对角速度是否也是同一个模"）。
+// ---------------------------------------------------------------------------
+namespace calib {
+
+struct Step {
+    double dur;     // 这一段的时长（秒）
+    int    action;  // 这一段的动作号（1 左 2 右 3 上 4 下 5..8 对角，0 停）
+};
+
+//: 一轮标定的动作表：**前缀只跑一次**（静止采样 + 回中），**脉冲段循环**。
+//:
+//: 为什么段长从 2 s 改成 0.6 s：2 s 在 166 单位/秒下就是 **330 单位**位移 ——
+//: 场地只有 640×480，平台从 (320,106) 出发往左 2 s 会**撞到左边界被钳住**，
+//: 量出来的"速度"是钳位后的平均速度（实测 y 方向 42.6、对角 51.8，全是钳位造成的
+//: 假值）。0.6 s = 100 单位，从场地中央出发八个方向都不会碰到边界。
+//:
+//: 为什么先"回中"：角色出生点在场地**靠下**（实测 (320,106)，场地 -y 方向只剩 96
+//: 单位），不回中就没法量向下的速度。回中方向/时长用**视觉给的位置**算（静止时
+//: 视觉误差中位 14 单位，够用），速度按契约 200 估（这里只需要走到中央附近，
+//: 不要求精确 —— 精确的那个数正是后面脉冲段要量的）。
+struct Plan {
+    std::vector<Step> prefix;   // 只跑一次（静止采样、回中）
+    std::vector<Step> pulses;   // 循环跑（八个方向各一次 + 段间停）
+    double prefix_s = 0.0;
+    double pulse_s = 0.0;
+};
+
+inline double sum_dur(const std::vector<Step>& v) {
+    double s = 0.0;
+    for (const Step& st : v) s += st.dur;
+    return s;
+}
+
+//: 用"角色现在在哪"生成标定计划。`have` == false 时跳过回中（位置未知就别乱走）。
+inline Plan build(double x, double y, bool have, double field_w, double field_h) {
+    Plan pl;
+    pl.prefix.push_back({1.0, 0});          // 静止采样（初始位置）
+    if (have) {
+        const double cx = 0.5 * field_w, cy = 0.5 * field_h;
+        // 回中速度按 200 估：只求"走到中央附近"，不精确
+        const double dy = cy - y, dx = cx - x;
+        double vd = std::min(0.9, std::fabs(dy) / 200.0);
+        if (std::fabs(dy) > 60.0 && vd > 0.15) {
+            pl.prefix.push_back({vd, dy > 0.0 ? 3 : 4});
+            pl.prefix.push_back({0.3, 0});
+        }
+        double hd = std::min(0.9, std::fabs(dx) / 200.0);
+        if (std::fabs(dx) > 60.0 && hd > 0.15) {
+            pl.prefix.push_back({hd, dx > 0.0 ? 2 : 1});
+            pl.prefix.push_back({0.3, 0});
+        }
+    }
+    // 八个方向各 **0.8 s**，段间停 0.3 s；成对安排让位置大致回到原点。
+    // 0.8 s 在 200 单位/秒下约 160 单位 —— **从场地中央出发，八个方向都不会碰边界**
+    // （中央到最近边界 230 单位，斜向每轴 113 单位）。1.2 s 就太长了：从中央往下
+    // 240 单位会直接撞到底边被钳住，量出来的速度是钳位后的假值（实测出现过
+    // 119 单位/秒、分方向 114~126 的荒谬结果）。
+    static const int kDirs[] = {1, 2, 4, 3, 5, 8, 6, 7};
+    for (int d : kDirs) {
+        pl.pulses.push_back({0.8, d});
+        pl.pulses.push_back({0.3, 0});
+    }
+    pl.prefix_s = sum_dur(pl.prefix);
+    pl.pulse_s = sum_dur(pl.pulses);
+    return pl;
+}
+
+//: `t`（标定窗口内的秒数）对应的 (动作号, 段序号, 段内相对时间)。
+//: 段序号**单调递增**（脉冲段跨轮次继续编号），分析脚本据此切样本。
+struct Point { int action; int step; double t_in_step; };
+
+inline Point at(const Plan& pl, double t) {
+    Point p{0, -1, 0.0};
+    if (t < 0.0 || pl.pulses.empty()) return p;
+    if (t < pl.prefix_s) {
+        double x = t;
+        for (size_t i = 0; i < pl.prefix.size(); ++i) {
+            if (x < pl.prefix[i].dur || i + 1 == pl.prefix.size()) {
+                p.action = pl.prefix[i].action;
+                p.step = static_cast<int>(i);
+                p.t_in_step = x;
+                return p;
+            }
+            x -= pl.prefix[i].dur;
+        }
+        return p;
+    }
+    double x = t - pl.prefix_s;
+    const int cycle = static_cast<int>(x / pl.pulse_s);
+    x -= cycle * pl.pulse_s;
+    const int n = static_cast<int>(pl.pulses.size());
+    for (int i = 0; i < n; ++i) {
+        if (x < pl.pulses[i].dur || i + 1 == n) {
+            p.action = pl.pulses[i].action;
+            p.step = static_cast<int>(pl.prefix.size()) + cycle * n + i;
+            p.t_in_step = x;
+            return p;
+        }
+        x -= pl.pulses[i].dur;
+    }
+    return p;
+}
+
+}   // namespace calib
+
 }   // namespace
 
 int main(int argc, char** argv) {
@@ -1258,6 +1536,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<StdinPump> pump;
     if (args.stdin_rgb) {
         pump.reset(new StdinPump(kPlWidth, kPlHeight, args.skip_frames, args.frames));
+        pump->set_drop_stale(!args.keep_stale);
         std::printf("帧来源: **stdin 原始 RGB**（%dx%d，丢掉开头 %d 帧热身，读线程重叠）\n"
                     "  管道缓冲 = %d 字节（要 ≥1 帧 691200 才谈得上重叠；"
                     "不够就在启动脚本里调 /proc/sys/fs/pipe-max-size）\n",
@@ -1320,9 +1599,25 @@ int main(int argc, char** argv) {
         std::printf("键盘桥: 已关闭（--no-keyboard）\n");
     }
 
+    // ---- 结构化诊断记录（--diag-log）--------------------------------------
+    // 只写事实，不写推断：几何是否有效、几个标记、角色在哪、墙/缺口在哪、最后发了什么。
+    // `coordinate_error` 之类的真值误差**不在这里算** —— 真值不来自算法自身（不变式 I5）。
+    FILE* diag_f = nullptr;
+    if (!args.diag_log.empty()) {
+        diag_f = std::fopen(args.diag_log.c_str(), "w");
+        if (!diag_f) std::fprintf(stderr, "⚠ 打不开诊断日志 %s\n", args.diag_log.c_str());
+        else std::printf("诊断记录: %s（每帧一条 JSON）\n", args.diag_log.c_str());
+    }
+
     // ---- 逐帧 ------------------------------------------------------------
     DecisionState st;
     const auto t0 = std::chrono::steady_clock::now();
+    //: 进程启动的单调时刻，用来把"主机墙钟起点"外推到每一帧
+    const auto t_proc0 = t0;
+    if (args.host_epoch > 0.0) {
+        std::printf("主机时基: %.3f（诊断日志里的 host_t 可直接与仿真时间对账）\n",
+                    args.host_epoch);
+    }
     int ok = 0, bad = 0;
     uint64_t stamp_ns = 0;
     double sum_read = 0, sum_push = 0, sum_wait = 0, sum_total = 0;
@@ -1333,6 +1628,15 @@ int main(int argc, char** argv) {
     long n_struct_all = 0;
     long n_marker4 = 0;
     long n_model_frames = 0;   // 靠世界模型外推给出几何的帧数
+    //: 标定窗口的起点：**第一帧处理完**那一刻（不是进程启动）——
+    //: 相机起来到出第一帧要 1~3 s，用进程启动会把窗口浪费在还没画面的时间里，
+    //: 于是仿真那侧已经"该放墙了"而板子还在发标定动作。以首帧为零点，
+    //: 两边就只差仿真启动→板子首帧那一段已知延迟。
+    bool cal_started = false;
+    auto t_cal0 = t0;
+    long n_cal_frames = 0;
+    //: 标定计划（首帧时按视觉位置生成一次；之后只读）
+    calib::Plan cal_plan;
     //: 场地不可见的帧数（`field_extent` 失败 = 相机没看到场地边框）。
     //: 闭环测试里这个数就是"这一轮算不算数"的判据：窗口被盖住时它会一路涨，
     //: 同时所有指令都是 stay —— 那是环境问题，不是判据问题，必须能一眼看出来。
@@ -1344,10 +1648,13 @@ int main(int argc, char** argv) {
         // 两条下游（PL 推像素 / PS 参考模型）**吃同一份 rgb** ——
         // 否则 --verify-both 比的就不是"两条像素通路"而是"两张图"。
         const auto t_frame0 = std::chrono::steady_clock::now();
+        auto t_got = t_frame0;   // 像素真正交到手上的时刻（延迟分解用）
+        size_t q_before = 0;
         std::vector<uint8_t> rgb;
         int pw = 0, ph = 0;
         if (pump) {
             std::string swhy;
+            q_before = pump->queued();
             if (!pump->get(&rgb, &swhy)) {
                 if (i > 0) break;
                 std::fprintf(stderr, "第一帧就取不到像素：%s\n", swhy.c_str());
@@ -1356,6 +1663,7 @@ int main(int argc, char** argv) {
             pw = kPlWidth; ph = kPlHeight;
             // 用读线程打下的**真实采集时刻**当 stamp：固定步长会让速度系统性偏小
             // （相机实测 40~48 fps，按 30fps 打戳就低 28%~50%）。
+            t_got = std::chrono::steady_clock::now();
             const uint64_t cam_ts = pump->last_stamp_ns();
             if (cam_ts != 0) stamp_ns = cam_ts;
         } else if (src) {
@@ -1390,13 +1698,46 @@ int main(int argc, char** argv) {
         int sg_min_gap_px = 0;
         rectify::Homography sg_h;
         size_t sg_marker_count = 0;
+        //: 几何可信性判定失败的原因（"ok" = 通过）。直接进诊断日志，
+        //: 这样"这一帧为什么 stay"在日志里是**可读的一句话**，不用再靠猜。
+        const char* sg_geo_why = "none";
+        //: 上一次"可信几何"成功确认距今多少 ms（诊断 / 门控用，见上面 geo_stale）
+        double sg_geo_age_ms = 1e9;
+        //: 新角色检测器（`player.hpp`）的完整结果，供诊断日志区分来源
+        player::Player sg_player_new;
+        //: 角色目标的不确定度（时间窗内两轴范围之和，像素）。越小越确定，进日志/门控用。
+        double sg_player_unc = 0.0;
+        //: 去重前的门候选个数（诊断：这个数远大于 `walls` 的长度就说明重复严重）
+        size_t sg_doors_raw = 0;
+        //: 结构判据内部的分段耗时（毫秒）。`decide` 只给出总时间，回答不了
+        //: "到底哪一步慢" —— 实测总时间 57ms(p50)/125ms(p95)，必须拆开看。
+        double ms_markers = 0, ms_doors = 0, ms_player = 0, ms_extent = 0;
+        //: 本帧的墙（`wall_gap::find_walls` 的结果）。**在找角色之前就要有**：
+        //: 墙的端头在形状上和角色圆盘不可分，只能靠"这个候选是不是落在墙带上"排除。
+        std::vector<wall_gap::Wall> sg_walls;
+        std::vector<std::pair<int, int>> sg_bands;
         if (args.structural_gap && !rgb.empty() && pw > 0 && ph > 0) {
             // 先用亮度边缘粗量（无标记时的回退）。如果下面用标记解出了单应，
             // 会被 `field_bbox()` 覆盖 —— 那时这次的 1.5 ms 全图扫描就白花了。
             // 真机上它大约占 15 ms 板子时间，先保留（逻辑简单、无标记的帧仍需要它）。
-            sg_ext = band_gap::field_extent(rgb.data(), pw, ph,
-                                            args.field_w, args.field_h,
-                                            5.0, 3, args.image_squash);
+            // ⚠ P1 之后 `field_extent` 只是"参考值"（有效性由四标记单应判定），
+            //   但它每帧仍要花 **9.6 ms**（p50，实测）。默认不再调用；
+            //   需要对比时才 `--extent-fallback`。
+            if (args.extent_fallback) {
+                const auto t_ext0 = std::chrono::steady_clock::now();
+                sg_ext = band_gap::field_extent(rgb.data(), pw, ph,
+                                                args.field_w, args.field_h,
+                                                5.0, 3, args.image_squash);
+                ms_extent = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_ext0).count();
+            }
+            // ⚠ **P1：亮度台阶法不再有权单独判定"场地可见"**
+            //   实测它在 268 帧上只有 45.9% 有效，且有效时 scale_x 恒为 1.187 ——
+            //   它量的是显示器边框（黑边→屏幕的亮度台阶），不是场地；纵向尺度更是
+            //   "按 squash 反推 + 场地居中"假设出来的，从来没被量过。
+            //   所以这里只保留它的数值作为**兜底参考**，有效性一律由四标记单应 +
+            //   可信性判定（geometry.hpp）给出：没有标记 → 没有几何 → INVALID → stay。
+            sg_ext.ok = false;
             // 尺寸窗口与可通过性都由**契约 + 本帧比例尺**算出来，不是像素常数
             if (sg_ext.ok && sg_ext.scale_x > 0.0) {
                 const double dia_px = 2.0 * args.player_radius / sg_ext.scale_x;
@@ -1423,9 +1764,86 @@ int main(int argc, char** argv) {
             // 四角标记 → 单应（吃掉旋转与透视），并给出场地四边形掩膜
             {
                 // 每 5 帧重算一次标记/单应，其余帧复用（相机与平台相对静止）
-                static rectify::MarkerCache mcache;
-                const std::vector<rectify::Marker> ms =
-                    mcache.update(rgb.data(), pw, ph, args.field_w, args.field_h);
+                //
+                // ⚠ 三处刻意的选择，都是被实测逼出来的：
+                // 1) 用 `find_markers4`（深色纹理 + 亮块两个检测器合并）而不是
+                //    `find_markers`：268 帧语料上四标记齐全率 84.7% vs **97.8%**。
+                // 2) **自己按几何排序**再解单应，不依赖检测器的返回顺序。
+                //    实测有 20/101 帧出现"标记离 bbox 角很远"，根子就是顺序假设
+                //    （原来写死 img=[m0,m1,m3,m2] ↔ [TL,TR,BR,BL]）。
+                // 3) 4 点单应对**任何**顺序都能精确解出来（重投影误差恒 0），
+                //    所以顺序错了不会报错，只会给出一个歪掉的场地 —— 必须靠几何排序
+                //    + 可信性判定（geometry.hpp）一起兜住。
+                static std::vector<rectify::Marker> s_mk;
+                static rectify::Homography s_homo;
+                static long s_tick = 0;
+                if (s_tick % 5 == 0 || s_mk.size() != 4) {
+                    const auto t_mk0 = std::chrono::steady_clock::now();
+                    std::vector<rectify::Marker> found =
+                        rectify::find_markers4(rgb.data(), pw, ph);
+                    if (found.size() == 4) {
+                        // 按"和/差"排成 TL, TR, BR, BL：与成像方向无关，只要不是
+                        // 45° 旋转就能唯一确定（45° 那种病态情形由可信性判定否掉）。
+                        std::sort(found.begin(), found.end(),
+                                  [](const rectify::Marker& a, const rectify::Marker& b) {
+                                      return (a.x + a.y) < (b.x + b.y);
+                                  });
+                        rectify::Marker tl = found[0], br = found[3];
+                        rectify::Marker o1 = found[1], o2 = found[2];
+                        rectify::Marker tr = (o1.x >= o2.x) ? o1 : o2;   // 靠右的是 TR
+                        rectify::Marker bl = (o1.x >= o2.x) ? o2 : o1;
+                        // 标记中心精修：检测器给的是"亮内图"的质心，而契约坐标是
+                        // **方块中心**；内图不对称会让单应整体平移 8~15 px（实测）。
+                        // 精修到"包住内图的深色方块"的 bbox 中心后，角色位置误差中位
+                        // 从 16.6 px 降到 8.7 px（同一批静态帧）。
+                        bool r_tl = false, r_tr = false, r_br = false, r_bl = false;
+                        // 契约：标记方块边长 48 场地单位 → 像素边长 ≈ 四标记跨度 × 48/640。
+                        // 给精修一个**尺寸窗口**，否则它会吞掉画面边缘的大片暗区。
+                        const double span_px =
+                            0.5 * (std::hypot(found[1].x - found[0].x, found[1].y - found[0].y) +
+                                   std::hypot(found[2].x - found[3].x, found[2].y - found[3].y));
+                        markers::Params rp;
+                        if (span_px > 40.0) {
+                            const double expect = span_px * 48.0 / 640.0;
+                            rp.min_side_px = static_cast<int>(0.5 * expect);
+                            rp.max_side_px = static_cast<int>(2.0 * expect);
+                        }
+                        tl = markers::refine(rgb.data(), pw, ph, tl, &r_tl, rp);
+                        tr = markers::refine(rgb.data(), pw, ph, tr, &r_tr, rp);
+                        br = markers::refine(rgb.data(), pw, ph, br, &r_br, rp);
+                        bl = markers::refine(rgb.data(), pw, ph, bl, &r_bl, rp);
+                        // ⚠ 解单应时喂的顺序也必须是"世界口径"的 [左下,右下,右上,左上]。
+                        //   只改 `s_mk`（judge 用）而忘了这里，会出现"判定通过、坐标仍然
+                        //   上下镜像"的最坏情形：实测同一帧真值 (320,106) 被算成 (319,380)。
+                        const std::array<std::array<double, 2>, 4> img = {
+                            {{bl.x, bl.y}, {br.x, br.y}, {tr.x, tr.y}, {tl.x, tl.y}}};
+                        const rectify::Homography h =
+                            rectify::solve(img, rectify::contract_markers(args.field_w,
+                                                                         args.field_h));
+                        if (h.ok) {
+                            // ⚠ 顺序必须与 `rectify::contract_markers()` 一致：
+                            //   contract = [TL, TR, BR, BL]（注意 BR 在 BL 前面）。
+                            //   写成 TL,TR,BL,BR 会让单应整体**上下镜像** —— 而镜像
+                            //   不改变 bbox、不改变宽高比、也不改变"标记到角点距离"，
+                            //   所以可信性判定照样通过，只有"真值投影到图像"时才暴露：
+                            //   实测把角色真值投成了 y=-33.9（画面外）。
+                            // **世界口径（y 朝上）**：contract 的 (32,32) 是世界左下，
+                            // 对应图像左下标记 → 喂给 solve 的顺序是 [BL, BR, TR, TL]。
+                            // 这样解出来的单应直接给出"y 朝上"的场地坐标，和 `@STATE`、
+                            // `gap_avoid`（已验证）同一口径，纵向逻辑不再镜像。
+                            s_mk = {bl, br, tr, tl};
+                            s_homo = h;
+                        } else {
+                            s_mk.clear();
+                        }
+                    } else {
+                        s_mk.clear();
+                    }
+                    ms_markers = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t_mk0).count();
+                }
+                ++s_tick;
+                const std::vector<rectify::Marker>& ms = s_mk;
                 sg_marker_count = ms.size();
                 ++n_struct_all;
                 if (ms.size() == 4) ++n_marker4;
@@ -1440,29 +1858,191 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                if (mcache.homo.ok) {
-                    sg_h = mcache.homo;
-                    // **场地范围以四角标记为准**：`field_extent` 在真机帧上会去量
-                    // 墙端（亮墙 vs 暗底产生更强台阶），实测宽度只量出 67 px（真值 544）。
-                    // 标记是已知场地坐标的强特征，反解出来的包围盒不受"哪条边更亮"影响。
-                    if (sg_h.ok) {
-                        int bx0 = 0, bx1 = 0, by0 = 0, by1 = 0;
-                        if (rectify::field_bbox(sg_h, args.field_w, args.field_h,
-                                                pw, ph, &bx0, &bx1, &by0, &by1)) {
-                            sg_ext.ok = true;
-                            sg_ext.x0 = bx0; sg_ext.x1 = bx1;
-                            sg_ext.y0 = by0; sg_ext.y1 = by1;
-                            sg_ext.width_px = static_cast<double>(bx1 - bx0 + 1);
-                            sg_ext.height_px = static_cast<double>(by1 - by0 + 1);
-                            sg_ext.scale_x = args.field_w / sg_ext.width_px;
-                            sg_ext.scale_y = args.field_h / sg_ext.height_px;
-                            sg_ext.anisotropy = sg_ext.scale_y > 0 ? sg_ext.scale_x / sg_ext.scale_y : 1.0;
-                        }
+                if (!s_homo.ok) {
+                    sg_geo_why = "no_markers";
+                } else {
+                    sg_h = s_homo;
+                    const geometry::Geometry geo = geometry::judge(
+                        sg_h, ms, pw, ph, args.field_w, args.field_h);
+                    sg_geo_why = geo.why;
+                    // ⚠ 顺序不能反：**先算年龄，再更新**"最后一次成功确认"的时刻。
+                    //   反过来的话，本帧刚把自己写成"刚刚成功"，年龄永远是 0/无穷，
+                    //   实测表现为每一帧都被判 `geo_stale`（101/101 帧 INVALID）。
+                    static uint64_t last_marker_ok_ns = 0;
+                    sg_geo_age_ms = (last_marker_ok_ns == 0)
+                        ? 0.0
+                        : ((stamp_ns >= last_marker_ok_ns)
+                               ? static_cast<double>(stamp_ns - last_marker_ok_ns) * 1e-6
+                               : 1e9);
+                    if (geo.valid) last_marker_ok_ns = stamp_ns;
+                    if (geo.valid && sg_geo_age_ms > 600.0) {
+                        sg_geo_why = "geo_stale";
                     }
+                    if (geo.valid && sg_geo_age_ms <= 600.0) {
+                        sg_ext.ok = true;
+                        sg_ext.x0 = geo.bbox[0]; sg_ext.x1 = geo.bbox[1];
+                        sg_ext.y0 = geo.bbox[2]; sg_ext.y1 = geo.bbox[3];
+                        sg_ext.width_px = static_cast<double>(geo.bbox[1] - geo.bbox[0] + 1);
+                        sg_ext.height_px = static_cast<double>(geo.bbox[3] - geo.bbox[2] + 1);
+                        sg_ext.scale_x = geo.scale_x;
+                        sg_ext.scale_y = geo.scale_y;
+                        sg_ext.anisotropy = geo.scale_y > 0 ? geo.scale_x / geo.scale_y : 1.0;
+                        // **P2：角色检测换成"场地 ROI 内找实心圆"**
+                        // 旧 `band_gap::find_player` 是全图找最亮的圆，和四角标记形状重叠，
+                        // 实测 PS 侧从没被采用过。新检测器（`player.hpp`）用：
+                        //   契约面积（由 10 场地单位半径换算）+ 形状 + 离标记的距离
+                        // 并且只在场地 ROI 里找。找到就覆盖旧结果；找不到就保留旧结果
+                        // （旧的仍然可能对，只是不可靠，日志里 player_src 会区分）。
+                        const auto t_pl0 = std::chrono::steady_clock::now();
+                        // 先算墙（同一套检测器、同一帧），给角色检测提供"墙带"约束
+                        sg_walls = wall_gap::find_walls(rgb.data(), pw, ph);
+                        sg_bands.clear();
+                        for (const wall_gap::Wall& w2 : sg_walls)
+                            sg_bands.emplace_back(w2.y0, w2.y1);
+                        const auto pl = player::find(rgb.data(), pw, ph, sg_h, ms,
+                                                     args.field_w, args.field_h,
+                                                     args.player_radius, player::Params{},
+                                                     &sg_bands);
+                        ms_player = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t_pl0).count();
+                        sg_player_new = pl;
+                        // ⚠ **角色不可能落在四角标记上**：按世界坐标再排一次。
+                        //   实测坑：空场地（没有墙）时 PS 检测器的"角色"稳定落在图像
+                        //   (0..31, 0..31)，也就是左上角那个标定标记 —— 于是
+                        //   `player_field` 跑到 x=186..551 的乱值，标定窗口的
+                        //   "初始位置"直接失效。像素级的标记排除（`marker_exclude_k`
+                        //   × 检出尺寸）不够（标记的内亮块本身就小），而**世界坐标**
+                        //   是准的：直接按合同角点排最可靠。
+                        if (sg_player_new.found && sg_h.ok) {
+                            const auto q = sg_h.apply(sg_player_new.x, sg_player_new.y);
+                            // 标记半边长 24 + 角色半径 10 + 余量 36 → 70 场地单位
+                            const double keep_out = 24.0 + args.player_radius + 36.0;
+                            const double corners[4][2] = {
+                                {32.0, 32.0},
+                                {args.field_w - 32.0, 32.0},
+                                {32.0, args.field_h - 32.0},
+                                {args.field_w - 32.0, args.field_h - 32.0}};
+                            for (const auto& c : corners) {
+                                if (std::hypot(q[0] - c[0], q[1] - c[1]) < keep_out) {
+                                    sg_player_new.found = false;
+                                    break;
+                                }
+                            }
+                        }
+                        // 全局没找到时，用**上一帧**位置做局部精修：角色贴墙时
+                        // 会被并进墙的大块里（面积判据直接否掉），但"盘内亮、环带暗"
+                        // 的对比度仍然成立。只在上一次位置可信时做，避免满场乱找。
+                        static player::Player s_prev_player;
+                        if (!sg_player_new.found && s_prev_player.found && !args.no_player_pred &&
+                            args.local_refine) {
+                            const double unit_per_px =
+                                args.field_w / std::max(1.0, static_cast<double>(
+                                    geo.bbox[1] - geo.bbox[0]));
+                            const double r_px = args.player_radius / std::max(1e-6, unit_per_px);
+                            auto loc = player::refine_near(rgb.data(), pw, ph,
+                                                           s_prev_player.x,
+                                                           s_prev_player.y, r_px,
+                                                           45.0, 12.0);
+                            bool near_mk = false;
+                            for (const rectify::Marker& m : ms) {
+                                if (std::hypot(loc.x - m.x, loc.y - m.y) <
+                                    2.0 * std::max(m.w, m.h)) { near_mk = true; break; }
+                            }
+                            // **漂移闸**：局部精修以**上一帧**为种子，而角色周围是平坦
+                            // 的场地灰 —— 对比度曲面在那里几乎是平的，argmax 每帧挪一两个
+                            // 像素，会**自我强化地越走越偏**（实测平台静止不动时，板子的
+                            // "角色"在 0.9 s 里从 x=324 漂到 199，而真值一直是 320）。
+                            // 所以只允许"一帧能走到的距离"（200 场地单位/秒 × 60ms ≈ 12 px，
+                            // 留余量取 14 px），超过就当它没找到，改用预测/全局结果。
+                            const double drift_px = std::hypot(loc.x - s_prev_player.x,
+                                                               loc.y - s_prev_player.y);
+                            if (loc.found && drift_px > 14.0) loc.found = false;
+                            if (loc.found && !near_mk) {
+                                sg_player_new.found = true;
+                                sg_player_new.x = loc.x;
+                                sg_player_new.y = loc.y;
+                                sg_player_new.why = "local";
+                                sg_player_new.conf = loc.contrast / 100.0;
+                            }
+                        }
+                        // **时间窗鲁棒化**（用户口径：宁可要一个大概的范围，也不要一个
+                        // 不稳定的点值）。实测：单帧角色误差 p50 35 / p95 159 场地单位，
+                        // 而决策要的是稳定目标 —— 目标抖就变成指令抖（缺口跳变 >20 单位
+                        // 的帧里指令翻转率 29%，平稳帧 8%）。
+                        // 做法：对**像素坐标**做 0.35 s 的截尾均值 + MAD 离群剔除。
+                        // 用 MAD 而不是"均值±3σ"，因为均值本身会被错块带跑。
+                        {
+                            static robust::Window2 s_win_player(0.35, 10);
+                            const double t_s = static_cast<double>(stamp_ns) * 1e-9;
+                            if (sg_player_new.found) {
+                                s_win_player.push(sg_player_new.x, sg_player_new.y, t_s);
+                                sg_player_unc = s_win_player.uncertainty();
+                                if (s_win_player.enough(3)) {
+                                    sg_player_new.x = s_win_player.cx();
+                                    sg_player_new.y = s_win_player.cy();
+                                }
+                            }
+                        }
 
+                        // **预测（coasting）**：角色被墙盖住时，相机确实看不见它
+                        // （实测动态跑里 42% 的帧没有角色）。物理上"看不见"不等于
+                        // "不存在"——平台只需要知道自己大概在哪、往哪走。所以用
+                        // 最后几次有效观测估速度，短时间外推（≤300 ms），并把来源
+                        // 标成 `ps_pred` 以便审计；超过 300 ms 一律不再外推（stay）。
+                        struct PlayerPred {
+                            double x = 0, y = 0, vx = 0, vy = 0;
+                            uint64_t t_ns = 0;
+                            bool have = false;
+                        };
+                        static PlayerPred s_pred;
+                        if (sg_player_new.found && sg_player_new.why != std::string("pred")) {
+                            if (s_pred.have && stamp_ns > s_pred.t_ns) {
+                                const double dt = static_cast<double>(stamp_ns - s_pred.t_ns) * 1e-9;
+                                if (dt > 0.001 && dt < 0.6) {
+                                    const double nvx = (sg_player_new.x - s_pred.x) / dt;
+                                    const double nvy = (sg_player_new.y - s_pred.y) / dt;
+                                    s_pred.vx = 0.5 * s_pred.vx + 0.5 * nvx;
+                                    s_pred.vy = 0.5 * s_pred.vy + 0.5 * nvy;
+                                }
+                            }
+                            s_pred.x = sg_player_new.x;
+                            s_pred.y = sg_player_new.y;
+                            s_pred.t_ns = stamp_ns;
+                            s_pred.have = true;
+                            s_prev_player = sg_player_new;
+                            // ⚠ 试过对角色位置做 α-β 轨迹滤波（+离群闸）：实测
+                            //   ≤20 场地单位的比例反而从 19% 降到 14% —— 说明这点抖动
+                            //   不是"白噪声"，而是**偶发的错块**（跳到墙/网格线上）。
+                            //   滤波对偶发错块无效，只会把正确值一起拖慢，故不保留。
+                            //   真正的解法是"错块识别"（形状/上下文），见文档 §7 的下一步。
+                            s_prev_player = sg_player_new;
+                        } else if (!args.no_player_pred && s_pred.have && stamp_ns > s_pred.t_ns) {
+                            const double age = static_cast<double>(stamp_ns - s_pred.t_ns) * 1e-9;
+                            if (age <= 0.30) {
+                                sg_player_new.found = true;
+                                sg_player_new.why = "pred";
+                                sg_player_new.x = s_pred.x + s_pred.vx * age;
+                                sg_player_new.y = s_pred.y + s_pred.vy * age;
+                                sg_player_new.conf = 1.0 - age / 0.30;
+                            }
+                        }
+                        // ⚠ **决策用的 `sg_player` 必须吃下全部三个来源**（全局/局部/预测）。
+                        //   之前只写了全局结果 `pl`，局部精修与预测只落在 `sg_player_new`
+                        //   （诊断用）→ "角色被墙盖住时靠预测继续走"根本没进决策。
+                        if (sg_player_new.found) {
+                            sg_player.found = true;
+                            sg_player.x = sg_player_new.x;
+                            sg_player.y = sg_player_new.y;
+                            sg_player.w = sg_player_new.w;
+                            sg_player.h = sg_player_new.h;
+                            sg_player.fill = sg_player_new.fill;
+                        }
+                    } else {
+                        sg_ext.ok = false;
+                    }
                 }
             }
-            }
+            }   // 收掉"无比例尺时的 ROI 角色跟踪"那个 else 分支
             // **性能**：`find_all` 会在 ±10° 里搜 25 个角度（每个角度都要重扫整幅图），
             // 实测是整帧耗时的大头（板子上 ~390 ms/帧）。有了四角标记的单应之后，
             // 旋转/透视都在**坐标变换**里被吃掉了，行带检测不需要再搜角度。
@@ -1470,7 +2050,37 @@ int main(int argc, char** argv) {
             // 2~3 个，若这类帧回退到 25 角度搜索，帧率会周期性掉到 1 帧/秒。
             static bool have_h_ever = false;
             if (sg_h.ok) have_h_ever = true;
-            if (sg_h.ok || have_h_ever) {
+            const auto t_door0 = std::chrono::steady_clock::now();
+            if (!args.legacy_gap) {
+                // **已验证的检测器**：`wall_gap::find_walls`。
+                // 它的做法是"按行找亮像素多的行 → 聚成行带 → 行带内按列统计亮行数 →
+                // 连续不亮的内部区间就是缺口"，每道墙**只给一扇门**。
+                // 实测（静态语料）缺口中心误差 **1 px**、0.6 ms/帧；而旧的
+                // `band_gap::find_at` 每条墙带吐 27~153 个候选、90% snr=0，
+                // 靠启发式挑一个 —— 实测碰撞前一刻缺口误差中位 **147 场地单位**。
+                wall_gap::Params wp2;
+                wp2.min_gap_px = std::min(sg_min_gap_px > 0 ? sg_min_gap_px : 8, 24);
+                // 复用角色检测那一步已经算好的墙（省一次 ~0.5 ms，也保证两者一致）
+                const std::vector<wall_gap::Wall>& walls =
+                    sg_walls.empty() ? (sg_walls = wall_gap::find_walls(rgb.data(), pw, ph, wp2))
+                                     : sg_walls;
+                sg_doors.clear();
+                for (const wall_gap::Wall& w : walls) {
+                    if (!w.has_gap) continue;
+                    band_gap::Door d;
+                    d.found = true;
+                    d.y0 = w.y0; d.y1 = w.y1;
+                    d.x0 = w.gap_x0; d.x1 = w.gap_x1;
+                    d.cx = static_cast<int>(std::lround(w.gap_cx));
+                    d.width = w.gap_w;
+                    d.support = static_cast<float>(w.bright_frac);   // 诊断用
+                    d.snr = static_cast<float>(w.bright_frac * 10.0);
+                    // 可通过性：用契约算出来的最小缺口宽度（`sg_min_gap_px`）过滤，
+                    // 与旧路径同一口径，避免"看着有缺口但其实过不去"。
+                    if (sg_min_gap_px > 0 && d.width < sg_min_gap_px) continue;
+                    sg_doors.push_back(d);
+                }
+            } else if (sg_h.ok || have_h_ever) {
                 std::vector<band_gap::Door> all;
                 band_gap::find_at(rgb.data(), pw, ph, 0.0, 6, 40, 6, 5.0f, &all,
                                   sg_min_gap_px);
@@ -1479,6 +2089,15 @@ int main(int argc, char** argv) {
                 sg_doors = band_gap::find_all(rgb.data(), pw, ph, 6, 40, 6, 5.0f, 10.0f, 2.5f,
                                               sg_min_gap_px);
             }
+            ms_doors = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_door0).count();
+            // **门候选去重**：`find_at` 会把每条墙带上的所有可能缺口都当候选输出
+            // （实测 1 帧 94 个），而 `decide` 会把每一扇都注入规划器 —— 同一道墙被叠
+            // 十几遍，规划器看到的墙"糊成一片"。这里按"行带重叠 + 缺口中心接近"合并。
+            const size_t n_raw_doors = sg_doors.size();
+            if (!sg_doors.empty()) sg_doors = wall_gap::dedup_doors(sg_doors);
+            sg_doors_raw = n_raw_doors;
+
             // 场地范围要在**去剪切**的坐标系里量：先由角度搜索定角，再用同一个角
             // 重新量一次边界。顺序不能反（先量框会把旋转的信息烧掉，实测偏 150 单位）。
             {
@@ -1492,6 +2111,8 @@ int main(int argc, char** argv) {
                     sg_ext = band_gap::field_extent(rgb.data(), pw, ph, args.field_w,
                                                     args.field_h, 5.0, 3,
                                                     args.image_squash, ta);
+                    // 同 P1：这里只是"按角度再量一次"的参考值，没有资格单独判定有效
+                    sg_ext.ok = false;
                 }
             }
 
@@ -1527,6 +2148,30 @@ int main(int argc, char** argv) {
                     sg_doors.push_back(d);
                 }
                 if (!sg_doors.empty()) ++n_model_frames;
+            }
+            // **最终去重 + 上限**（必须在世界模型之后再做一次）：
+            // 上面那次去重只作用于"本帧检测到的"候选；世界模型外推会把**每条轨迹**
+            // 都吐成一扇门，轨迹测多了就会一次注入几十扇（实测 p50 24、最大 53，
+            // 每一扇都被当成一段墙塞给规划器 → 墙糊成一片）。
+            // 这里按"行带 + 缺口中心"再去重一次，并限制注入数量（按缺口宽度排序取前 N）。
+            {
+                const size_t before = sg_doors.size();
+                // 先把"同一道墙上的多条候选"收敛成一扇门（契约：一道墙只有一个缺口），
+                // 再按 (行带, 缺口中心) 去重，最后限上限。
+                // 上一帧选中的缺口中心（像素）：用来在同一条墙带的多个候选里
+                // 保持跨帧一致（见 `one_gap_per_band` 的注释）。
+                static double s_prev_gap_cx = -1e9;
+                if (!sg_doors.empty()) sg_doors = wall_gap::one_gap_per_band(sg_doors, s_prev_gap_cx);
+                if (!sg_doors.empty()) s_prev_gap_cx = sg_doors.front().cx;
+                if (!sg_doors.empty()) sg_doors = wall_gap::dedup_doors(sg_doors);
+                if (sg_doors.size() > 6) {
+                    std::sort(sg_doors.begin(), sg_doors.end(),
+                              [](const band_gap::Door& a, const band_gap::Door& b) {
+                                  return a.width > b.width;
+                              });
+                    sg_doors.resize(6);
+                }
+                sg_doors_raw = before;
             }
             // 日志/回退用：仍然报"最宽的那扇门"
             for (const band_gap::Door& d : sg_doors)
@@ -1603,7 +2248,7 @@ int main(int argc, char** argv) {
                     std::printf("  ✓ 帧 %d：PL 与 PS 黄金模型逐字节相同（%zu 字节）\n",
                                 i, bytes.size());
             }
-        } else if (drv && (src || pump)) {
+        } else if (drv && (src || pump) && !args.no_pl) {
             try {
                 bytes = drv->run_frame_push(rgb.data(), rgb.size(),
                                             static_cast<uint32_t>(i), stamp_ns,
@@ -1650,7 +2295,16 @@ int main(int argc, char** argv) {
                         rd, tm.push_ms, tm.wait_ms, total);
         }
         try {
-            const GeometryFrame frame = parse_geometry_frame(bytes);
+            // `--no-pl` 时没有几何帧：合成一个"只有时间戳"的空帧。
+            // 下游 `decide` 只用它的 `stamp_ns`（dt）和 `player`（RTL 角色），
+            // 后者在没有 PL 时本来就没有 —— 于是 PS 侧几何成为唯一来源。
+            GeometryFrame frame;
+            if (!bytes.empty()) {
+                frame = parse_geometry_frame(bytes);
+            } else {
+                frame.header.stamp_ns = stamp_ns;
+                frame.player.present = false;
+            }
             const FrameHeader& h = frame.header;
             ++ok;
             std::printf("帧 %4d: seq=%u  长度=%zu B  障碍=%u  缺口=%u  "
@@ -1681,15 +2335,197 @@ int main(int argc, char** argv) {
                                 sg_h.ok ? 1 : 0);
                 }
             }
+            FrameLat lat;
+            // 只有实时采集（stdin 读线程）才有"真实的取帧时刻"；PPM 回放那条路上
+            // stamp 是合成的，量出来的差值没有意义，所以置 0 让打印自己跳过。
+            lat.got_ns = pump
+                ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      t_got.time_since_epoch()).count())
+                : 0;
+            lat.queued = q_before;
+            lat.dropped = pump ? pump->dropped() : 0L;
             const gap_avoid::Vec2 cmd =
-                decide(frame, args, st, &sg_doors, &sg_ext, &sg_player, &sg_h);
-            const int action = vision_board::action_from_velocity(
+                decide(frame, args, st, &sg_doors, &sg_ext, &sg_player, &sg_h, lat);
+            int action = vision_board::action_from_velocity(
                 cmd.x, cmd.y, args.action_deadzone);
+            // ---- 开场标定：窗口内旁路决策，发已知动作序列 --------------------
+            // `cal_t` 是**标定窗口内的秒数**（-1 = 不在标定窗口）。它进诊断日志，
+            // 于是分析脚本能直接按"指令段"切样本：每段位移/时间 = 速度，
+            // 段起点到位移起点的滞后 = 指令延迟。
+            double cal_t = -1.0;
+            int cal_step = -1;
+            if (args.cal_seconds > 0.0) {
+                // **等角色被看见再开始标定**：计划要不要回中、往哪个方向回，
+                // 取决于角色现在在哪。用"第一帧"当起点会踩坑：第一帧往往还没有
+                // 可信几何（标记/单应要几帧才稳），于是拿不到位置 → 不回中 →
+                // 出生点靠下时"向下"那一段直接撞边界，量出来的速度就是假的
+                // （实测出现过初始位置 (0,0)、速度 119 单位/秒、段间差 148）。
+                // 所以：等到"四标记 + 角色"都有，或者等够 5 s（相机被挡的兜底）。
+                if (!cal_started) {
+                    bool have_pos = sg_player.found && sg_h.ok;
+                    const double waited = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    if (!have_pos && waited < 5.0) {
+                        // 还没就绪：这一帧什么都不发（保持 stay），窗口也还没开始计时
+                        action = 0;
+                        if (args.echo_action) std::printf("        动作: 0 (标定等待几何)\n");
+                        kb.emit(action, args.verbose);
+                        continue;
+                    }
+                    cal_started = true;
+                    t_cal0 = std::chrono::steady_clock::now();
+                    double px_u = 0.0, py_u = 0.0;
+                    if (have_pos) {
+                        const auto q = sg_h.apply(sg_player.x, sg_player.y);
+                        px_u = q[0];
+                        py_u = q[1];
+                    }
+                    cal_plan = calib::build(px_u, py_u, have_pos, args.field_w, args.field_h);
+                    std::printf("标定窗口: %.1f s（决策旁路；前缀 %.1f s"
+                                "（静止采样 + 回中），脉冲一轮 %.1f s）\n",
+                                args.cal_seconds, cal_plan.prefix_s, cal_plan.pulse_s);
+                    if (!have_pos) {
+                        std::printf("  ⚠ 首帧没看到角色：跳过回中，只跑八个方向的脉冲"
+                                    "（若出生点靠边，向下/向右那几段可能撞边界）\n");
+                    }
+                }
+                cal_t = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_cal0).count();
+                if (cal_t < args.cal_seconds) {
+                    const calib::Point cp = calib::at(cal_plan, cal_t);
+                    action = cp.action;
+                    cal_step = cp.step;
+                    ++n_cal_frames;
+                } else {
+                    cal_t = -1.0;   // 窗口结束：后面全是决策层，日志里一眼能分开
+                }
+            }
             if (args.echo_action) {
-                std::printf("        动作: %d (%s)\n", action,
-                            vision_board::action_name(action));
+                std::printf("        动作: %d (%s)%s\n", action,
+                            vision_board::action_name(action),
+                            cal_step >= 0 ? "  [标定]" : "");
             }
             kb.emit(action, args.verbose);
+            if (diag_f) {
+                // 每帧一条：字段固定，方便直接喂给对账脚本（见 docs §4）
+                const uint64_t t_now_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+                // **共享时基**：板子和仿真机都用 CLOCK_REALTIME（NTP 同源），
+                // 记下时间戳就能直接对齐，不必再用"速度序列互相关"这种间接办法
+                // （实测位置对齐残差 197 场地单位、速度对齐在长段恒定动作上会给出
+                //   多个几乎同样好的偏移）。
+                const double host_t = (args.host_epoch > 0.0)
+                    ? args.host_epoch + std::chrono::duration<double>(
+                          std::chrono::steady_clock::now() - t_proc0).count()
+                    : 0.0;
+                // **帧交付时刻**（像素真正交到手上的那一刻）的墙钟。
+                // 为什么单独记：`host_t` 是"处理完"的时刻，比交付时刻晚一个处理周期
+                // （实测 ~65 ms）。在线平台以 200 场地单位/秒往复运动，这 65 ms 就是
+                // 13 单位的假误差，而延迟抖动会把它放大到几十单位 —— 这正是在线
+                // 数字比离线（按交付时刻配对）差一大截的原因。
+                const double host_t_got = (args.host_epoch > 0.0)
+                    ? args.host_epoch + std::chrono::duration<double>(t_got - t_proc0).count()
+                    : 0.0;
+                const auto unix_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count());
+                const double lat_age_ms =
+                    (lat.got_ns > frame.header.stamp_ns)
+                        ? (lat.got_ns - frame.header.stamp_ns) * 1e-6 : 0.0;
+                const double lat_proc_ms =
+                    (lat.got_ns != 0 && t_now_ns > lat.got_ns)
+                        ? (t_now_ns - lat.got_ns) * 1e-6 : 0.0;
+                // 分段耗时：读像素（含等采集）/ 推 PL / 等流水线 —— 和 `--timing` 同一口径，
+                // 但每帧都落盘，才能算 p50/p95/p99 而不是只有平均值。
+                const auto t_frame0_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        t_frame0.time_since_epoch()).count());
+                const double ms_read = (lat.got_ns > t_frame0_ns)
+                    ? (lat.got_ns - t_frame0_ns) * 1e-6 : 0.0;
+                const auto tm_now = drv ? drv->last_timing() : VisionDriver::FrameTiming{};
+                // **场地单位**的角色/缺口坐标（诊断专用）。
+                // 为什么必须单独记：`player_xy` 是图像像素，`truth.jsonl` 是场地单位，
+                // 两者不能直接对账（第一次做对齐时残差 449 单位，等于没对齐）。
+                double player_fx = 0, player_fy = 0;
+                bool have_pf = false;
+                if (sg_player.found && sg_h.ok) {
+                    const auto q = sg_h.apply(sg_player.x, sg_player.y);
+                    player_fx = q[0];
+                    player_fy = q[1];
+                    have_pf = true;
+                }
+                double gap_units = 0, wall_y_units = 0;
+                // ⚠ 必须用**决策实际选中的那扇门**，不能用 `front()`。
+                //   `sg_doors` 是按 y0 升序排的，front 是**画面最上面**那道墙（也就是
+                //   场地里**最远**的那道），而决策选的是"角色前方最近"的那道。
+                //   用 front 记日志会让对账把"板子瞄的缺口"和"真值里另一道墙的缺口"
+                //   比较 —— 实测因此得出"缺口误差 230~523 单位"的假结论。
+                const band_gap::Door* dsel = (!sg_doors.empty() && sg_h.ok)
+                    ? ((st.selected_door >= 0 && st.selected_door < static_cast<int>(sg_doors.size()))
+                           ? &sg_doors[static_cast<size_t>(st.selected_door)]
+                           : &sg_doors.front())
+                    : nullptr;
+                if (dsel != nullptr) {
+                    const band_gap::Door& d0 = *dsel;
+                    const auto q0 = sg_h.apply(0.5 * (d0.x0 + d0.x1),
+                                               0.5 * (d0.y0 + d0.y1));
+                    gap_units = q0[0];
+                    wall_y_units = q0[1];
+                }
+                const char* src = sg_ext.ok ? "markers" : (sg_h.ok ? "rejected" : "none");
+                // 角色来源必须分开记：PS 结构检测（`find_player`）和 RTL 几何帧里的
+                // 角色**是两条路**，一个坏了另一个可能还在用。混在一起会让诊断日志说
+                // "no_player"而板子其实正在按 RTL 的角色走 —— 实测就踩过（71/101 帧
+                // 动作非 0，却被标成"没角色"）。
+                const bool ps_player = sg_player.found && !sg_doors.empty();
+                const bool rtl_player = frame.player.present;
+                const char* player_src = sg_player_new.found
+                    ? (std::string(sg_player_new.why) == "pred" ? "ps_pred" : "ps_new")
+                    : (ps_player ? "ps_old" : (rtl_player ? "rtl" : "none"));
+                const char* stop_reason = !sg_ext.ok ? "no_field"
+                    : (sg_doors.empty() ? "no_wall"
+                       : ((!ps_player && !rtl_player) ? "no_player" : "none"));
+                std::fprintf(diag_f,
+                    "{\"frame\":%d,\"t_ns\":%llu,\"unix_ms\":%llu,\"host_t\":%.3f,\"host_t_got\":%.3f,"
+                    "\"frame_age_ms\":%.1f,"
+                    "\"field_valid\":%s,\"field_src\":\"%s\",\"geo_why\":\"%s\","
+                    "\"geo_age_ms\":%.1f,\"markers\":%zu,\"walls_raw\":%zu,"
+                    "\"scale\":[%.4f,%.4f],\"player_valid\":%s,\"player_src\":\"%s\","
+                    "\"player_xy\":[%.1f,%.1f],"
+                    "\"player_px\":[%d,%d],\"player_field\":[%.1f,%.1f],"
+                    "\"player_field_valid\":%s,\"player_unc\":%.1f,\"gap_units\":%.1f,\"wall_y_units\":%.1f,\"tier\":\"%s\",\"walls\":[",
+                    i, static_cast<unsigned long long>(frame.header.stamp_ns),
+                    static_cast<unsigned long long>(unix_ns / 1000000ull), host_t,
+                    host_t_got, lat_age_ms,
+                    sg_ext.ok ? "true" : "false", src, sg_geo_why, sg_geo_age_ms,
+                    sg_marker_count, sg_doors_raw,
+                    sg_ext.scale_x, sg_ext.scale_y,
+                    sg_player.found ? "true" : "false", player_src, sg_player.x, sg_player.y,
+                    sg_player.w, sg_player.h, player_fx, player_fy,
+                    have_pf ? "true" : "false", sg_player_unc, gap_units, wall_y_units, st.last_tier);
+                for (size_t wi = 0; wi < sg_doors.size(); ++wi) {
+                    const band_gap::Door& d = sg_doors[wi];
+                    std::fprintf(diag_f,
+                                 "%s{\"y0\":%d,\"y1\":%d,\"gap_x0\":%d,\"gap_x1\":%d,"
+                                 "\"gap_cx\":%d,\"gap_w\":%d,\"snr\":%.1f}",
+                                 wi ? "," : "", d.y0, d.y1, d.x0, d.x1, d.cx, d.width,
+                                 static_cast<double>(d.snr));
+                }
+                std::fprintf(diag_f,
+                    "],\"selected_wall\":%d,\"gap_center\":%d,"
+                    "\"select_reason\":\"%s\",\"decision\":[%.2f,%.2f],\"action\":%d,"
+                    "\"cal\":%.3f,\"cal_step\":%d,"
+                    "\"stop_reason\":\"%s\","
+                    "\"ms\":{\"read\":%.1f,\"push\":%.1f,\"wait\":%.1f,"
+                    "\"decide\":%.1f,\"markers\":%.1f,\"doors\":%.1f,\"player\":%.1f,"
+                    "\"extent\":%.1f}}\n",
+                    st.selected_door, sg_doors.empty() ? 0 : sg_doors.front().cx,
+                    st.select_reason, cmd.x, cmd.y, action, cal_t, cal_step, stop_reason,
+                    ms_read, tm_now.push_ms, tm_now.wait_ms, lat_proc_ms,
+                    ms_markers, ms_doors, ms_player, ms_extent);
+                std::fflush(diag_f);
+            }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "帧 %d 解码失败：%s\n", i, e.what());
             ++bad;
@@ -1703,6 +2539,7 @@ int main(int argc, char** argv) {
         stamp_ns += static_cast<uint64_t>(1e9 / args.ppm_fps + 0.5);
     }
 
+    if (diag_f) { std::fclose(diag_f); diag_f = nullptr; }
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
     std::printf("----\n成功 %d 帧，失败 %d 帧，用时 %lld ms", ok, bad,

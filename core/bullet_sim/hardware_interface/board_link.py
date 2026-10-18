@@ -190,6 +190,11 @@ class BoardInputAdapter(HardwareInputAdapter):
         self.n_actions = 0          # 累计收到的动作行
         self.n_dropped = 0          # 解析阶段静默丢弃的行（诊断用）
         self.n_holds = 0            # 看门狗回中次数
+        #: 队列最多留几条待执行动作。**2** 足够让"一次读到两行"的顺序保持住
+        #: （测试 `test_stdin_transport_maps_move_to_action` 就是这个口径），
+        #: 又能把积压压掉：实测积压上百行时指令会晚 4~8 秒才生效。
+        self.queue_cap = 2
+        self.n_stale_dropped = 0    # 因积压被丢掉的过期动作行
 
     # -- 子类实现 ---------------------------------------------------------
     def _open_transport(self) -> None:      # pragma: no cover - 子类覆盖
@@ -232,6 +237,17 @@ class BoardInputAdapter(HardwareInputAdapter):
                 self.n_actions += len(got)
                 self._pending.extend(got)
                 self._last_line_t = time.monotonic()
+                # ⚠ **过期动作要丢**：板子每帧发一行，仿真每渲染帧才取一行
+                #   （`cli.py` 的 `source.poll(frame_dt)`）。两边帧率不一致时，
+                #   队列会慢慢积压：仿真正在启动的那 10 秒里板子就发出上百行，
+                #   之后仿真按顺序一行行"重放"这些**几秒前**的指令 ——
+                #   实测（`boot_cal`）指令生效比板子发出晚 **4~8 秒**，
+                #   而且滞后随时间缓慢缩小，看起来像"板子的决策慢"，其实是重放。
+                #   控制回路只需要**最新**指令；把队列压到 2 条，最多落后两帧。
+                if len(self._pending) > self.queue_cap:
+                    drop = len(self._pending) - self.queue_cap
+                    del self._pending[:drop]
+                    self.n_stale_dropped += drop
         if not self._pending:
             return None
         return self._pending.pop(0)
@@ -289,8 +305,9 @@ class BoardInputAdapter(HardwareInputAdapter):
         d = self._last_action.direction
         who = "stay" if (d[0] == 0.0 and d[1] == 0.0) else f"({d[0]:+.2f},{d[1]:+.2f})"
         tag = "  ⚠断流中" if age > self.hold_s else ""
+        stale = f"  丢过期 {self.n_stale_dropped}" if self.n_stale_dropped else ""
         return (f"board     : {self.n_actions} 行  最后 {who}  {age:.2f}s 前"
-                f"  回中 {self.n_holds} 次{tag}")
+                f"  回中 {self.n_holds} 次{stale}{tag}")
 
     def describe(self) -> dict[str, Any]:
         data = super().describe()

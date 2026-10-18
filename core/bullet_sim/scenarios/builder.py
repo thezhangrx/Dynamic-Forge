@@ -315,6 +315,35 @@ def cycle_spec(
     return spec.replaced(patterns=patterns, meta=meta)
 
 
+def delay_patterns(patterns: Sequence[PatternSpec], seconds: float) -> list[PatternSpec]:
+    """把每个障碍的进场时间整体推后 ``seconds`` 秒（**标定窗口**）。
+
+    用途：板子/视觉在开场需要一段"场上什么都没有"的时间来做三件事：
+
+    1. 认出场地四角、把单应矩阵定下来（有墙压着角点时会误判）；
+    2. 观察角色**静止时的位置**（取稳健均值当初始位置，不靠单帧）；
+    3. 让角色按已知指令**走一圈**，用"位移 / 时间"标定**平台速度**和
+       **指令→动作的延迟**（这两个量不标出来，虚拟真值就只能拍脑袋）。
+
+    语义上只改 ``start_time``，不动数量、速度、间隔和持续时间，
+    所以标定窗口之后看到的场景与不加这个参数时**完全一致**。
+    """
+    shift = float(seconds)
+    if shift <= 0.0 or not patterns:
+        return list(patterns)
+    return [p.replaced(start_time=float(p.start_time) + shift) for p in patterns]
+
+
+def delay_spec(spec: ScenarioSpec, seconds: float) -> ScenarioSpec:
+    """Apply :func:`delay_patterns` to a scenario and record the shift."""
+    shift = float(seconds)
+    if shift <= 0.0:
+        return spec
+    meta = dict(spec.meta)
+    meta["obstacle_delay_s"] = shift
+    return spec.replaced(patterns=delay_patterns(spec.patterns, shift), meta=meta)
+
+
 # --------------------------------------------------------------------------
 # complexity -> scenario
 # --------------------------------------------------------------------------

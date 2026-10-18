@@ -55,8 +55,13 @@ class BulletHellEnv:
         hash_steps: bool = False,
         compact_every: int = 0,
         renderer: Any = None,
+        #: 碰撞/间距逐帧日志（JSONL）。给验收判据「120 s 内 0 碰撞」提供**独立**证据：
+        #: 碰撞由仿真物理算，不由板子/视觉算 —— 真值不能来自被测对象。
+        collision_log: str | None = None,
         **world_kwargs: Any,
     ) -> None:
+        self._collision_log = open(collision_log, "w", encoding="utf-8") if collision_log else None
+        self._collision_steps = 0
         self.world = World(
             scenario,
             seed=seed,
@@ -157,6 +162,20 @@ class BulletHellEnv:
         obs["collision"] = bool(result.info["collision_active"])
         obs["collision_event"] = bool(result.info["collision_event"])
         obs["collision_count"] = int(result.info["collision_count"])
+        if self._collision_log is not None:
+            import json as _json
+            self._collision_steps += 1
+            _i = result.info
+            _clr = _i.get("clearance", None)
+            self._collision_log.write(_json.dumps({
+                "step": self._collision_steps,
+                "t": round(float(_i.get("sim_time", self._collision_steps / 60.0)), 4),
+                "clearance": (None if _clr is None else round(float(_clr), 3)),
+                "risk": round(float(_i.get("risk", 0.0)), 3),
+                "collision": bool(_i.get("collision_active", False)),
+                "collision_event": bool(_i.get("collision_event", False)),
+                "collision_count": int(_i.get("collision_count", 0)),
+            }) + "\n")
         self._last_obs, self._last_info = obs, result.info
         return obs, result.reward, result.terminated, result.truncated, result.info
 
@@ -374,6 +393,11 @@ class BulletHellEnv:
         if self._renderer is not None and hasattr(self._renderer, "close"):
             self._renderer.close()
         self._renderer = None
+        if self._collision_log is not None:
+            try:
+                self._collision_log.close()
+            finally:
+                self._collision_log = None
         self.world.close()
         self._closed = True
 

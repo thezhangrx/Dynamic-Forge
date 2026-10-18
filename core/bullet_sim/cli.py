@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -226,6 +227,9 @@ def _add_play_args(p: argparse.ArgumentParser, *, input_default: str = "manual")
         help="**仿真真值日志**（每帧一行 JSON：角色与所有障碍的世界坐标）。"
              "配合 core/board/tools/score_vs_sim.py，把板子报的几何与真值按场地单位对账",
     )
+    p.add_argument("--collision-log", default=None, metavar="FILE",
+                   help="逐帧碰撞/间距日志（JSONL）。为「120 s 内 0 碰撞」提供**独立**证据："
+                        "碰撞由仿真物理计算，不来自视觉/板子")
     p.add_argument("--fullscreen", action="store_true",
                    help="全屏显示场地（调试视觉时建议开：场地就是整个屏幕，"
                         "窗口外的桌面内容不会再被当成目标）")
@@ -360,6 +364,13 @@ def _add_obstacle_args(p: argparse.ArgumentParser) -> None:
              "墙缺口 → 移动块 → 小障碍 → 交叉 → 走廊。0 = 关（默认）。"
              "给了它就接管 `--stage-seconds`（分批是「叠加」，轮播是「独占」）",
     )
+    p.add_argument(
+        "--obstacle-delay", type=float, default=0.0, metavar="S",
+        help="**标定窗口**：开场 S 秒**场上不放任何障碍**（第一个障碍的进场时间整体"
+             "推后 S 秒，数量/速度/间隔都不变）。这段时间给视觉/平台做三件事："
+             "定四角→单应、看静止位置取稳健均值、按已知指令走一圈标定"
+             "**平台速度**和**指令→动作延迟**。0 = 关（默认）",
+    )
     p.add_argument("--obstacle-count", type=int, default=None,
                    help="obstacles emitted per interval by the chosen type(s)")
     p.add_argument("--obstacle-speed", type=float, default=None,
@@ -483,6 +494,8 @@ def _spec_from_args(args: argparse.Namespace):
 
     cycle = float(getattr(args, "obstacle_cycle", 0.0) or 0.0)
     stage = 0.0 if cycle > 0.0 else float(getattr(args, "stage_seconds", None) or 0.0)
+    #: 标定窗口：把第一个障碍的进场时间整体推后，开场 N 秒场上什么都没有。
+    obstacle_delay = float(getattr(args, "obstacle_delay", 0.0) or 0.0)
     order = list(getattr(args, "obstacle_type", None) or []) or None
     board_mode = _is_board_mode(args)
     if board_mode:
@@ -540,6 +553,9 @@ def _spec_from_args(args: argparse.Namespace):
                 f"板子控制平台时只能有一种障碍类型，这个场景有 {len(present)} 种"
                 f"（{', '.join(present) or '无'}）：换个场景文件，或显式"
                 " `--obstacle-type <一种>`；要看多种障碍用 `play`。")
+    if obstacle_delay > 0.0:
+        from bullet_sim.scenarios.builder import delay_spec
+        spec = delay_spec(spec, obstacle_delay)
     return spec
 
 
@@ -908,6 +924,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     env = BulletHellEnv(
         spec, seed=args.seed, collision=args.collision,
         codec=args.action_space or "action",
+        collision_log=getattr(args, "collision_log", None),
         **_collision_kwargs(args, spec),
     )
     # 「一直跑」的无窗口路径也要能被干净停掉：不装处理函数的话 SIGTERM 是硬杀，
@@ -1187,6 +1204,7 @@ def cmd_play(args: argparse.Namespace) -> int:
     env = BulletHellEnv(
         spec, seed=args.seed, collision=args.collision,
         codec=args.action_space or "action",
+        collision_log=getattr(args, "collision_log", None),
         **_collision_kwargs(args, spec),
     )
 
@@ -1446,6 +1464,10 @@ def cmd_play(args: argparse.Namespace) -> int:
                     "player": [float(_pl[0]), float(_pl[1]), float(_pl[4])],
                     # 仿真**实际执行**的动作（离散码）——用来区分"指令没到"和
                     # "指令到了但没执行"，这是判断延迟/断流的关键字段
+                    # **墙钟时刻**：仿真里的 `t` 是"步数×dt"的**仿真时间**，负载高时
+                    # 它会比真实时间慢（实测 78 s 仿真 ≈ 102 s 真实）。做"视觉↔真值"
+                    # 对账必须用墙钟，否则会漂几十秒，看起来像算法偏了几百个场地单位。
+                    "unix": time.time(),
                     "applied": [float(last_action.direction[0]) * float(last_action.magnitude),
                                 float(last_action.direction[1]) * float(last_action.magnitude)]
                     if hasattr(last_action, "direction") else None,

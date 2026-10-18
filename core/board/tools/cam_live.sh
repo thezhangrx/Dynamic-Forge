@@ -140,10 +140,31 @@ fi
 #       有角色的帧  117 104  77 120 ~120  92 120
 #   所以默认取 70（唯一能让墙稳定出现的一档）；**这只是权宜**：真正该做的是在 PS 侧
 #   做一次像素预调理（提色度 + 压高光）再推给 PL，让墙不再靠曝光"刚好"过阈值。
-CAM_SATURATION=${CAM_SATURATION:-100}
+# ⚠ 2026-10-18 实测（`camera_bench.py` 全屏灰 128 标板 + `camera_sweep.sh`，逐项隔离）：
+#
+#     saturation   sharpness   σ_L(亮度噪点)   σ_色(彩色噪点)   SNR
+#        100           2          26.8           21.3          3.1     ← 之前
+#         60           0          12.6            4.3          7.0     ← 现在
+#
+#   `-c saturation=100` 是我们自己开的：它把色度通道的噪声一起放大 5 倍，
+#   画面里"到处是紫绿斑点"主要是它 + 锐化，**不是传感器噪声**（同一块平坦灰面上
+#   逐像素 σ 只有 6 个灰阶，同一点跨帧的时间 σ 小于 1）。锐化 2 再把亮度噪点翻倍。
+#   所以这两个都调回去：saturation 60、sharpness 0。SNR 从 3 提到 7，
+#   "墙/角色与场地的反差只有两三倍噪声"这个前提才算破掉。
+#
+#   顺带记两个改不动的（试过，别再试）：
+#     · `power_line_frequency=2`（60Hz）→ 整幅变成全黑（实测灰 128 的标板拍出来是 2）。
+#       只能留在 1（50Hz）。
+#     · 手动曝光（`exposure_auto=1` + 100…2500）→ 全部过曝到 202，这颗 sensor 上是坏的。
+#     · 自动曝光在**第 3~4 帧**会往上跳一档（实测标板灰 128 → 129 然后 197，之后稳定）。
+#       所以"前几帧好用、后面变花"不是错觉；`SKIP` 热身帧丢的是**跳变之前**的好帧，
+#       需要的话用 `SKIP=0` 对比，但稳态那一档才是长期行为。
+CAM_SATURATION=${CAM_SATURATION:-60}
 CAM_BRIGHTNESS=${CAM_BRIGHTNESS:-70}
-v4l2-ctl -d "$DEV" -c saturation=$CAM_SATURATION -c brightness=$CAM_BRIGHTNESS >/dev/null 2>&1 \
-    && echo "[cam_live] 颜色: saturation=$CAM_SATURATION brightness=$CAM_BRIGHTNESS（拍屏幕时必需，见脚本注释）"
+CAM_SHARPNESS=${CAM_SHARPNESS:-0}
+v4l2-ctl -d "$DEV" -c saturation=$CAM_SATURATION -c brightness=$CAM_BRIGHTNESS \
+    -c sharpness=$CAM_SHARPNESS >/dev/null 2>&1 \
+    && echo "[cam_live] 颜色: saturation=$CAM_SATURATION brightness=$CAM_BRIGHTNESS sharpness=$CAM_SHARPNESS（拍屏幕时必需，见脚本注释）"
 
 # ---- 3) 一次开设备、连续出帧、原始 RGB 走管道 → 板子程序 -------------------
 if [ "$CAM_MODE" = "mjpg" ]; then
@@ -177,17 +198,38 @@ if [ "${CAM_CROP:-0}" = "1" ] && [ "$CAM_W" -eq "$PIPE_W" ] && [ "$CAM_H" -gt "$
 else
     VF="scale=${PIPE_W}:${PIPE_H}"
 fi
-echo "[cam_live] $DEV ${CAM_W}x${CAM_H} $IN_FMT -vf $VF → RGB → $APP $*"
-ffmpeg -hide_banner -loglevel error \
-       -f v4l2 -input_format "$IN_FMT" -video_size "${CAM_W}x${CAM_H}" -i "$DEV" \
-       -vf "$VF" -pix_fmt rgb24 -f rawvideo - \
+# ---- 采集方式：低延迟（默认）或老的"ffmpeg 直接开设备" ------------------
+# 实测（`v4l2_latency`，处理 80ms/帧时）：ffmpeg 用驱动默认队列（8 buffer）→
+# **采集→出队 p50 587 ms**；2 buffer → 122 ms。我们 13 帧/秒的处理速度让队列永远是满的，
+# 所以 ffmpeg 交出来的永远是最老那一帧 —— 端到端滞后 ~0.5 s 就是这么来的。
+# `CAP=lowlat` 改成"自己开设备、只取最新帧"，其余不变（仍由 ffmpeg 解码 + 缩放）。
+CAP=${CAP:-lowlat}
+echo "[cam_live] $DEV ${CAM_W}x${CAM_H} $IN_FMT CAP=$CAP -vf $VF → RGB → $APP $*"
+# 采集器封成函数：低延迟那条是"自己开设备只取最新帧 + ffmpeg 解码/缩放"，
+# 老路径是"ffmpeg 直接开设备"。两者输出都是 640x360 原始 RGB。
+if [ "$CAP" = "lowlat" ]; then
+    capture() {
+        "$(dirname "$0")/v4l2_mjpeg_pipe" --dev "$DEV" --bufs "${CAP_BUFS:-2}" \
+            --w "$CAM_W" --h "$CAM_H" --log-every 100 2>>/tmp/cap_lat.log \
+          | ffmpeg -hide_banner -loglevel error -f mjpeg -i - \
+                   -vf "$VF" -pix_fmt rgb24 -f rawvideo -
+    }
+else
+    capture() {
+        ffmpeg -hide_banner -loglevel error \
+               -f v4l2 -input_format "$IN_FMT" -video_size "${CAM_W}x${CAM_H}" -i "$DEV" \
+               -vf "$VF" -pix_fmt rgb24 -f rawvideo -
+    }
+fi
+capture \
   | { if [ -n "${DUMP_DIR:-}" ]; then
         python3 "$(dirname "$0")/raw_tee.py" --dir "$DUMP_DIR" --w "$PIPE_W" --h "$PIPE_H" \
-            --every "${DUMP_EVERY:-10}" --max "${DUMP_MAX:-20}"
+            --every "${DUMP_EVERY:-10}" --max "${DUMP_MAX:-20}" \
+            ${DUMP_STAMP:+--stamp-file "$DUMP_STAMP"}
       else
         cat
       fi; } \
-  | "$APP" --stdin-rgb --skip-frames "$SKIP" "$@"
+  | "$APP" --stdin-rgb --skip-frames "$SKIP" --host-epoch "$(date +%s.%N)" "$@"
 # ⚠ 两个退出码要**分开看**：脚本上面开了 `set -o pipefail`，于是 ffmpeg 的
 #   "broken pipe" 会把整条管道判成失败 —— 但那恰恰是**正常收尾**：程序处理够
 #   `--frames N` 就不再读 stdin，ffmpeg 写不进去只好退出。以前这会报
