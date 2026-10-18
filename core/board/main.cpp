@@ -220,6 +220,15 @@ struct Args {
     //:
     //: 旁路只在标定窗口内生效：窗口一过立刻恢复决策层，行为和平时完全一样。
     double cal_seconds = 0.0;
+    //: `--predict-s S`（P1）：把世界**推进到"这条指令真正生效"的那一刻**再决策。
+    //: 实测端到端 0.56 板秒（相机 60 ms + 处理 65 ms + 传输 + 仿真 0.75× 实时），
+    //: 而平台按 ~156 场地单位/板秒 走 —— 0.5 s 就是 **78 单位**，而缺口可用半宽
+    //: 只有 25 单位。拿"看到的位置"直接决策，等于朝 0.5 s 前该去的地方走。
+    //: 0 = 关（默认，保持老行为，便于 A/B）。
+    double predict_s = 0.0;
+    //: 预测用的平台速度（场地单位/**板秒**）。默认取 `boot_cal` 的实测值
+    //: （156.6 ≈ 契约 200 单位/仿真秒 × rtf 0.75 ÷ 板子速率 1.09）。
+    double predict_speed = 156.6;
 };
 
 Args parse_args(int argc, char** argv) {
@@ -269,6 +278,8 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--no-pl") a.no_pl = true;
         else if (k == "--host-epoch") a.host_epoch = std::atof(next());
         else if (k == "--cal") a.cal_seconds = std::atof(next());
+        else if (k == "--predict-s") a.predict_s = std::atof(next());
+        else if (k == "--predict-speed") a.predict_speed = std::atof(next());
         else if (k == "--no-player-pred") a.no_player_pred = true;
         else if (k == "--local-refine") a.local_refine = true;
         else if (k == "--legacy-gap") a.legacy_gap = true;
@@ -547,6 +558,8 @@ struct DecisionState {
     //: `gap_avoid` 本帧的决策档位（"为什么不动"必须能从日志直接看出来）
     const char* last_tier = "none";
     gap_avoid::AlgoConfig cfg;
+    //: P1：上一帧**实际发出**的单位方向（预测要用它，不能用帧间差分的"看到的速度"）
+    gap_avoid::Vec2 last_cmd{0.0, 0.0};
     //: 线协议**不带速度**，所以 PS 侧自己推（见 `core/cpu/cpp/motion.hpp`）。
     //: 角色与障碍各一个跟踪器：关联是"最近邻 + 门限"，两类目标的运动模型
     //: 完全无关，混在一起只会互相抢检测。
@@ -1233,10 +1246,38 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
             rects[i].vx = ovx[i];
             rects[i].vy = ovy[i];
         }
+        // ---- P1：障碍按**跟踪器给的速度**前推 ------------------------------
+        // 速度来自 `motion::Tracker`（最近邻关联），不是"这一帧和上一帧选同一个带"
+        // ——后者在有多道墙时会跳到另一道墙上（实测 |v_y| p90 815 px/s 全是假速度）。
+        // 墙在场景里确实在动（实测 128 场地单位/秒向下），0.5 s 就是 64 单位，
+        // 比缺口半宽还大，所以"墙 y"必须一起前推才谈得上瞄得准。
+        if (args.predict_s > 0.0) {
+            const double k = args.predict_s;
+            for (size_t i = 0; i < rects.size(); ++i) {
+                rects[i].x += rects[i].vx * k;
+                rects[i].y += rects[i].vy * k;
+            }
+        }
+    }
+
+    // ---- P1：把角色推进到"这条指令真正生效"的那一刻 ------------------------
+    // 为什么用**上一帧发出的指令**而不是帧间差分：平台上看到的位移已经含了
+    // 0.5 s 的延迟，用它外推只会把延迟再算一遍；而"我们自己刚发的是什么方向"
+    // 是零延迟的已知量。速度取 `boot_cal` 实测的 156.6 单位/板秒。
+    double player_pred[7] = {player[0], player[1], player[2], player[3],
+                             player[4], player[5], player[6]};
+    if (args.predict_s > 0.0 && player_ok) {
+        const double k = args.predict_s * args.predict_speed;
+        player_pred[0] += st.last_cmd.x * k;
+        player_pred[1] += st.last_cmd.y * k;
+        // 前推后必须留在场地内，否则规划器会把它当成"贴边"
+        const double m = std::max(1.0, player_pred[4] + 1.0);
+        player_pred[0] = std::min(std::max(player_pred[0], m), args.field_w - m);
+        player_pred[1] = std::min(std::max(player_pred[1], m), args.field_h - m);
     }
 
     gap_avoid::WorldView world;
-    world.player = player;
+    world.player = player_pred;
     world.rects = rects.data();
     world.n_rects = rects.size();
     world.dt = dt;
@@ -1281,6 +1322,12 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
     } else if (player_ok && (cmd.x != 0.0 || cmd.y != 0.0)) {
         last_cmd = cmd;
         have_cmd = true;
+    }
+    //: P1 用：本帧最终发出的**单位方向**（没有速度模长的概念，只有方向）
+    {
+        const double n = std::hypot(cmd.x, cmd.y);
+        st.last_cmd = (n > 1e-9) ? gap_avoid::Vec2{cmd.x / n, cmd.y / n}
+                                 : gap_avoid::Vec2{0.0, 0.0};
     }
     ++st.n_decisions;
     st.tier_count[tier_bucket(d.tier)] += 1;
