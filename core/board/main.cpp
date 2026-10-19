@@ -22,6 +22,8 @@
 #include "band_gap.hpp"
 #include "denoise.hpp"
 #include "geometry.hpp"
+#include "frame_geom.hpp"
+#include "virt_truth.hpp"
 #include "marker_refine.hpp"
 #include "player.hpp"
 #include "robust.hpp"
@@ -229,6 +231,15 @@ struct Args {
     //: 预测用的平台速度（场地单位/**板秒**）。默认取 `boot_cal` 的实测值
     //: （156.6 ≈ 契约 200 单位/仿真秒 × rtf 0.75 ÷ 板子速率 1.09）。
     double predict_speed = 156.6;
+    //: 几何来源：`frame` = 只认场地白框（推荐，不再依赖四角标记）；
+    //: `markers` = 老路径；`auto` = 白框优先、失败退标记。
+    std::string geom = "auto";
+    //: `--virt`（默认开）：墙/角色的位置由**虚拟真值**维持（视觉只做初始化 +
+    //: 发现新墙 + 慢校正）。`--no-virt` 回到"每帧都用视觉"，用于 A/B。
+    bool virt = true;
+    //: 角色慢校正的残差门（场地单位）与比例；漂移超过门 → 该帧视觉**不喂**。
+    double virt_gate = 60.0;
+    double virt_alpha = 0.25;
 };
 
 Args parse_args(int argc, char** argv) {
@@ -280,6 +291,11 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--cal") a.cal_seconds = std::atof(next());
         else if (k == "--predict-s") a.predict_s = std::atof(next());
         else if (k == "--predict-speed") a.predict_speed = std::atof(next());
+        else if (k == "--geom") a.geom = next();
+        else if (k == "--virt") a.virt = true;
+        else if (k == "--no-virt") a.virt = false;
+        else if (k == "--virt-gate") a.virt_gate = std::atof(next());
+        else if (k == "--virt-alpha") a.virt_alpha = std::atof(next());
         else if (k == "--no-player-pred") a.no_player_pred = true;
         else if (k == "--local-refine") a.local_refine = true;
         else if (k == "--legacy-gap") a.legacy_gap = true;
@@ -560,6 +576,12 @@ struct DecisionState {
     gap_avoid::AlgoConfig cfg;
     //: P1：上一帧**实际发出**的单位方向（预测要用它，不能用帧间差分的"看到的速度"）
     gap_avoid::Vec2 last_cmd{0.0, 0.0};
+    //: 虚拟真值：角色（积分 + 慢校正）、墙（队列 + 冻结 + 积分）
+    virt::PlayerState vp;
+    virt::WallQueue wq;
+    //: 这一帧"选中那扇门"的场地量（墙队列的输入）
+    double wq_last_y = 0.0, wq_last_gl = 0.0, wq_last_gr = 0.0;
+    bool wq_last_seen = false;
     //: 线协议**不带速度**，所以 PS 侧自己推（见 `core/cpu/cpp/motion.hpp`）。
     //: 角色与障碍各一个跟踪器：关联是"最近邻 + 门限"，两类目标的运动模型
     //: 完全无关，混在一起只会互相抢检测。
@@ -1004,14 +1026,57 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
     }
 
     // ---- 角色 ----
+    // ⚠ **最后的兜底：角色不可能落在场地四角**。
+    // 白框的四个角在相机里是"小而亮的紧凑块"，和角色圆盘几乎一样 —— 实测这一轮
+    // 100% 的 `player_field_valid` 帧都落在左上角 40×40 像素内（988/991），
+    // 于是决策一直以为角色在边上。这条判据放在**最终取值处**，对"新检测器 / 旧亮圆
+    // 检测器 / 预测"三条来源一起生效（之前只加在新检测器上，旧检测器漏过去了）。
+    bool player_on_corner = false;
+    {
+        const double pxu = player_ok ? f.player.x : args.field_w * 0.5;
+        const double pyu = player_ok ? f.player.y : 0.0;
+        const double keep = 24.0 + args.player_radius + 60.0;   // 角标记半边长+半径+余量
+        const double cs[4][2] = {{32.0, 32.0}, {args.field_w - 32.0, 32.0},
+                                 {32.0, args.field_h - 32.0},
+                                 {args.field_w - 32.0, args.field_h - 32.0}};
+        for (const auto& c : cs)
+            if (std::hypot(pxu - c[0], pyu - c[1]) < keep) { player_on_corner = true; break; }
+    }
     const double player[7] = {
-        player_ok ? f.player.x : args.field_w * 0.5,
-        player_ok ? f.player.y : 0.0,
+        (player_ok && !player_on_corner) ? f.player.x : args.field_w * 0.5,
+        (player_ok && !player_on_corner) ? f.player.y : 0.0,
         pvx, pvy,
         player_ok ? f.player.radius : 10.0,
         args.player_speed,
         1.0,
     };
+
+    // ---- 虚拟真值：角色（视觉只做初始化 + 慢校正）------------------------
+    // 为什么不再每帧都用视觉：相机端到端 0.56 板秒（= 78 场地单位），而视觉在
+    // "墙经过角色"时会丢帧或漂移 —— 那正是最需要它的时刻。改成积分维持后，
+    // 丢帧只影响校正，不影响位置。
+    if (args.virt) {
+        st.vp.gate = args.virt_gate;
+        st.vp.alpha = args.virt_alpha;
+        if (!st.vp.locked) {
+            if (player_ok) st.vp.observe_init(player[0], player[1]);
+            st.vp.try_lock();
+        } else {
+            st.vp.integrate(st.last_cmd.x, st.last_cmd.y, dt, args.predict_speed,
+                            args.field_w, args.field_h, player[4]);
+            // **只在"有检出 且 没漂移"时喂视觉**；否则这一帧完全不用它
+            // **只在"识别到 且 不漂移"时更新真值**：没检出（被墙盖住/贴墙）
+            // 或行为不一致（没发指令却动了、动得超出逻辑）→ 这一帧完全不喂。
+            // **不做任何校正**（用户口径）：锁定初始位置之后，角色位置**完全**由
+            // 指令积分决定；视觉的角色结果一概不进虚拟真值。
+            // 仍然调用 `vision_ok` 只为**统计漂移/缺失**（`n_reject_*`）与"严重分叉
+            // 时重锚"这一个安全阀；它不再修改位置（原来那句 `correct()` 已删除）。
+            if (player_ok) {
+                (void)st.vp.vision_ok(player[0], player[1], t_now,
+                                      st.last_cmd.x, st.last_cmd.y, args.predict_speed, dt);
+            }
+        }
+    }
 
     // ---- 障碍：只取矩形（决策的 group_walls 只认矩形）----
     //
@@ -1182,6 +1247,10 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
             if (gl < 0.0) gl = 0.0;
             if (gr > args.field_w) gr = args.field_w;
             if (gr - gl < 1.0) continue;    // 整个缺口在场外 → 这扇门不可用
+            // 虚拟真值：记下这一帧"选中那扇门"的场地量（y / 缺口两端）
+            if (&d == pick) {
+                st.wq_last_y = by; st.wq_last_gl = gl; st.wq_last_gr = gr; st.wq_last_seen = true;
+            }
             auto push_seg = [&](double a, double b) {
                 gap_avoid::Rect r;
                 r.ent_id = ++ent;
@@ -1199,6 +1268,50 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
             };
             if (gl > 1.0) push_seg(0.0, gl);
             if (args.field_w - gr > 1.0) push_seg(gr, args.field_w);
+        }
+        // ---- 虚拟真值：墙队列（视觉只负责"发现新墙 + 初始化"）----------------
+        // 冻结之后**视觉不再刷新这一面墙**：它只按自己测到的 vy 匀速走。
+        // 这样墙走到画面底部/贴住角色时，位置不会跟着每次重测去跳。
+        if (args.virt) {
+            st.wq.update(t_now, st.wq_last_seen, st.wq_last_y, st.wq_last_gl, st.wq_last_gr);
+            st.wq.advance(t_now);
+            st.wq.purge(args.field_h);
+            st.wq_last_seen = false;
+            if (st.wq.frozen_count() > 0) {
+                // ⚠ **不能直接 clear()**：那样会把"前方还没冻结的新墙"一起清掉，
+                // 决策就只剩身后那面已冻结的墙 —— 而它不在前方，于是 select_threat_wall
+                // 找不到目标 → `stay` 不动。实测用户看到的"过了缺口就停住"就是这个
+                // （用真值直接喂决策时 4718 帧里一次 stay 都没有，说明决策层本身没错）。
+                // 正确做法：**只替换与已冻结墙重合的矩形**，其余（新墙/未冻结）保留。
+                std::vector<gap_avoid::Rect> keep;
+                keep.reserve(rects.size());
+                for (const auto& r : rects) {
+                    bool matched = false;
+                    for (const auto& sl : st.wq.slots) {
+                        if (sl.frozen && std::fabs(r.y - sl.y) <= 40.0) { matched = true; break; }
+                    }
+                    if (!matched) keep.push_back(r);
+                }
+                rects.swap(keep);
+                int vid = 0;
+                for (const auto& sl : st.wq.slots) {
+                    if (!sl.frozen) continue;
+                    auto push = [&](double a, double b) {
+                        gap_avoid::Rect r;
+                        r.ent_id = ++vid;
+                        r.x = 0.5 * (a + b);
+                        r.y = sl.y;
+                        r.half_w = 0.5 * (b - a);
+                        r.half_h = 4.0;            // 契约：墙全厚 8 场地单位
+                        r.vx = 0.0;
+                        r.vy = sl.vy;              // 逼近速度（决策要用它算"墙在压过来"）
+                        r.rotation = 0.0;
+                        rects.push_back(r);
+                    };
+                    if (sl.gap_l > 1.0) push(0.0, sl.gap_l);
+                    if (args.field_w - sl.gap_r > 1.0) push(sl.gap_r, args.field_w);
+                }
+            }
         }
         if (!rects.empty()) ++st.n_structural;
         if (args.verbose && rects.size() >= 2) {
@@ -1266,7 +1379,15 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
     // 是零延迟的已知量。速度取 `boot_cal` 实测的 156.6 单位/板秒。
     double player_pred[7] = {player[0], player[1], player[2], player[3],
                              player[4], player[5], player[6]};
-    if (args.predict_s > 0.0 && player_ok) {
+    if (args.virt && st.vp.locked) {
+        // 虚拟真值的角色位置是**零延迟**的，直接用它，不再叠 P1 的外推
+        player_pred[0] = st.vp.x;
+        player_pred[1] = st.vp.y;
+        // 速度也用虚拟真值：**发出去什么方向、就以什么速度在动**（单位时间位移
+        // 由积分保证），而不是拿视觉帧间差分那个抖动的"看到的速度"。
+        player_pred[2] = st.last_cmd.x * args.predict_speed;
+        player_pred[3] = st.last_cmd.y * args.predict_speed;
+    } else if (args.predict_s > 0.0 && player_ok) {
         const double k = args.predict_s * args.predict_speed;
         player_pred[0] += st.last_cmd.x * k;
         player_pred[1] += st.last_cmd.y * k;
@@ -1285,7 +1406,11 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
     world.field_w = args.field_w;
     world.field_h = args.field_h;
 
-    st.cfg.edge_margin = args.edge_margin;      // 边界余量（0 = 关）
+    st.cfg.edge_margin = args.edge_margin;
+    // **A 方案**：打开前后控制并给前进一个固定占比（0.6），让指令能"斜着直奔缺口"。
+    // 默认 `front_back=false` + `fwd_speed=0` 时，规划器的前进分量恒为 0，只会横着走。
+    st.cfg.front_back = true;
+    st.cfg.fwd_speed = 0.6;      // 边界余量（0 = 关）
     const gap_avoid::Decision d = gap_avoid::plan(world, st.mem, st.cfg, 2.0);
     if (d.edge_limited) ++st.n_edge_limited;
     gap_avoid::Vec2 cmd = gap_avoid::to_command(d);
@@ -1824,7 +1949,9 @@ int main(int argc, char** argv) {
                 static std::vector<rectify::Marker> s_mk;
                 static rectify::Homography s_homo;
                 static long s_tick = 0;
-                if (s_tick % 5 == 0 || s_mk.size() != 4) {
+                // `--geom=frame` 时**完全不找标记**：省掉每 5 帧一次 51 ms 的尖峰
+                // （实测帧率 11.3 → 16.7 fps 主要就是这个），也不再需要标记排除。
+                if (args.geom != "frame" && (s_tick % 5 == 0 || s_mk.size() != 4)) {
                     const auto t_mk0 = std::chrono::steady_clock::now();
                     std::vector<rectify::Marker> found =
                         rectify::find_markers4(rgb.data(), pw, ph);
@@ -1851,7 +1978,7 @@ int main(int argc, char** argv) {
                                    std::hypot(found[2].x - found[3].x, found[2].y - found[3].y));
                         markers::Params rp;
                         if (span_px > 40.0) {
-                            const double expect = span_px * 48.0 / 640.0;
+                            const double expect = span_px * 28.0 / 640.0;   // 标记边长已缩到 28 场地单位
                             rp.min_side_px = static_cast<int>(0.5 * expect);
                             rp.max_side_px = static_cast<int>(2.0 * expect);
                         }
@@ -1905,12 +2032,33 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                if (!s_homo.ok) {
-                    sg_geo_why = "no_markers";
-                } else {
+                // ---- 几何来源：白框优先、标记兜底（`--geom=frame|markers|auto`）----
+                // 白框路径的四个角**就是**场地四角，不需要任何近似；标记路径保留做兜底，
+                // 也用于对照（历史上 `--verify-both` 的对账都基于它）。
+                geometry::Geometry geo;
+                bool geo_ready = false;
+                static rectify::Homography s_frame_homo;
+                if (args.geom != "markers") {
+                    const auto fr = frame_geom::find(rgb.data(), pw, ph);
+                    if (fr.ok) {
+                        const rectify::Homography fh =
+                            frame_geom::homography(fr, args.field_w, args.field_h);
+                        if (fh.ok) {
+                            geo = frame_geom::as_geometry(fr, args.field_w, args.field_h,
+                                                          geometry::Params{}, &fh);
+                            if (geo.valid) { s_frame_homo = fh; geo_ready = true; }
+                        }
+                    }
+                }
+                if (!geo_ready && args.geom != "frame" && s_homo.ok) {
                     sg_h = s_homo;
-                    const geometry::Geometry geo = geometry::judge(
-                        sg_h, ms, pw, ph, args.field_w, args.field_h);
+                    geo = geometry::judge(sg_h, ms, pw, ph, args.field_w, args.field_h);
+                    geo_ready = true;
+                }
+                if (!geo_ready) {
+                    sg_geo_why = "no_geometry";
+                } else {
+                    if (geo.src == geometry::Source::Frame) sg_h = s_frame_homo;
                     sg_geo_why = geo.why;
                     // ⚠ 顺序不能反：**先算年龄，再更新**"最后一次成功确认"的时刻。
                     //   反过来的话，本帧刚把自己写成"刚刚成功"，年龄永远是 0/无穷，
@@ -1942,14 +2090,35 @@ int main(int argc, char** argv) {
                         // （旧的仍然可能对，只是不可靠，日志里 player_src 会区分）。
                         const auto t_pl0 = std::chrono::steady_clock::now();
                         // 先算墙（同一套检测器、同一帧），给角色检测提供"墙带"约束
-                        sg_walls = wall_gap::find_walls(rgb.data(), pw, ph);
+                        // 场地掩膜：只在几何给出的场地 bbox 内找墙/缺口，
+                        // 场外黑区不许当缺口（否则缺口中心被拉到画面边缘，
+                        // 角色会被带出平台）。bbox 来自四标记单应 + 可信性判定。
+                        // 裁剪边界 = 场地内沿（收缩 4 px，避开白框线自身）。
+                        // 几何这一帧无效时**沿用上一次有效的 bbox**：否则"刚出现墙"
+                        // 的那几帧没有裁剪，绿/红框就跑到平台外的黑区去了（实测现象）。
+                        static band_gap::Extent s_clip{};
+                        if (sg_h.ok && sg_ext.ok) s_clip = sg_ext;
+                        wall_gap::Params wp;
+                        if (s_clip.ok) {
+                            const int inset = 4;
+                            wp.clip_x0 = s_clip.x0 + inset;
+                            wp.clip_x1 = s_clip.x1 - inset;
+                            wp.clip_y0 = s_clip.y0 + inset;
+                            wp.clip_y1 = s_clip.y1 - inset;
+                        }
+                        sg_walls = wall_gap::find_walls(rgb.data(), pw, ph, wp);
                         sg_bands.clear();
                         for (const wall_gap::Wall& w2 : sg_walls)
                             sg_bands.emplace_back(w2.y0, w2.y1);
+                        // 缺口的列范围：角色穿缺口时它的行号会落在墙带里，
+                        // 必须放行（否则最需要角色的时刻恰好丢帧）。
+                        std::vector<std::array<int, 4>> gap_windows;
+                        for (const wall_gap::Wall& w2 : sg_walls)
+                            if (w2.has_gap) gap_windows.push_back({w2.y0, w2.y1, w2.gap_x0, w2.gap_x1});
                         const auto pl = player::find(rgb.data(), pw, ph, sg_h, ms,
                                                      args.field_w, args.field_h,
                                                      args.player_radius, player::Params{},
-                                                     &sg_bands);
+                                                     &sg_bands, &gap_windows);
                         ms_player = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t_pl0).count();
                         sg_player_new = pl;

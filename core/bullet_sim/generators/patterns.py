@@ -391,6 +391,17 @@ def _layout_wall_gap(spec, ctx, elapsed, step):
         segs.append((0.0, centre - half_gap))
     if centre + half_gap < span - 1.0:
         segs.append((centre + half_gap, span))
+    # ---- ② 短墙段丢弃 ------------------------------------------------------
+    # 缺口贴近左右两侧时，另一半只剩一小截 —— 它没有任何穿越意义，却会：
+    #   · 被角色检测当成"扁圆的亮块"（实测短墙段被误认成角色）；
+    #   · 把缺口的左右端判断带偏（那一截的端头也成了一条"墙边"）。
+    # 所以短于 `min_segment`（默认 120 场地单位 ≈ 6 个角色直径）的段直接丢掉；
+    # 极端情况下（两段都短）保留较长的那一段，绝不让整面墙消失。
+    min_seg = float(spec.params.get("min_segment", 120.0))
+    kept = [sg for sg in segs if (sg[1] - sg[0]) >= min_seg]
+    if not kept and segs:
+        kept = [min(segs, key=lambda sg: sg[1] - sg[0])]
+    segs = kept
     offs, hws, hhs = [], [], []
     for a, b in segs:
         mid = 0.5 * (a + b)

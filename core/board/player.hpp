@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdint>
 #include <vector>
+#include <array>
 #include <algorithm>
 
 #include "rectify.hpp"
@@ -135,7 +136,8 @@ inline Player find(const uint8_t* rgb, int w, int hh, const rectify::Homography&
                    const std::vector<rectify::Marker>& markers,
                    double field_w, double field_h, double player_radius_units,
                    const Params& p = Params{},
-                   const std::vector<std::pair<int, int>>* wall_bands = nullptr) {
+                   const std::vector<std::pair<int, int>>* wall_bands = nullptr,
+                   const std::vector<std::array<int, 4>>* gap_windows = nullptr) {
     Player out;
     if (!rgb || w < 32 || hh < 32) return out;
     if (!h.ok) { out.why = "no_geometry"; return out; }
@@ -413,11 +415,26 @@ inline Player find(const uint8_t* rgb, int w, int hh, const rectify::Homography&
         // **落在墙带上 → 是墙的端头/亮边，不是角色**
         if (wall_bands != nullptr && !wall_bands->empty()) {
             const int cy_i = static_cast<int>(std::lround(cy));
+            const int cx_i = static_cast<int>(std::lround(cx));
             bool on_wall = false;
             for (const auto& b : *wall_bands) {
                 if (cy_i >= b.first - p.wall_band_margin && cy_i <= b.second + p.wall_band_margin) {
                     on_wall = true;
                     break;
+                }
+            }
+            // **穿缺口的例外**：角色正从缺口通过时，它的行号必然落在墙带里 ——
+            // 这时候若还按"在墙上"否掉，就会正好在最需要它的时候丢掉角色
+            // （实测：角色贴着墙带时紫框消失，决策因为"没角色"而 stay）。
+            // 只有"落在墙带的**缺口列范围**内"才放行。
+            if (on_wall && gap_windows != nullptr) {
+                const int r_px = std::max(3, static_cast<int>(0.5 * std::max(cw, ch)));
+                for (const auto& g : *gap_windows) {          // {y0, y1, x0, x1}
+                    if (cy_i >= g[0] - p.wall_band_margin && cy_i <= g[1] + p.wall_band_margin &&
+                        cx_i >= g[2] + r_px && cx_i <= g[3] - r_px) {
+                        on_wall = false;                       // 在缺口里 → 是角色
+                        break;
+                    }
                 }
             }
             if (on_wall) continue;

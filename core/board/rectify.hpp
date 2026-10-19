@@ -27,7 +27,7 @@ namespace rectify {
 /// 场地四角（平台契约）：左上、右上、右下、左下 的**标记中心**。
 inline std::array<std::array<double, 2>, 4> contract_markers(double fw = 640.0,
                                                              double fh = 480.0) {
-    const double s = 32.0;              // 边长 48、离边 8 → 中心 8+24 = 32
+    const double s = 22.0;              // 边长 28、离边 8 → 中心 8+14 = 22（2026-10-18 缩小标记）
     return {{{s, s}, {fw - s, s}, {fw - s, fh - s}, {s, fh - s}}};
 }
 

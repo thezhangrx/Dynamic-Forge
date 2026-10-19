@@ -379,9 +379,16 @@ Aperture reconstruct_aperture(const Wall& wall, WallMemory& mem, double r_p,
         complete = false;
     }
 
-    const double lo = std::fmax(e_lo, 0.0);
-    const double hi = std::fmin(e_hi, field_w);
-    const double usable_w = hi - lo;
+    // **瞄准点必须落在"可通行区间"内**：把缺口两端按 (角色半径 + 余量) 往场内收，
+    // 而不是只夹到 [0, field_w]。为什么必须收：
+    //   缺口贴边时（现在场景里常见：缺口贴左右边只剩一段长墙），`lo≈0`，
+    //   瞄准点就落在边界上 → 决策一路把角色往边界里推 → 角色被钳在角落
+    //   （实测 78.7% 的帧角色 x=10，30.4% 的帧 applied=0）。
+    // 收完之后可用宽度不够 2r 的缺口，`usable_half` 会 ≤0，走既有的 NO_GAP 分支。
+    const double inset = r_p + margin;
+    const double lo = std::fmax(e_lo, inset);
+    const double hi = std::fmin(e_hi, field_w - inset);
+    const double usable_w = (hi > lo) ? (hi - lo) : 0.0;
 
     Aperture ap;
     ap.e_lo = lo;
@@ -550,6 +557,44 @@ Decision plan(const WorldView& world, GapMemory& mem, const AlgoConfig& cfg,
     WallMemory& wmem = mem.get(key);
     const double lat = dot(Vec2{px, py}, wall.u_hat);
 
+    // ---- WAIT：没有"前方"目标了 → 静止等下一个 ----
+    // 规则（用户口径）：**没有前方缺口（缺口 y > 角色 y），且角色已经越过上一个目标
+    // （角色 y > 目标 y）时，应当静止等待下一个目标出现**，不要继续横推。
+    // 为什么必须显式处理：身后的墙仍然是最佳候选（prio==2），于是会被一路追着横推，
+    // 角色最终被压在左右边界上（实测 78.7% 的帧角色 x=10，30.4% 的帧 applied=0）。
+    if (cands[pick].prio == 2) {
+        // 已经越过（身后/被越过）所有墙 → **回中心**，不要停在边上。
+        // 用户口径："角色 y 大于队列里的墙时回到平台大概的中心即可"。
+        // 只在离中心足够远时才动，避免在中心附近抖（±30 场地单位死区）。
+        const double cx_field = 0.5 * field_w;
+        const double dx_c = cx_field - px;
+        if (std::fabs(dx_c) > 30.0) {
+            d.wx = (dx_c > 0.0 ? 1.0 : -1.0) * wall.u_hat.x;
+            d.wy = (dx_c > 0.0 ? 1.0 : -1.0) * wall.u_hat.y;
+            d.tier = "RECENTER";
+            d.reason = "back_to_center";
+        } else {
+            d.wx = 0.0; d.wy = 0.0;
+            d.tier = "WAIT";
+            d.reason = "wait_next_target";
+        }
+        d.tier = "WAIT";
+        d.reason = "wait_next_target";
+        d.t_arr = t_arr;
+        d.clearance = clearance;
+        d.gap = ap.gap_raw;
+        d.usable_half = ap.usable_half;
+        d.e_lo = ap.e_lo;
+        d.e_hi = ap.e_hi;
+        d.n_rects = wall.n_rects;
+        d.gap_line[0] = band_point(wall, ap.e_lo, front);
+        d.gap_line[1] = band_point(wall, ap.e_hi, front);
+        d.aim_world = band_point(wall, 0.5 * (ap.e_lo + ap.e_hi), front);
+        d.aim_lat = 0.5 * (ap.e_lo + ap.e_hi);
+        d.edge_limited = false;
+        return d;
+    }
+
     if (ap.usable_half <= 0.0) {
         // 推不出缺口 / 膨胀后装不下人：朝远离最近那段墙的方向横移兜底，
         // 别把自己顶到场地边界上。
@@ -670,6 +715,11 @@ Decision plan(const WorldView& world, GapMemory& mem, const AlgoConfig& cfg,
     const Vec2 fwd{-wall.n_hat.x, -wall.n_hat.y};
     const double d_n = std::fmax(0.0, dot(Vec2{px, py}, wall.n_hat) - (front + r_p));
 
+    // **给前进留出速度预算**（用户要"朝缺口直来直去"）：
+    // 原来 ALIGN 档 `u_mag=1.0` → `w_cap=sqrt(v²−u²)=0`，前进恒为 0，
+    // 于是只会横着走、左/右满速横跳。这里把横向压到 0.8，留出 60% 给前进，
+    // 就会出现 45° 左右的斜向指令（实测纯横向 66% → 目标明显下降）。
+    if (cfg.front_back) u_mag = std::fmin(u_mag, 0.8);
     const double u_speed = u_mag * cx.v_max;
     const double w_cap = std::sqrt(std::fmax(0.0, cx.v_max * cx.v_max - u_speed * u_speed));
     double w;

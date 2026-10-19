@@ -58,6 +58,10 @@ def main(argv=None):
     ap.add_argument("--init-s", type=float, default=1.0)
     ap.add_argument("--wall-init-n", type=int, default=3)
     ap.add_argument("--wall-thick", type=float, default=8.0)
+    ap.add_argument("--every", type=float, default=0.0,
+                    help="每隔多少**板秒**输入一次视觉真值来修正角色（0 = 永不）")
+    ap.add_argument("--blend", type=float, default=1.0,
+                    help="修正强度：1.0 = 硬覆盖，0.3 = 只拉 30%（软校正）")
     a = ap.parse_args(argv)
 
     diag = load(a.diag)
@@ -114,6 +118,7 @@ def main(argv=None):
     init = []
     p = [0.0, 0.0]
     locked = False
+    last_seed = 0.0
     t_prev = None
     reinit = 0
     bad_run = 0
@@ -146,6 +151,11 @@ def main(argv=None):
             p[1] += uy * a.speed * dt
             p[0] = max(1.0, min(639.0, p[0]))
             p[1] = max(1.0, min(479.0, p[1]))
+            # **周期性输入真值**：隔 `--every` 板秒把视觉位置融进来一次
+            if a.every > 0 and (w - last_seed) >= a.every and r.get("player_field_valid"):
+                last_seed = w
+                p[0] = (1.0 - a.blend) * p[0] + a.blend * r["player_field"][0]
+                p[1] = (1.0 - a.blend) * p[1] + a.blend * r["player_field"][1]
             # 重锚例外
             if r.get("player_field_valid"):
                 d = math.hypot(r["player_field"][0] - p[0], r["player_field"][1] - p[1])

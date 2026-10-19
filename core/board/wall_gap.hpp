@@ -74,7 +74,15 @@ struct Params {
     //:
     //: 兜底：整幅暖像素太少（< 0.2%）时**退回亮度判据** —— 万一以后把墙改成中性色，
     //: 这里不会静默变成"永远没有墙"，而是保持老行为（日志里 `wall_px` 会掉到 0）。
-    int min_warmth = 60;
+    //: **场地掩膜**：只在 [x0,x1]×[y0,y1] 里找墙/缺口；场外（黑色无边界区）
+    //: 一律当"非墙、非缺口"。为什么必须有：场地没有边界线，墙带一贴到画面边缘，
+    //: 场外黑区就被当成"墙上的缺口"（实测缺口中心被拉到场地左边缘 x=98，
+    //: 而真实缺口在别处）→ 决策把角色往平台外带。
+    int clip_x0 = 0, clip_x1 = 0, clip_y0 = 0, clip_y1 = 0;   // x1<=x0 表示不裁剪
+    //: 缺口两端离场地边缘至少留这么多像素（防止"贴边黑区"冒充缺口）
+    int gap_edge_margin = 6;
+
+    int min_warmth = 0;   // 结构门接管后默认关（相机把橙色拉成白灰，色相不可靠）
     //: 整幅画面里"墙像素"少于这个比例就认为"这一帧没有暖色墙"，退回亮度判据。
     double warm_fallback_frac = 0.002;
 };
@@ -174,10 +182,15 @@ inline std::vector<Wall> find_walls(const uint8_t* rgb, int w, int h, const Para
     // ---- 1) 每行的"墙像素"个数 ----
     // 颜色门：计数的是**暖**像素；回退：计数的是**亮**像素（老行为）。
     std::vector<int> row_cnt(static_cast<size_t>(h), 0);
-    for (int y = 0; y < h; ++y) {
+    const bool clipped = (p.clip_x1 > p.clip_x0);
+    const int cx0 = clipped ? std::max(0, p.clip_x0) : 0;
+    const int cx1 = clipped ? std::min(w - 1, p.clip_x1) : w - 1;
+    const int cy0 = clipped ? std::max(0, p.clip_y0) : 0;
+    const int cy1 = clipped ? std::min(h - 1, p.clip_y1) : h - 1;
+    for (int y = cy0; y <= cy1; ++y) {
         const uint8_t* row = rgb + static_cast<size_t>(y) * w * 3;
         int c = 0;
-        for (int x = 0; x < w; ++x) {
+        for (int x = cx0; x <= cx1; ++x) {
             const int r = row[x * 3], g = row[x * 3 + 1], b = row[x * 3 + 2];
             if (min_warmth > 0 ? is_wall_pixel(r, g, b, min_warmth) : (luma(r, g, b) >= T)) ++c;
         }
@@ -302,7 +315,9 @@ inline std::vector<Wall> find_walls(const uint8_t* rgb, int w, int h, const Para
                 const int gw = gx1 - gx0 + 1;
                 cur0 = -1;
                 const bool inside = (gx0 > x0) && (gx1 < x1);
-                if (inside && gw >= p.min_gap_px && gw <= p.max_gap_px) {
+                if (inside && gw >= p.min_gap_px && gw <= p.max_gap_px &&
+                    (!clipped || (gx0 > cx0 + p.gap_edge_margin &&
+                                  gx1 < cx1 - p.gap_edge_margin))) {
                     ++n_gaps;
                     if (gw > best_w) { best_w = gw; bx0 = gx0; bx1 = gx1; }
                 }
@@ -316,6 +331,15 @@ inline std::vector<Wall> find_walls(const uint8_t* rgb, int w, int h, const Para
             wl.left_x0 = x0; wl.left_x1 = bx0 - 1;
             wl.right_x0 = bx1 + 1; wl.right_x1 = x1;
         }
+        // ---- 结构门（唯一一道）------------------------------------------
+        // 为什么不再用颜色：实测板子相机把墙的 (255,120,0) 拍成 (130,128,124)
+        // （r−b=7，纯中性），而屏幕外那圈背景反而更"暖"（r−b=43）→ 颜色门会把
+        // 背景认成墙（绿框跑到平台外）。亮度对比也只有 ~10 个灰阶，靠不住。
+        // 稳定的是几何：**横贯场地宽度 + 带内有缺口 + 厚度 5~20 行**。
+        // 网格线连续（没缺口）、外框太薄、角色/标记太小 —— 都过不了这三条。
+        if (!wl.has_gap) continue;                      // 没有缺口 = 不是 wall_with_gap
+        if (wl.gap_w < p.min_gap_px || wl.gap_w > p.max_gap_px) continue;
+        if (wl.bright_frac < p.min_bright_frac) continue;
         out.push_back(wl);
     }
     return out;

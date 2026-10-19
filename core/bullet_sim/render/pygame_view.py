@@ -125,7 +125,7 @@ class PygameRenderer:
         calibration_marker_color: tuple[int, int, int] = (128, 0, 128),
         wall_color: tuple[int, int, int] = WALL_COLOR,
         show_fiducials: bool = True,
-        fiducial_side: float = 48.0,
+        fiducial_side: float = 28.0,   # 28 场地单位：够定边界，又不会挡住宅的墙/缺口
         show_field_border: bool = True,
         window_timeout_s: float = 20.0,
     ) -> None:
@@ -423,8 +423,26 @@ class PygameRenderer:
 
         # --- 四角标定标记（ArUco）---------------------------------------
         # 画在目标之上：标记要**完整可见**才能被解码，被一条墙线切过就废了。
-        if self.show_fiducials:
+        import os as _os2
+        if self.show_fiducials and _os2.environ.get("BULLET_NO_FIDUCIALS", "") in ("", "0"):
             self._draw_fiducials(screen, world, vp)
+
+        # **场地白框**：平台边界在相机画面里必须是**可见的线**。
+        # 之前没有边界线，场外黑区会被当成"墙上的缺口"（实测缺口中心被拉到
+        # 场地左边缘），角色于是朝平台外走。白框同时给视觉一个硬边界。
+        # ⚠ 这段**不能**放在 `show_fiducials` 的条件里 —— 之前放进去过，
+        #   结果 `BULLET_NO_FIDUCIALS=1` 时连白框一起消失（实测：录像里平台四周
+        #   没有任何边框）。白框只受它自己的开关 `BULLET_NO_FRAME` 控制。
+        if _os2.environ.get("BULLET_NO_FRAME", "") in ("", "0"):
+            fw = float(world.state.env.field_w)
+            fh = float(world.state.env.field_h)
+            a = vp.world_to_screen(0.0, fh)
+            b = vp.world_to_screen(fw, 0.0)
+            pygame.draw.rect(
+                screen, (255, 255, 255),
+                pygame.Rect(int(min(a[0], b[0])), int(min(a[1], b[1])),
+                            max(1, int(abs(b[0] - a[0]))), max(1, int(abs(b[1] - a[1])))),
+                2)
 
         # --- 标定参考物：画在**所有东西之上** ---------------------------
         # 位置在这里是有意的：障碍物/玩家先画，参考物最后覆盖上去，
@@ -588,7 +606,15 @@ class PygameRenderer:
             pygame.draw.circle(screen, (255, 255, 255), (int(px), int(py)), 1)
 
     def _draw_world_axes(self, screen: Any, world: Any, vp: Viewport) -> None:
-        """World-coordinate grid; the numeric tick labels need ``show_text``."""
+        """World-coordinate grid; the numeric tick labels need ``show_text``.
+
+        ⚠ ``BULLET_NO_GRID=1`` 时**不画网格**。为什么需要这个开关：网格线和墙在
+        相机里只差 ~10 个灰阶（墙 L≈128、场地 L≈118、网格 L≈40~60 但会被自动
+        曝光拉近），缺口定位会被这些横线带偏；实测把网格去掉后缺口中心才稳。
+        """
+        import os as _os
+        if _os.environ.get("BULLET_NO_GRID", "") not in ("", "0"):
+            return
         w = float(world.state.env.field_w)
         h = float(world.state.env.field_h)
         step = 100.0

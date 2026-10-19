@@ -38,6 +38,8 @@ SPEED_ARG=""
    --state-log '$OUT/truth.jsonl'" > "$OUT/sim.log" 2>&1 &)
 sleep 6
 echo '@MOVE 0' >> /tmp/oc_stream.txt
+# 窗口必须在最前：相机拍的是物理屏幕，被浏览器盖住时"就绪检查"会一直 0/3（实测过）
+bash core/board/tools/focus_sim.sh 2>&1 | sed 's/^/[语料] /'
 
 # `LOOP=board`：让**板子自己闭环开车**（这样语料里的帧和真实闭环完全一致，
 # 而不是"脚本化动作"那种偏简单的场景）。默认 `LOOP=script`（脚本化运动）。
@@ -50,9 +52,13 @@ else
 (setsid sh -c "for i in \$(seq 1 $((SECS * 2))); do
      case \$((i % 6)) in
        0) echo '@MOVE 2' >> /tmp/oc_stream.txt;;
-       1|2) echo '@MOVE 0' >> /tmp/oc_stream.txt;;
+       1|2) echo '@MOVE 0' >> /tmp/oc_stream.txt
+# 窗口必须在最前：相机拍的是物理屏幕，被浏览器盖住时"就绪检查"会一直 0/3（实测过）
+bash core/board/tools/focus_sim.sh 2>&1 | sed 's/^/[语料] /';;
        3) echo '@MOVE 1' >> /tmp/oc_stream.txt;;
-       4|5) echo '@MOVE 0' >> /tmp/oc_stream.txt;;
+       4|5) echo '@MOVE 0' >> /tmp/oc_stream.txt
+# 窗口必须在最前：相机拍的是物理屏幕，被浏览器盖住时"就绪检查"会一直 0/3（实测过）
+bash core/board/tools/focus_sim.sh 2>&1 | sed 's/^/[语料] /';;
      esac
      sleep 0.5
    done" > /dev/null 2>&1 &)

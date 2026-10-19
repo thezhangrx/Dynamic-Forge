@@ -93,7 +93,11 @@ fi
 echo "[④] 场地就绪，开始正式记录"
 
 echo "[④] 板子闭环开跑（相机 → PL → 决策 → @MOVE）…"
-R "cd /root/tools && rm -f /tmp/diag_crit4.jsonl; ./cam_live.sh --frames 0 --via-pl \
+# DUMP=1 时**同时把相机原始帧存盘**：这样三段视频（相机/决策/虚拟真值）来自**同一次运行**，
+# 帧号能严格对应。不存盘时行为完全不变。
+DUMP_ENV=""
+[ "${DUMP:-0}" = "1" ] && DUMP_ENV="DUMP_DIR=/tmp/cl_frames DUMP_EVERY=${DUMP_EVERY:-3} DUMP_MAX=100000 DUMP_STAMP=/tmp/cl_frames/stamps.tsv"
+R "cd /root/tools && rm -rf /tmp/cl_frames; mkdir -p /tmp/cl_frames; rm -f /tmp/diag_crit4.jsonl; $DUMP_ENV ./cam_live.sh --frames 0 --via-pl \
    --keyboard-dev stdout --structural-gap --diag-log /tmp/diag_crit4.jsonl ${EXTRA:-}" \
    2>/dev/null | tee -a /tmp/crit4_stream.txt > /dev/null &
 BPID=$!

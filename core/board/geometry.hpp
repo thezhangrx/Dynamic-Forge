@@ -30,11 +30,12 @@ namespace geometry {
 
 //: 几何来源。`Stale` 表示"这一帧没有可信几何，但上一次可用还不算太久"，
 //: 由调用方决定要不要继续用（本工程的口径：超过 150 ms 就必须停）。
-enum class Source { None = 0, Markers, Extent, Stale };
+enum class Source { None = 0, Markers, Frame, Extent, Stale };
 
 inline const char* source_name(Source s) {
     switch (s) {
         case Source::Markers: return "markers";
+        case Source::Frame:   return "frame";
         case Source::Extent:  return "extent";
         case Source::Stale:   return "stale";
         default:              return "none";

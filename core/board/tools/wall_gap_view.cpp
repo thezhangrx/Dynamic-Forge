@@ -30,6 +30,7 @@
 #include "geometry.hpp"
 #include "marker_refine.hpp"
 #include "player.hpp"
+#include "frame_geom.hpp"
 
 namespace {
 
@@ -114,7 +115,26 @@ int main(int argc, char** argv) {
         // 这样视频里看到的就是板子真正在用的那个位置，而不是另一套近似判断。
         vision_board::player::Player pl;
         {
-            std::vector<rectify::Marker> mk = rectify::find_markers4(src.data(), a.w, a.h);
+            // **白框几何优先**：场景里已经没有四角标记了，只靠标记的话
+            // `player::find` 会返回 `no_geometry` → 视频里根本没有紫框
+            // （实测：关掉标记后紫框消失，正是这一步造成的）。
+            const auto fr = vision_board::frame_geom::find(src.data(), a.w, a.h);
+            if (fr.ok) {
+                const auto hf = vision_board::frame_geom::homography(fr, 640.0, 480.0);
+                if (hf.ok) {
+                    // 缺口列范围：角色穿缺口时行号会落在墙带里，必须放行
+                    std::vector<std::array<int, 4>> gapw;
+                    for (const auto& w2 : walls)
+                        if (w2.has_gap) gapw.push_back({w2.y0, w2.y1, w2.gap_x0, w2.gap_x1});
+                    std::vector<std::pair<int, int>> bands;
+                    for (const auto& w2 : walls) bands.emplace_back(w2.y0, w2.y1);
+                    pl = vision_board::player::find(src.data(), a.w, a.h, hf, {}, 640.0, 480.0,
+                                                    10.0, vision_board::player::Params{},
+                                                    &bands, &gapw);
+                }
+            }
+            std::vector<rectify::Marker> mk;
+            if (!pl.found) mk = rectify::find_markers4(src.data(), a.w, a.h);
             if (mk.size() == 4) {
                 std::sort(mk.begin(), mk.end(), [](const rectify::Marker& p,
                                                    const rectify::Marker& q) {
