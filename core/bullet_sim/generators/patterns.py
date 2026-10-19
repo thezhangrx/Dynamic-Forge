@@ -561,12 +561,41 @@ def _layout_corridor(spec, ctx, elapsed, step):
 
 
 #: layout name -> builder
+def _layout_wall_static(spec, ctx, elapsed, step):
+    """**静态墙**（平台 v2）：墙在开局就摆在固定 y，不移动、不生成。
+
+    每道墙有自己的缺口（`gap_center`），两侧各留一段（静态场景里两侧都有意义，
+    不做「贴边丢短段」）。因为不移动，`vy=0` 是**正确**的，虚拟真值冻结后
+    永远不会漂——这正是这个平台要验证的东西。
+    """
+    p = spec.params
+    y = float(p["y"])
+    gx = float(p["gap_center"])
+    gw = float(p["gap_width"])
+    hh = 0.5 * float(p["thickness"])
+    segs = []
+    if gx - gw / 2 > 1.0:
+        segs.append((0.0, gx - gw / 2))
+    if gx + gw / 2 < ctx.field_w - 1.0:
+        segs.append((gx + gw / 2, ctx.field_w))
+    if not segs:                      # 缺口比场地还宽：整面墙都不要
+        empty = np.zeros((0, 2))
+        z = np.zeros(0)
+        return (empty, z, z, z, z, z, z, False)
+    offs = np.array([[0.5 * (a + b), y] for a, b in segs], dtype=np.float64)
+    hws = np.array([0.5 * (b - a) for a, b in segs], dtype=np.float64)
+    hhs = np.full(len(segs), hh, dtype=np.float64)
+    z = np.zeros(len(segs), dtype=np.float64)
+    return (offs, z, z, hws, hhs, z, z, False)
+
+
 _LAYOUT_BUILDERS = {
     "block": _layout_block,
     "wall_gap": _layout_wall_gap,
     "small": _layout_small,
     "cross": _layout_cross,
     "corridor": _layout_corridor,
+    "wall_static": _layout_wall_static,
 }
 
 #: All supported obstacle layouts.

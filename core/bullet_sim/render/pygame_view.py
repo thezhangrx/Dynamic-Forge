@@ -125,6 +125,10 @@ class PygameRenderer:
         calibration_marker_color: tuple[int, int, int] = (128, 0, 128),
         wall_color: tuple[int, int, int] = WALL_COLOR,
         show_fiducials: bool = True,
+        #: **跟随角色 y 滚动**（平台 v2）：窗口只显示角色上下各 `follow_h/2` 的带，
+        #: 水平仍是全宽。墙/角色超出这一带的会被裁掉（真实相机只拍这一屏）。
+        follow_player: bool = False,
+        follow_h: float = 240.0,
         fiducial_side: float = 28.0,   # 28 场地单位：够定边界，又不会挡住宅的墙/缺口
         show_field_border: bool = True,
         window_timeout_s: float = 20.0,
@@ -215,6 +219,17 @@ class PygameRenderer:
         #: 可以全程可见，于是每一帧都能反解单次标定（视觉侧据此判断"标定还成立吗"）。
         #: 位图与布局在 ``standard.fiducial``（平台画、视觉认，共享契约）。
         self.show_fiducials = bool(show_fiducials)
+        # 环境变量覆盖（`BULLET_FOLLOW=240`）：不必改 CLI 就能给"静态墙平台"开跟随。
+        import os as _os
+        _fh = _os.environ.get("BULLET_FOLLOW", "")
+        if _fh not in ("", "0"):
+            follow_player = True
+            try:
+                follow_h = float(_fh)
+            except ValueError:
+                follow_h = 240.0
+        self.follow_player = bool(follow_player)
+        self.follow_h = float(follow_h)
         self.fiducial_side = float(fiducial_side)
         #: 场地外框那 1 像素的线。相机拍屏幕时它是一条**横贯画面的长线**，会被
         #: 视觉判成矩形（实测：几何帧里多出一条贴底边的"墙"），板子在环里时关掉。
@@ -334,6 +349,17 @@ class PygameRenderer:
         screen.fill(self.background)
 
         vp = self.viewport
+        if self.follow_player:
+            # 视口跟着角色：中心 = (场地中线, 角色 y)，缩放让 follow_h 刚好铺满窗口高度。
+            # 水平仍是全宽（640），于是画面里永远只有"当前这一屏"的 1~2 道墙。
+            py = float(world.player[1]) if hasattr(world, "player") else 0.0
+            vp.center = (float(world.state.env.field_w) * 0.5, py)
+            half = max(60.0, 0.5 * self.follow_h)
+            vp.zoom = (vp.usable_h / (2.0 * half)) / max(1e-9, vp.fit_scale)
+            self._band = (py - half, py + half)
+        else:
+            vp.center = None
+            self._band = None
         assert vp is not None
         vp.resize(*self._size)          # keep in sync even without an event
         fh = float(world.state.env.field_h)
@@ -436,13 +462,24 @@ class PygameRenderer:
         if _os2.environ.get("BULLET_NO_FRAME", "") in ("", "0"):
             fw = float(world.state.env.field_w)
             fh = float(world.state.env.field_h)
-            a = vp.world_to_screen(0.0, fh)
-            b = vp.world_to_screen(fw, 0.0)
-            pygame.draw.rect(
-                screen, (255, 255, 255),
-                pygame.Rect(int(min(a[0], b[0])), int(min(a[1], b[1])),
-                            max(1, int(abs(b[0] - a[0]))), max(1, int(abs(b[1] - a[1])))),
-                2)
+            if self.follow_player:
+                # **跟随模式**：场地本身在画面里只露出一部分，直接画场地框会被裁掉。
+                # 用户要求"平台四周的方框要保持"→ 在**视口边界**画白框（左/右竖边
+                # 正好落在 x=0 与 x=640 的世界位置上，上下边就是窗口上下沿）。
+                a = vp.world_to_screen(0.0, 0.0)
+                b = vp.world_to_screen(fw, 0.0)
+                x0 = int(round(min(a[0], b[0]))); x1 = int(round(max(a[0], b[0])))
+                pygame.draw.rect(screen, (255, 255, 255),
+                                 pygame.Rect(x0, 0, max(1, x1 - x0),
+                                             max(1, screen.get_height() - 1)), 2)
+            else:
+                a = vp.world_to_screen(0.0, fh)
+                b = vp.world_to_screen(fw, 0.0)
+                pygame.draw.rect(
+                    screen, (255, 255, 255),
+                    pygame.Rect(int(min(a[0], b[0])), int(min(a[1], b[1])),
+                                max(1, int(abs(b[0] - a[0]))), max(1, int(abs(b[1] - a[1])))),
+                    2)
 
         # --- 标定参考物：画在**所有东西之上** ---------------------------
         # 位置在这里是有意的：障碍物/玩家先画，参考物最后覆盖上去，
@@ -769,6 +806,17 @@ class PygameRenderer:
         except Exception:  # pragma: no cover - predictor errors must not break the view
             return
         vp = self.viewport
+        if self.follow_player:
+            # 视口跟着角色：中心 = (场地中线, 角色 y)，缩放让 follow_h 刚好铺满窗口高度。
+            # 水平仍是全宽（640），于是画面里永远只有"当前这一屏"的 1~2 道墙。
+            py = float(world.player[1]) if hasattr(world, "player") else 0.0
+            vp.center = (float(world.state.env.field_w) * 0.5, py)
+            half = max(60.0, 0.5 * self.follow_h)
+            vp.zoom = (vp.usable_h / (2.0 * half)) / max(1e-9, vp.fit_scale)
+            self._band = (py - half, py + half)
+        else:
+            vp.center = None
+            self._band = None
         for line in prediction_polylines(forecast, max_lines=self.max_prediction_lines):
             pts = [vp.world_to_screen(float(x), float(y)) for x, y in line]
             if len(pts) >= 2:
@@ -840,6 +888,17 @@ class PygameRenderer:
         if danger is None:
             return
         vp = self.viewport
+        if self.follow_player:
+            # 视口跟着角色：中心 = (场地中线, 角色 y)，缩放让 follow_h 刚好铺满窗口高度。
+            # 水平仍是全宽（640），于是画面里永远只有"当前这一屏"的 1~2 道墙。
+            py = float(world.player[1]) if hasattr(world, "player") else 0.0
+            vp.center = (float(world.state.env.field_w) * 0.5, py)
+            half = max(60.0, 0.5 * self.follow_h)
+            vp.zoom = (vp.usable_h / (2.0 * half)) / max(1e-9, vp.fit_scale)
+            self._band = (py - half, py + half)
+        else:
+            vp.center = None
+            self._band = None
         # **分层色**：把连续的危险值量化成 4 档，每档一个颜色（用户要的"分层"观感）。
         # 只是显示方式，不改变势图数值本身。
         layer = pygame.Surface(self._size, pygame.SRCALPHA)
