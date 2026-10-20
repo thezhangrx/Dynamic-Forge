@@ -327,6 +327,25 @@ def main(argv: list[str] | None = None) -> int:
     cooldown_until = 0.0
     cooldown_gaps: list[tuple[float, float]] = []
 
+    def gap_suspect(gy: float, gl: float, gr: float) -> str:
+        """判断这条候选的缺口是不是"配错行配来的"。
+
+        依据（来自日志实测）：同一暂停窗口里两道墙都可见时，VT 偶尔把 A 行的缺口
+        贴到 B 行上 —— 表现就是"两行的缺口完全相同"，而真缺口左右交替、中心
+        相差 60~150。所以：
+          dup_known : 与某道已知墙（y 差 ≤250）的缺口在 ±25 内完全相同
+          dup_batch : 与本次同批候选的缺口重复（另一道墙已在 y 差 ≥100 处）
+          edge      : 缺口贴到画面边缘（gl<20 或 gr>620），这一行多半没测准
+        """
+        if gl < 20.0 or gr > 620.0:
+            return "edge"
+        for d in known_detail:
+            if abs(float(d["y"]) - gy) <= 250.0 \
+                    and abs(float(d["gl"]) - gl) <= 25.0 \
+                    and abs(float(d["gr"]) - gr) <= 25.0:
+                return "dup_known"
+        return ""
+
     def emit_state(px: float, py: float, pr: float) -> None:
         nonlocal seq
         obs = []
@@ -426,33 +445,45 @@ def main(argv: list[str] | None = None) -> int:
             #: VT 量到的角色 x 应该 ≈ 主机 px。偏了就说明白框/四边形检测坏了，
             #: 这一帧的缺口 x 一律不可信 —— 整帧丢掉，别让它污染 known。
             pv = s.get("player")
-            #: 只在"停住"时做几何判据：角色在动的时候，VT 帧比当前位姿旧
-            #: ~0.5 s，|dx| 天然就有一两百（200 单位/s × 0.5 s），会把好帧误杀。
-            still = (int(last_act) == 0) and not paused
-            if pv is not None and a.player_tol > 0 and (still or paused):
-                dx_p = float(pv[0]) - px
-                if abs(dx_p) > a.player_tol:
-                    geom_rej_n += 1
-                    ev("geom_reject", dx=round(dx_p, 1), vt_seq=int(s["seq"]),
-                       player=[round(float(pv[0]), 1), round(float(pv[1]), 1)],
-                       px=round(px, 1), n_vt=len(walls))
-                    walls = []
-                    if (geom_rej_n >= 6
-                            and time.monotonic() - geom_warn_t > 5.0
-                            and not known):
-                        geom_warn_t = time.monotonic()
-                        print(f"GEOM_BAD rejects={geom_rej_n} "
-                              f"player_x={float(pv[0]):.0f} px={px:.0f} "
-                              f"dx={dx_p:+.0f}（相机没看到页面？）",
-                              file=sys.stderr, flush=True)
-            now_m = time.monotonic()
-            #: 暂停时姿态是停住的，VT 帧（0.5 s 延迟）用的就是当前 py；再叠一层
-            #: "用帧内角色 y 反推拍照位姿"反而会把视口被夹住的情况算错，所以直接
-            #: 用当前 py + 可见带夹取。
+            dx_p = None if pv is None else float(pv[0]) - px
+            #: 竖直方向的"帧新鲜度"：页面按当前 py 画角色，所以角色在帧里的 vy
+            #: 必然是 (py-lo)/scale。实测偏差 >15 就说明这一帧还是"角色更靠下时"
+            #: 拍的 —— 用当前 py 去映射它，墙的 y 会整体偏大 70~140（实测 +69）。
+            lo_now = py - half
+            if lo_now < 0.0:
+                lo_now = 0.0
+            elif lo_now > a.field_h - 2.0 * half:
+                lo_now = max(0.0, a.field_h - 2.0 * half)
+            vy_expect = (py - lo_now) / max(1e-6, a.y_scale)
+            dy_p = None if pv is None else float(pv[1]) - vy_expect
+            #: 帧新鲜度门：VT 帧比当前位姿旧 ~0.5 s，角色一秒走 200 单位，
+            #: 所以"帧里的角色 x"和主机 px 差多少，就等于这一帧旧了多少。
+            #: 暂停后 settle 秒内的帧一律不用；settle 之后只收 |dx|≤12 的新鲜帧。
+            #: 这样入表的 y/缺口都来自"停稳那几帧"，不会再出现整行错位。
+            py_cap = py
+            if pv is not None and dy_p is not None:
+                #: 帧里的角色比"当前 py 应有的位置"偏下多少，就说明这一帧是
+                #: 角色还低那么多的时候拍的 → 用 py_cap 去映射，y 就不会偏。
+                #: 丢帧会让墙学不到（实测只学到 4 道、整轮卡死），修正更好。
+                py_cap = py - dy_p * a.y_scale
+                if abs(dy_p) > 6.0:
+                    ev("stale_corrected", dy=round(dy_p, 1),
+                       vt_seq=int(s["seq"]), py=round(py, 1),
+                       py_cap=round(py_cap, 1))
+            if pv is not None and paused and time.monotonic() - pause_t0 < a.settle:
+                ev("settle_skip", dx=round(dx_p, 1), vt_seq=int(s["seq"]))
+                walls = []
+            #: 粗判据：|dx| 大到"根本不是这张页面"（相机被别的窗口挡住时 ~200）
+            elif pv is not None and a.player_tol > 0 and abs(dx_p) > a.player_tol * 4:
+                geom_rej_n += 1
+                ev("geom_reject", dx=round(dx_p, 1), vt_seq=int(s["seq"]),
+                   player=[round(float(pv[0]), 1), round(float(pv[1]), 1)],
+                   px=round(px, 1), n_vt=len(walls))
+                walls = []
             for w in walls:
-                gy = vt_world_y(w["y"], py, half, a.y_scale, a.y_bias, a.field_h)
+                gy = vt_world_y(w["y"], py_cap, half, a.y_scale, a.y_bias, a.field_h)
                 ahead = gy - py
-                if not (5.0 < gy < a.field_h - 8.0) or ahead < -20.0:
+                if not (5.0 < gy < a.field_h - 8.0) or ahead < -5.0:
                     continue
                 #: 贴近的墙（视野下沿）几何误差更大，缺口再放宽一点。
                 margin = a.gap_margin if ahead >= 60.0 else a.gap_margin + 6.0
@@ -549,9 +580,22 @@ def main(argv: list[str] | None = None) -> int:
                         link.send_move(nudge_act if time.monotonic() < nudge_until
                                        else last_act)
                 if paused:
+                    _batch_gaps: list[tuple[float, float, float]] = []
                     for gy, gl, gr in accept:
                         if any(abs(gy - k) <= 55.0 for k in known):
                             continue
+                        _why = gap_suspect(gy, gl, gr)
+                        if not _why:
+                            for (_by, _bgl, _bgr) in _batch_gaps:
+                                if abs(_bgl - gl) <= 20.0 and abs(_bgr - gr) <= 20.0 \
+                                        and abs(_by - gy) >= 100.0:
+                                    _why = "dup_batch"
+                                    break
+                        if _why:
+                            ev("reject_gap", why=_why, y=round(gy, 1),
+                               gl=round(gl, 1), gr=round(gr, 1))
+                            continue
+                        _batch_gaps.append((gy, gl, gr))
                         known.append(gy)
                         known_detail.append({"y": round(gy, 1), "gl": round(gl, 1),
                                              "gr": round(gr, 1),
