@@ -269,13 +269,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--view-h", type=float, default=480.0)
     ap.add_argument("--inflate", type=float, default=26.0)
     ap.add_argument("--pause-ahead", type=float, default=220.0)
-    ap.add_argument("--y-bias", type=float, default=8.0,
-                    help="标定：world=(py-half)+0.972*vy+8（用两道已知缺口的墙拟合）")
+    ap.add_argument("--y-bias", type=float, default=0.0,
+                    help="同上的截距；外部四边形正确时为 0")
     ap.add_argument("--calib-file", default="/tmp/calib_y.json",
                     help="自动标定结果文件（scale/bias），存在时覆盖命令行默认值")
-    ap.add_argument("--y-scale", type=float, default=0.972,
-                    help="白框加粗后四边形按框外沿算，实测行坐标 = 1.0286*真值+12.6，"
-                         "所以这里 1/1.0286")
+    ap.add_argument("--y-scale", type=float, default=1.0,
+                    help="换算系数。**用主机下发的四边形（VT 的 quad_ext=1）时必须是 "
+                         "1.0**：此时 vy 就是页面局部坐标(0=可见带下沿)，"
+                         "world=(py-half)+vy 本来就成立；0.972/8 是当年白框检测"
+                         "退化时的补丁，已被 calib_y 自动标定取代")
     ap.add_argument("--gap-margin", type=float, default=10.0)
     ap.add_argument("--state-file", default="/tmp/board_state.txt",
                     help="把发给决策的 @STATE 逐行落盘（事后核查墙覆盖率）")
