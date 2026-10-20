@@ -506,11 +506,15 @@ def main(argv: list[str] | None = None) -> int:
             #: 暂停后 settle 秒内的帧一律不用；settle 之后只收 |dx|≤12 的新鲜帧。
             #: 这样入表的 y/缺口都来自"停稳那几帧"，不会再出现整行错位。
             py_cap = py
+            contemporaneous = True
             if pv is not None and dy_p is not None:
                 #: 帧里的角色比"当前 py 应有的位置"偏下多少，就说明这一帧是
                 #: 角色还低那么多的时候拍的 → 用 py_cap 去映射，y 就不会偏。
                 #: 丢帧会让墙学不到（实测只学到 4 道、整轮卡死），修正更好。
                 py_cap = py - dy_p * a.y_scale
+                #: 只有"帧里的角色与当前位姿基本重合"的帧才算同拍（|dy|≤5 → 位移
+                #: ≤5 单位）。这类帧的墙行才可信；旧帧只用来触发暂停，不进测量。
+                contemporaneous = abs(dy_p) <= 5.0
                 if abs(dy_p) > 6.0:
                     ev("stale_corrected", dy=round(dy_p, 1),
                        vt_seq=int(s["seq"]), py=round(py, 1),
@@ -518,8 +522,12 @@ def main(argv: list[str] | None = None) -> int:
             if pv is not None and paused and time.monotonic() - pause_t0 < a.settle:
                 ev("settle_skip", dx=round(dx_p, 1), vt_seq=int(s["seq"]))
                 walls = []
-            #: 粗判据：|dx| 大到"根本不是这张页面"（相机被别的窗口挡住时 ~200）
-            elif pv is not None and a.player_tol > 0 and abs(dx_p) > a.player_tol * 4:
+            #: 粗判据只在"离谱"时触发：角色在动时 VT 帧旧 0.5 s，200~300 单位/s
+            #: 下 |dx| 天然 100~150（实测把阈值放在 4×tol=120 会误杀 48% 的好帧，
+            #: 导致暂停不触发、覆盖率掉到 10/24；完全没有阈值又会放进旧帧导致撞墙）。
+            #: 取 tol*20（≈600）：只挡"相机根本没看页面"那种 dx≈500 的情况。
+            elif (pv is not None and a.player_tol > 0
+                  and abs(dx_p) > a.player_tol * 20):
                 geom_rej_n += 1
                 ev("geom_reject", dx=round(dx_p, 1), vt_seq=int(s["seq"]),
                    player=[round(float(pv[0]), 1), round(float(pv[1]), 1)],
@@ -575,6 +583,9 @@ def main(argv: list[str] | None = None) -> int:
                 #: 暂停刚发出时 VT 帧还可能是"动着的"那一帧：等 0.35 s 再开始收，
                 #: 之后的帧才是停稳后拍的（否则 y/缺口带着运动模糊的偏差）。
                 if time.monotonic() - pause_t0 >= a.settle:
+                    #: 注意：不要用 |dy|（帧里角色位置与预期之差）当"同时性"闸门 ——
+                    #: 实测它不是抖动而是系统偏 ~101 px（页面可见带实际比 follow_h
+                    #: 假设的高），一加就得 0 道墙。留作诊断字段即可。
                     pause_seen.extend(raw)
                 del pause_seen[:-30]
                 waited = time.monotonic() - pause_t0
