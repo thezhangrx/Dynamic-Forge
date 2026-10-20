@@ -230,6 +230,8 @@ class SshLink:
         self.poses = 0
         self.pose_seq = 0
         self.move_log: list[tuple[float, int]] = []
+        self.geom_bad = False
+        self.geom_bad_msg = ""
         self._stop = False
         cmd = ["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
                "-o", "ServerAliveInterval=5", target,
@@ -243,8 +245,14 @@ class SshLink:
     def _drain_err(self) -> None:
         for line in self.proc.stderr:
             txt = line.decode("utf-8", "ignore").rstrip()
-            if txt:
-                print(f"  [board] {txt}", file=sys.stderr)
+            if not txt:
+                continue
+            if "GEOM_BAD" in txt:
+                #: 板端明确说"相机里没有页面"：记下来，主机 8 s 后提前收工，
+                #: 别白跑 300 s 再发现一条墙都没学到。
+                self.geom_bad = True
+                self.geom_bad_msg = txt
+            print(f"  [board] {txt}", file=sys.stderr)
 
     def _read(self) -> None:
         for line in self.proc.stdout:
@@ -334,6 +342,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--viewer-pos", default="320,60")
     ap.add_argument("--viewer-size", default="1280x960")
     ap.add_argument("--hold", type=float, default=2.0)
+    ap.add_argument("--wall-rgb", default="200,60,0",
+                    help="墙颜色（相机 VT 对比度不够时可以调成纯色）")
+    ap.add_argument("--field-rgb", default="34,40,55", help="场地底色")
+    ap.add_argument("--bg-rgb", default="8,10,14", help="场地外底色")
+    ap.add_argument("--viewer-margin", type=int, default=0,
+                    help="页面窗口四周留黑边（实测 24 会把黑边算进四边形，默认 0）")
+    ap.add_argument("--frame-px", type=int, default=2,
+                    help="页面白框粗细（相机 VT 靠它定四边形，太细会锁错框）")
     ap.add_argument("--field-every", type=int, default=2,
                     help="热力图抽样：每 N 个格子画一次（1=最细但很贵）")
     ap.add_argument("--profile", action="store_true", help="每 2 s 打一次循环耗时")
@@ -382,13 +398,27 @@ def main(argv: list[str] | None = None) -> int:
         return cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"),
                                float(fps), (640, 480))
 
+    def _rgb(text: str, default: tuple[int, int, int]) -> tuple[int, int, int]:
+        try:
+            parts = [int(v) for v in str(text).replace(" ", "").split(",")]
+            if len(parts) == 3:
+                return (max(0, min(255, parts[0])), max(0, min(255, parts[1])),
+                        max(0, min(255, parts[2])))
+        except ValueError:
+            pass
+        return default
+
+    wall_rgb = _rgb(a.wall_rgb, (200, 60, 0))
+    field_rgb = _rgb(a.field_rgb, (34, 40, 55))
+    bg_rgb = _rgb(a.bg_rgb, (8, 10, 14))
     common = dict(mode="rgb_array", window_size=(640, 480), show_hud=False,
                   show_text=False, show_fiducials=False, show_world_axes=False,
-                  show_field_border=True, show_hitboxes=False,
+                  show_field_border=True, frame_px=int(a.frame_px),
+                  show_hitboxes=False,
                   follow_player=True, follow_h=240.0,
                   follow_scale=float(a.follow_scale),
-                  wall_color=(200, 60, 0), background=(8, 10, 14),
-                  field_bg=(34, 40, 55), resizable=False)
+                  wall_color=wall_rgb, background=bg_rgb,
+                  field_bg=field_rgb, resizable=False)
     page = PygameRenderer(show_potential=False, **common)
     field_view = PygameRenderer(show_potential=True,
                                 potential_every=max(1, int(a.field_every)),
@@ -431,7 +461,8 @@ def main(argv: list[str] | None = None) -> int:
             [sys.executable, str(ROOT / "core/board/tools/page_view.py"),
              "--url", f"http://127.0.0.1:{a.port}/stream.mjpg",
              "--x", vx, "--y", vy, "--w", vw, "--h", vh,
-             "--fps", f"{max(20.0, a.render_hz):g}"],
+             "--fps", f"{max(20.0, a.render_hz):g}",
+             "--margin", str(int(a.viewer_margin))],
             env=venv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     board_files = {"state": str(run_dir / "board_state.txt"),
@@ -482,6 +513,7 @@ def main(argv: list[str] | None = None) -> int:
     collisions = 0
     min_clear: float | None = None
     min_clear_at: list | None = None
+    abort_reason = None
     if not a.board_ssh:
         print("  等板子连 TCP ...", file=sys.stderr)
     prof = {"it": 0, "step": 0.0, "page": 0.0, "field": 0.0, "t": time.monotonic()}
@@ -597,6 +629,9 @@ def main(argv: list[str] | None = None) -> int:
                       queued=field_rec.q.qsize(), dropped=field_rec.dropped)
         if (px - goal[0]) ** 2 + (py - goal[1]) ** 2 <= goal_r ** 2:
             reached = True
+        if getattr(link, "geom_bad", False) and t_sim > 8.0:
+            abort_reason = "camera_not_page"
+            break
         prof["step"] += _st_ms
         if a.profile and time.monotonic() - prof["t"] >= 2.0:
             el = time.monotonic() - prof["t"]
@@ -629,6 +664,7 @@ def main(argv: list[str] | None = None) -> int:
         "render_ms": round(1000.0 * render_t / max(1, fw.written + vw_.written), 2),
         "peer": link.peer,
         "videos": {"follow": str(follow_mp4), "field": str(field_mp4)},
+        "abort_reason": abort_reason,
         "run_dir": str(run_dir),
         "logs": log.counts(),
     }

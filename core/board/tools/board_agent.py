@@ -386,6 +386,8 @@ def main(argv: list[str] | None = None) -> int:
        inflate=a.inflate, y_bias=a.y_bias, y_scale=a.y_scale,
        gap_margin=a.gap_margin, settle=a.settle, warmup=a.warmup,
        goal=list(a.goal))
+    geom_rej_n = 0
+    geom_warn_t = 0.0
     last_status = 0.0
     extras: list[tuple[float, float, float]] = []
     while True:
@@ -421,10 +423,19 @@ def main(argv: list[str] | None = None) -> int:
             if pv is not None and a.player_tol > 0:
                 dx_p = float(pv[0]) - px
                 if abs(dx_p) > a.player_tol:
+                    geom_rej_n += 1
                     ev("geom_reject", dx=round(dx_p, 1), vt_seq=int(s["seq"]),
                        player=[round(float(pv[0]), 1), round(float(pv[1]), 1)],
                        px=round(px, 1), n_vt=len(walls))
                     walls = []
+                    if (geom_rej_n >= 6
+                            and time.monotonic() - geom_warn_t > 5.0
+                            and not known):
+                        geom_warn_t = time.monotonic()
+                        print(f"GEOM_BAD rejects={geom_rej_n} "
+                              f"player_x={float(pv[0]):.0f} px={px:.0f} "
+                              f"dx={dx_p:+.0f}（相机没看到页面？）",
+                              file=sys.stderr, flush=True)
             now_m = time.monotonic()
             #: 暂停时姿态是停住的，VT 帧（0.5 s 延迟）用的就是当前 py；再叠一层
             #: "用帧内角色 y 反推拍照位姿"反而会把视口被夹住的情况算错，所以直接

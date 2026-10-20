@@ -133,6 +133,7 @@ class PygameRenderer:
         follow_scale: float = 1.0,
         fiducial_side: float = 28.0,   # 28 场地单位：够定边界，又不会挡住宅的墙/缺口
         show_field_border: bool = True,
+        frame_px: int = 2,
         window_timeout_s: float = 20.0,
     ) -> None:
         self.mode = mode
@@ -237,6 +238,7 @@ class PygameRenderer:
         #: 场地外框那 1 像素的线。相机拍屏幕时它是一条**横贯画面的长线**，会被
         #: 视觉判成矩形（实测：几何帧里多出一条贴底边的"墙"），板子在环里时关掉。
         self.show_field_border = bool(show_field_border)
+        self.frame_px = max(1, int(frame_px))
         #: 墙（矩形障碍）的颜色。**和视觉链路的契约**，见 ``WALL_COLOR``。
         self.wall_color = (int(wall_color[0]), int(wall_color[1]), int(wall_color[2]))
         self.viewport: Viewport | None = None
@@ -544,17 +546,27 @@ class PygameRenderer:
                 a = vp.world_to_screen(0.0, 0.0)
                 b = vp.world_to_screen(fw, 0.0)
                 x0 = int(round(min(a[0], b[0]))); x1 = int(round(max(a[0], b[0])))
+                #: 相机 VT 靠这个白框定四边形：太细（2 px）在 320×240 里只剩
+                #: 1 px，边缘检测会锁到一个更大的梯形，整幅图被压缩平移，缺口
+                #: x 全错。加粗到 frame_px 并内缩一半，保证完整可见。
+                t = int(self.frame_px)
+                inset = t // 2
                 pygame.draw.rect(screen, (255, 255, 255),
-                                 pygame.Rect(x0, 0, max(1, x1 - x0),
-                                             max(1, screen.get_height() - 1)), 2)
+                                 pygame.Rect(x0 + inset, inset,
+                                             max(1, x1 - x0 - 2 * inset),
+                                             max(1, screen.get_height() - 1 - 2 * inset)),
+                                 t)
             else:
                 a = vp.world_to_screen(0.0, fh)
                 b = vp.world_to_screen(fw, 0.0)
+                _t = int(self.frame_px)
+                _in = _t // 2
                 pygame.draw.rect(
                     screen, (255, 255, 255),
-                    pygame.Rect(int(min(a[0], b[0])), int(min(a[1], b[1])),
-                                max(1, int(abs(b[0] - a[0]))), max(1, int(abs(b[1] - a[1])))),
-                    2)
+                    pygame.Rect(int(min(a[0], b[0])) + _in, int(min(a[1], b[1])) + _in,
+                                max(1, int(abs(b[0] - a[0])) - 2 * _in),
+                                max(1, int(abs(b[1] - a[1])) - 2 * _in)),
+                    _t)
 
         # --- 标定参考物：画在**所有东西之上** ---------------------------
         # 位置在这里是有意的：障碍物/玩家先画，参考物最后覆盖上去，

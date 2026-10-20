@@ -71,6 +71,11 @@ class WindowRaiser:
             self._raise.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
             self._flush = x11.XFlush
             self._flush.argtypes = [ctypes.c_void_p]
+            #: 光 raise 有时压不住别的窗口（终端抢焦点后又会盖回来），
+            #: 再把输入焦点抢过来 —— 实测这样才能稳定待在相机视野里。
+            self._focus = x11.XSetInputFocus
+            self._focus.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                    ctypes.c_int, ctypes.c_ulong]
         except Exception:                                # noqa: BLE001
             self.dpy = None
 
@@ -78,7 +83,16 @@ class WindowRaiser:
         if self.dpy is None:
             return
         try:
+            #: 每次重新问一遍窗口 id：窗口刚创建时 get_wm_info() 可能还返回旧的
+            #: （实测僵持在错误 id 上，页面就一直被终端盖着）
+            wid = pygame.display.get_wm_info().get("window")
+            if wid:
+                self.wid = ctypes.c_ulong(wid)
             self._raise(self.dpy, self.wid)
+            try:
+                self._focus(self.dpy, self.wid, 1, 0)   # RevertToPointerRoot, CurrentTime
+            except Exception:                            # noqa: BLE001
+                pass
             self._flush(self.dpy)
         except Exception:                                # noqa: BLE001
             pass
@@ -94,6 +108,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--hold", action=argparse.BooleanOptionalAction, default=True,
                     help="流断了以后保留最后一帧（默认开）")
+    ap.add_argument("--margin", type=int, default=24,
+                    help="页面四周留黑边（相机 VT 靠白框定四边形，留边更稳）")
     ap.add_argument("--idle-exit", type=float, default=8.0,
                     help="N 秒没新帧就自己退出（避免旧窗口一直盖在新页面上）")
     args = ap.parse_args(argv)
@@ -108,8 +124,7 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
     pygame.display.set_caption("platform live")
-    raiser = WindowRaiser()
-    raiser.raise_now()
+    raiser = None
     font = pygame.font.SysFont("monospace", 18)
     print(f"viewer window {args.w}x{args.h} at ({args.x},{args.y})  url={args.url}",
           flush=True)
@@ -140,9 +155,12 @@ def main(argv: list[str] | None = None) -> int:
                 if last_frame is not None:
                     rgb = cv2.cvtColor(last_frame, cv2.COLOR_BGR2RGB)
                     surf = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
-                    if surf.get_size() != (args.w, args.h):
-                        surf = pygame.transform.smoothscale(surf, (args.w, args.h))
-                    screen.blit(surf, (0, 0))
+                    m = max(0, min(args.margin, min(args.w, args.h) // 4))
+                    inner = (args.w - 2 * m, args.h - 2 * m)
+                    if surf.get_size() != inner:
+                        surf = pygame.transform.smoothscale(surf, inner)
+                    screen.fill((0, 0, 0))
+                    screen.blit(surf, (m, m))
                 elif not args.hold:
                     screen.fill((0, 0, 0))
                 else:
@@ -155,11 +173,13 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"⚠ 15 s 没收到帧：{client.last_error}", file=sys.stderr)
                         waiting_since = now
                 pygame.display.flip()
+                if raiser is None:
+                    raiser = WindowRaiser()
             if args.idle_exit > 0 and now - waiting_since > args.idle_exit:
                 print(f"⚠ {args.idle_exit:g} s 没新帧，退出（防止僵窗盖住新页面）",
                       file=sys.stderr, flush=True)
                 return 0
-            if now - last_raise >= 1.0:
+            if raiser is not None and now - last_raise >= 0.5:
                 #: 每秒顶一次，防止终端/编辑器跑上来盖住页面（盖住 = VT 读文字）
                 last_raise = now
                 raiser.raise_now()
