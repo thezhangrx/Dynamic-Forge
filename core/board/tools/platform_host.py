@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -111,6 +112,66 @@ class Link:
             pass
 
 
+class SshLink:
+    """反向通道：主机 ssh 起 board_agent --stdio，stdin 发 @POSE，stdout 收 @MOVE。"""
+
+    def __init__(self, target: str, key: str, agent: str,
+                 python: str = "python3", extra: str = "") -> None:
+        self.peer = f"ssh:{target}"
+        self._lock = threading.Lock()
+        self.act = 0
+        self.moves = 0
+        self.poses = 0
+        self._stop = False
+        cmd = ["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
+               "-o", "ServerAliveInterval=5", target,
+               f"{python} {agent} --stdio {extra}".strip()]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE)
+        threading.Thread(target=self._read, daemon=True).start()
+        threading.Thread(target=self._drain_err, daemon=True).start()
+
+    def _drain_err(self) -> None:
+        for line in self.proc.stderr:
+            txt = line.decode("utf-8", "ignore").rstrip()
+            if txt:
+                print(f"  [board] {txt}", file=sys.stderr)
+
+    def _read(self) -> None:
+        for line in self.proc.stdout:
+            txt = line.decode("utf-8", "ignore").strip()
+            if txt.startswith("@MOVE"):
+                try:
+                    a = int(txt.split()[1])
+                except (IndexError, ValueError):
+                    continue
+                with self._lock:
+                    self.act = a
+                    self.moves += 1
+
+    def ready(self) -> bool:
+        return self.proc.poll() is None
+
+    def send_pose(self, x: float, y: float, r: float) -> bool:
+        if self.proc.poll() is not None:
+            return False
+        try:
+            self.proc.stdin.write(f"@POSE {x:.2f} {y:.2f} {r:.2f}\n".encode())
+            self.proc.stdin.flush()
+            self.poses += 1
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def stop(self) -> None:
+        self._stop = True
+        try:
+            self.proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="主机：只渲染平台 + 回放 @MOVE")
     ap.add_argument("--scenario", default=str(ROOT / "configs/20_walls_alt_24_dy140.json"))
@@ -127,6 +188,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--viewer-pos", default="320,60")
     ap.add_argument("--viewer-size", default="1280x960")
     ap.add_argument("--hold", type=float, default=2.0)
+    ap.add_argument("--board-ssh", default="",
+                    help="板子 ssh 目标，如 root@192.168.137.242（板子连不到主机时用）")
+    ap.add_argument("--ssh-key", default=str(ROOT / "data/fpga/board_ssh/board_key"))
+    ap.add_argument("--board-agent", default="/root/tools/board_agent.py")
+    ap.add_argument("--board-python", default="python3")
+    ap.add_argument("--board-extra", default="")
+    ap.add_argument("--connect-timeout", type=float, default=90.0)
     a = ap.parse_args(argv)
 
     spec = ScenarioSpec.load(a.scenario)
@@ -163,7 +231,10 @@ def main(argv: list[str] | None = None) -> int:
     base = page.render(env.world)
     server.publish(base)
     publisher = PagePublisher(server, fps=max(10.0, a.render_hz)).start()
-    print(f"  page http://127.0.0.1:{a.port}/   TCP @MOVE 端口 {a.tcp}", file=sys.stderr)
+    if a.board_ssh:
+        print(f"  page http://127.0.0.1:{a.port}/   ssh 反向通道 {a.board_ssh}", file=sys.stderr)
+    else:
+        print(f"  page http://127.0.0.1:{a.port}/   TCP @MOVE 端口 {a.tcp}", file=sys.stderr)
 
     viewer = None
     if a.viewer:
@@ -184,14 +255,28 @@ def main(argv: list[str] | None = None) -> int:
     fw = writer(follow_mp4, a.render_hz)
     vw_ = writer(field_mp4, a.field_hz)
 
-    link = Link(a.tcp)
+    if a.board_ssh:
+        link = SshLink(a.board_ssh, a.ssh_key, a.board_agent,
+                       python=a.board_python, extra=a.board_extra)
+        t_wait = time.monotonic()
+        while link.moves == 0 and time.monotonic() - t_wait < a.connect_timeout:
+            if not link.send_pose(*[float(v) for v in (env.world.player[0],
+                                                       env.world.player[1],
+                                                       env.world.player[4])]):
+                time.sleep(0.05)
+            time.sleep(0.02)
+        print(f"  板子已发首批动作 moves={link.moves}", file=sys.stderr)
+    else:
+        link = Link(a.tcp)
     t0 = time.monotonic()
     t_sim = 0.0
     last_page = 0.0
     last_field = 0.0
+    last_pose_t = 0.0
     reached = False
     collisions = 0
-    print("  等板子连 TCP ...", file=sys.stderr)
+    if not a.board_ssh:
+        print("  等板子连 TCP ...", file=sys.stderr)
     while t_sim < a.max_seconds and not reached:
         now = time.monotonic()
         with link._lock:
@@ -201,7 +286,10 @@ def main(argv: list[str] | None = None) -> int:
         px, py = float(env.world.player[0]), float(env.world.player[1])
         r = float(env.world.player[4])
         t_sim += dt
-        link.send_pose(px, py, r)
+        if now - last_pose_t >= 0.04:
+            #: 姿态 25 Hz 就够（板端 VT 才 2 Hz），发太快 ssh 通道会把主循环拖慢。
+            last_pose_t = now
+            link.send_pose(px, py, r)
         if now - last_page >= 1.0 / max(1.0, a.render_hz):
             last_page = now
             fr = page.render(env.world)
@@ -226,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
         "wall_s": round(time.monotonic() - t0, 2),
         "final_pos": [round(px, 1), round(py, 1)],
         "collisions": collisions, "moves": link.moves, "poses": link.poses,
-        "tcp_peer": link.peer,
+        "peer": link.peer,
         "videos": {"follow": str(follow_mp4), "field": str(field_mp4)},
     }
     (Path(str(stem) + ".json")).write_text(json.dumps(summary, ensure_ascii=False,
