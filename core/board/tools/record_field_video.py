@@ -275,8 +275,11 @@ def main():
                 cv2.line(img, (int(x1), int(sy1)), (int(x2), int(sy2)), (255, 255, 255), 2)
             psy = view_h - (py - view_y)
             cv2.circle(img, (int(px), int(psy)), int(R_P), (255, 255, 255), -1)
+            #: 纯视觉方案开头几帧板子还没有任何墙（@STATE n=0），mc 还是 None；
+            #: 直接格式化会炸，这里显式处理。
+            mc_txt = "--" if mc is None else f"{mc:+.1f}"
             cv2.putText(img,
-                        f"board M1  act={act} sw={switches} clear={mc:+.1f} "
+                        f"board M1  act={act} sw={switches} clear={mc_txt} "
                         f"view_y={view_y:.0f}",
                         (8, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
             cv2.putText(img, "orange=wall  dark-red=inflate(+13)  white=player  green=goal",

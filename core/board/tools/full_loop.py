@@ -717,6 +717,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="VT 墙映射回场地后与已知墙的最大匹配距离")
     ap.add_argument("--new-wall-margin", type=float, default=30.0,
                     help="候选新墙必须比已知最高墙再高多少")
+    ap.add_argument("--vt-y-bias", type=float, default=-8.0,
+                    help="VT 墙行相对真实墙行的固定偏移（相机/屏幕标定；实测 +8）")
+    ap.add_argument("--gap-margin", type=float, default=6.0,
+                    help="把视觉量到的缺口两边各收多少（保守通过，纯视觉不掺真值）")
     ap.add_argument("--pause-ahead", type=float, default=160.0,
                     help="新墙离角色还有多少场地单位时才暂停（越大越早停）")
     ap.add_argument("--pause-timeout", type=float, default=12.0)
@@ -1214,14 +1218,48 @@ def main(argv: list[str] | None = None) -> int:
         return any(abs(y - k) <= args.wall_match_tol for k in known)
 
     state_seg_counts: list[int] = []
+    state_vt_segs: list[int] = []
 
     def make_state(seq: int) -> str:
+        """组装 @STATE。
+
+        **默认（不给 --send-all-walls）：墙的几何也来自相机 VT** ——
+        用 `known_detail` 里冻结那一帧量到的缺口 `gl/gr` 直接拼左右两段，
+        y 用 VT 确认的墙行（不再是仿真真值）。没被视觉确认的墙一律不发，
+        所以板子的决策信息只来自：视觉的墙 + 自身位姿（里程计）。
+        `--send-all-walls` 保留旧的全真值行为（只用于对照实验）。
+        """
         pl = env.world.player
-        obs = []
-        for (x, y, hw, hh) in walls_of(env):
-            if not wall_filter(y):
-                continue
-            obs.append(f"{x:.1f} {y:.1f} {hw:.1f} {hh:.1f} 0.0")
+        obs: list[str] = []
+        if args.send_all_walls:
+            for (x, y, hw, hh) in walls_of(env):
+                if not wall_filter(y):
+                    continue
+                obs.append(f"{x:.1f} {y:.1f} {hw:.1f} {hh:.1f} 0.0")
+        else:
+            n_vt = 0
+            for d in known_detail:
+                if d.get("source") not in ("camera_vt_pause", "camera_vt_init"):
+                    continue
+                #: VT 的墙行有固定的标定偏移（实测 +8 单位，来自相机/屏幕几何），
+                #: 用 --vt-y-bias 折掉；这是**一次性标定常数**，不是每帧真值。
+                y = float(d["y"]) + args.vt_y_bias
+                gl = float(d.get("gl", 0.0)); gr = float(d.get("gr", 640.0))
+                if not (5.0 < y < field_h - 5.0) or gr - gl < 40.0:
+                    continue
+                #: 视觉量到的缺口两边各收 `--gap-margin`：VT 的缺口边界有 ~10 单位
+                #: 误差（实测），收一点让板子瞄中间，不从边缘擦过去。
+                gl = gl + args.gap_margin
+                gr = gr - args.gap_margin
+                if gr - gl < 30.0:
+                    continue
+                if gl > 4.0:
+                    obs.append(f"{gl * 0.5:.1f} {y:.1f} {gl * 0.5:.1f} 4.0 0.0")
+                if gr < 636.0:
+                    obs.append(f"{(gr + 640.0) * 0.5:.1f} {y:.1f} "
+                               f"{(640.0 - gr) * 0.5:.1f} 4.0 0.0")
+                n_vt += 1
+            state_vt_segs.append(n_vt)
         state_seg_counts.append(len(obs))
         return (f"@STATE {seq} {float(pl[0]):.1f} {float(pl[1]):.1f} "
                 f"{float(pl[4]):.1f} {len(obs)} " + " ".join(obs) + "\n")
@@ -1696,6 +1734,8 @@ def main(argv: list[str] | None = None) -> int:
             },
             "vt_error": vt.err if vt is not None else "",
         },
+        "vt_walls_sent": {"min": min(state_vt_segs) if state_vt_segs else None,
+                          "max": max(state_vt_segs) if state_vt_segs else None},
         "page": {
             "render_hz": float(args.render_hz),
             "published": int(publisher.published),
