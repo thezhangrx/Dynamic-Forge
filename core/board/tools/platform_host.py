@@ -377,16 +377,33 @@ def fetch_board_files(target: str, key: str, run_dir: Path,
         "board_state.txt": "cat /tmp/board_state.txt",
         "board_events.jsonl": "cat /tmp/board_events.jsonl",
         "board_vt.jsonl": "tail -n 6000 /tmp/vt.jsonl",
-        "camera_last.jpg": "cat /tmp/cam.jpg 2>/dev/null",
+        #: 相机快照必须连带时间戳一起取：/tmp/cam.jpg 只在管线带 jpeg 输出时才刷，
+        #: 之前吃过亏 —— 读到的是几分钟前的旧文件，误判成"窗口被盖住"。
+        "camera_last.jpg": "cat /tmp/cam.jpg 2>/dev/null; echo; "
+                           "stat -c %Y /tmp/cam.jpg 2>/dev/null",
     }
     for name, cmd in jobs.items():
         dest = run_dir / name
         try:
             res = subprocess.run(ssh + [cmd], capture_output=True, timeout=60)
             if res.returncode == 0 and res.stdout:
-                dest.write_bytes(res.stdout)
-                out[name] = {"bytes": len(res.stdout),
-                             "lines": res.stdout.count(b"\n")}
+                body = res.stdout
+                if name == "camera_last.jpg":
+                    #: 末行是 mtime（秒）；据此算出快照年龄，过期的直接标记
+                    parts = body.rsplit(b"\n", 2)
+                    mtxt = parts[-1].strip() if len(parts) > 1 else b""
+                    body = parts[0] + (b"\n" if len(parts) > 1 else b"")
+                    try:
+                        age = time.time() - float(mtxt or 0)
+                    except ValueError:
+                        age = -1.0
+                    dest.write_bytes(body)
+                    out[name] = {"bytes": len(body), "age_s": round(age, 1),
+                                 "stale": age < 0 or age > 5.0}
+                else:
+                    dest.write_bytes(body)
+                    out[name] = {"bytes": len(body),
+                                 "lines": body.count(b"\n")}
             else:
                 out[name] = {"error": res.returncode}
         except (OSError, subprocess.SubprocessError) as exc:
@@ -550,7 +567,22 @@ def main(argv: list[str] | None = None) -> int:
                  if a.field_hz >= 0.1 else None)
     render_t = 0.0
 
+    import subprocess as _sp
     if a.board_ssh:
+        #: 开跑前先确认板端 VT 正在出新帧：否则整轮都是"读旧画面"，
+        #: 结论会和现实脱节（我自己就被旧 cam.jpg 骗过一次）。
+        try:
+            _st = _sp.run(["ssh", "-i", a.ssh_key, "-o", "StrictHostKeyChecking=no",
+                           "-o", "ConnectTimeout=8", a.board_ssh,
+                           'now=$(date +%s); m=$(stat -c %Y /tmp/vt.jsonl 2>/dev/null '
+                           '|| echo 0); echo $((now - m))'],
+                          capture_output=True, timeout=20)
+            _age = int((_st.stdout or b"-1").strip() or -1)
+            print(f"  板端 VT 日志年龄 {_age}s", file=sys.stderr)
+            if 0 <= _age > 5:
+                print("  ⚠ 板端 VT 超过 5 s 没出新帧：先确认相机管线在跑", file=sys.stderr)
+        except (OSError, _sp.SubprocessError, ValueError):
+            pass
         #: 清场：上一轮残留的 board_agent 会继续写 /tmp/board_state.txt 和
         #: /tmp/vt.jsonl（两次 open("w") 交错 → 文件里混着两轮的数据），
         #: 证据日志就不可信了。用方括号模式避免 pkill 打到自己的命令行。
