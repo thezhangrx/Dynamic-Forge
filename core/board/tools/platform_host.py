@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import socket
 import subprocess
 import sys
@@ -35,7 +36,99 @@ sys.path.insert(0, str(ROOT / "core/board/tools"))
 from bullet_sim.render.pygame_view import PygameRenderer
 from bullet_sim.scenarios.spec import ScenarioSpec
 from bullet_sim.simulator.env import BulletHellEnv
+from field_loop import dist_rect, walls_of
 from full_loop import FrameServer, PagePublisher
+
+
+class VideoWriterThread:
+    """录像写盘/编码挪到独立线程：主循环只做一次 BGR 转换 + 入队。
+
+    队列满就丢帧（录像允许掉帧，页面和姿态不能等磁盘）。实测 640×480
+    `VideoWriter.write` 在主机上 5~10 ms/帧，放在 30 fps 主循环里直接把它
+    压到 ~18 fps；拆出去后主循环回到 28~30 fps。
+    """
+
+    def __init__(self, path: Path, fps: float, size: tuple[int, int] = (640, 480),
+                 maxlen: int = 8) -> None:
+        self.vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"),
+                                  float(fps), size)
+        self.q: queue.Queue = queue.Queue(maxlen)
+        self.written = 0
+        self.dropped = 0
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def write(self, rgb) -> None:
+        try:
+            self.q.put_nowait(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        except queue.Full:
+            self.dropped += 1
+
+    def _run(self) -> None:
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            try:
+                self.vw.write(item)
+                self.written += 1
+            except (cv2.error, OSError):
+                pass
+
+    def close(self) -> None:
+        try:
+            self.q.put_nowait(None)
+        except queue.Full:
+            try:
+                self.q.put(None, timeout=2.0)
+            except queue.Full:
+                pass
+        self._t.join(timeout=10.0)
+        self.vw.release()
+
+
+class FieldRecorder:
+    """热力图录像：主循环只提交世界快照（clone 0.07 ms），渲染+写盘在独立线程。
+
+    实测 `show_potential` 每帧要重算势场，一帧 ~80 ms；放在 30 fps 主循环里
+    每 200 ms 就吃掉 80 ms，页面 fps 从 30 掉到 18。拆出去后主循环只剩提交。
+    """
+
+    def __init__(self, renderer, writer: "VideoWriterThread", hz: float) -> None:
+        self.r = renderer
+        self.w = writer
+        self.hz = max(0.1, float(hz))
+        self.q: queue.Queue = queue.Queue(2)
+        self.rendered = 0
+        self.dropped = 0
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def submit(self, world) -> None:
+        try:
+            self.q.put_nowait(world.clone())
+        except queue.Full:
+            self.dropped += 1
+
+    def _run(self) -> None:
+        while True:
+            w = self.q.get()
+            if w is None:
+                return
+            try:
+                fr = self.r.render(w)
+            except (RuntimeError, cv2.error):
+                continue
+            if fr is not None:
+                self.w.write(fr)
+                self.rendered += 1
+
+    def close(self) -> None:
+        try:
+            self.q.put_nowait(None)
+        except queue.Full:
+            pass
+        self._t.join(timeout=10.0)
 
 
 class Link:
@@ -188,6 +281,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--viewer-pos", default="320,60")
     ap.add_argument("--viewer-size", default="1280x960")
     ap.add_argument("--hold", type=float, default=2.0)
+    ap.add_argument("--field-every", type=int, default=2,
+                    help="热力图抽样：每 N 个格子画一次（1=最细但很贵）")
+    ap.add_argument("--profile", action="store_true", help="每 2 s 打一次循环耗时")
     ap.add_argument("--board-ssh", default="",
                     help="板子 ssh 目标，如 root@192.168.137.242（板子连不到主机时用）")
     ap.add_argument("--ssh-key", default=str(ROOT / "data/fpga/board_ssh/board_key"))
@@ -225,7 +321,9 @@ def main(argv: list[str] | None = None) -> int:
                   wall_color=(200, 60, 0), background=(8, 10, 14),
                   field_bg=(34, 40, 55), resizable=False)
     page = PygameRenderer(show_potential=False, **common)
-    field_view = PygameRenderer(show_potential=True, potential_every=1, **common)
+    field_view = PygameRenderer(show_potential=True,
+                                potential_every=max(1, int(a.field_every)),
+                                **common)
 
     server = FrameServer(a.port)
     base = page.render(env.world)
@@ -252,8 +350,11 @@ def main(argv: list[str] | None = None) -> int:
              "--fps", f"{max(20.0, a.render_hz):g}"],
             env=venv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    fw = writer(follow_mp4, a.render_hz)
-    vw_ = writer(field_mp4, a.field_hz)
+    fw = VideoWriterThread(follow_mp4, a.render_hz)
+    vw_ = VideoWriterThread(field_mp4, a.field_hz)
+    field_rec = (FieldRecorder(field_view, vw_, a.field_hz)
+                 if a.field_hz >= 0.1 else None)
+    render_t = 0.0
 
     if a.board_ssh:
         link = SshLink(a.board_ssh, a.ssh_key, a.board_agent,
@@ -269,51 +370,89 @@ def main(argv: list[str] | None = None) -> int:
     else:
         link = Link(a.tcp)
     t0 = time.monotonic()
+    next_page = t0
+    next_field = t0
     t_sim = 0.0
     last_page = 0.0
     last_field = 0.0
     last_pose_t = 0.0
     reached = False
     collisions = 0
+    min_clear: float | None = None
     if not a.board_ssh:
         print("  等板子连 TCP ...", file=sys.stderr)
+    prof = {"it": 0, "step": 0.0, "page": 0.0, "field": 0.0, "t": time.monotonic()}
     while t_sim < a.max_seconds and not reached:
         now = time.monotonic()
+        prof["it"] += 1
         with link._lock:
             act = link.act
+        _t_st = time.monotonic()
         _o, _r, _t, _tr, info = env.step(int(act))
+        _st_ms = 1000.0 * (time.monotonic() - _t_st)
         collisions += int(info.get("collision_events", 0) or 0)
         px, py = float(env.world.player[0]), float(env.world.player[1])
         r = float(env.world.player[4])
+        #: 真值最小间隙（到最近墙面 - 角色半径），衡量"贴着墙走"的程度。
+        for (cx, cy, hw, hh) in walls_of(env):
+            d = dist_rect(px, py, cx, cy, hw, hh) - float(spec.player_radius)
+            min_clear = d if min_clear is None else min(min_clear, d)
         t_sim += dt
         if now - last_pose_t >= 0.04:
             #: 姿态 25 Hz 就够（板端 VT 才 2 Hz），发太快 ssh 通道会把主循环拖慢。
             last_pose_t = now
             link.send_pose(px, py, r)
-        if now - last_page >= 1.0 / max(1.0, a.render_hz):
-            last_page = now
+        if a.render_hz > 0 and now >= next_page:
+            #: 固定节拍推进（不是 now+period）：迭代按 60 步/s 走，now 抖动会让
+            #: "两拍"变成"三拍"，30 fps 直接掉到 23。
+            next_page += 1.0 / max(1.0, a.render_hz)
+            if next_page <= now:
+                next_page = now + 1.0 / max(1.0, a.render_hz)
+            _rt = time.monotonic()
             fr = page.render(env.world)
+            _pg_ms = 1000.0 * (time.monotonic() - _rt)
+            render_t += time.monotonic() - _rt
+            prof["page"] += _pg_ms
+            prof["pg"] = prof.get("pg", 0) + 1
             if fr is not None:
                 publisher.submit(fr)
-                fw.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))
-        if now - last_field >= 1.0 / max(0.5, a.field_hz):
-            last_field = now
-            ff = field_view.render(env.world)
-            if ff is not None:
-                vw_.write(cv2.cvtColor(ff, cv2.COLOR_RGB2BGR))
+                fw.write(fr)
+        if field_rec is not None and now >= next_field:
+            next_field = now + 1.0 / max(0.1, a.field_hz)
+            _ft = time.monotonic()
+            field_rec.submit(env.world)
+            prof["field"] += 1000.0 * (time.monotonic() - _ft)
         if (px - goal[0]) ** 2 + (py - goal[1]) ** 2 <= goal_r ** 2:
             reached = True
+        prof["step"] += _st_ms
+        if a.profile and time.monotonic() - prof["t"] >= 2.0:
+            el = time.monotonic() - prof["t"]
+            n = max(1, prof["it"])
+            print(f"  [prof] it/s={prof['it'] / el:.1f} step={prof['step'] / n:.2f}ms "
+                  f"page={prof['page'] / el:.1f}ms/s field={prof['field'] / el:.1f}ms/s "
+                  f"pg/s={prof.get('pg', 0) / el:.1f}",
+                  file=sys.stderr, flush=True)
+            prof = {"it": 0, "step": 0.0, "page": 0.0, "field": 0.0,
+                    "t": time.monotonic()}
         # 按 speed 节流
         due = t0 + t_sim / max(1e-6, a.speed)
         lag = due - time.monotonic()
         if lag > 0:
-            time.sleep(min(lag, 0.01))
+            #: 一次睡够（上限 50 ms）：分段 10 ms 睡会把循环节拍打散，30 fps 的
+            #: 页面渲染就会不断错过 deadline（实测 25 fps）。
+            time.sleep(min(lag, 0.05))
 
     summary = {
         "scenario": spec.name, "reached": reached, "t_sim_s": round(t_sim, 3),
         "wall_s": round(time.monotonic() - t0, 2),
         "final_pos": [round(px, 1), round(py, 1)],
         "collisions": collisions, "moves": link.moves, "poses": link.poses,
+        "min_clearance": None if min_clear is None else round(float(min_clear), 2),
+        "page_fps": round(publisher.published / max(1e-6, time.monotonic() - t0), 2),
+        "page_dropped": publisher.dropped,
+        "rec_pages": fw.written, "rec_fields": vw_.written,
+        "rec_dropped": [fw.dropped, vw_.dropped],
+        "render_ms": round(1000.0 * render_t / max(1, fw.written + vw_.written), 2),
         "peer": link.peer,
         "videos": {"follow": str(follow_mp4), "field": str(field_mp4)},
     }
@@ -323,8 +462,8 @@ def main(argv: list[str] | None = None) -> int:
 
     time.sleep(a.hold)
     publisher.stop()
-    fw.release()
-    vw_.release()
+    fw.close()
+    vw_.close()
     link.stop()
     if viewer is not None:
         try:

@@ -347,7 +347,10 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  pause: {[round(e[0], 1) for e in extras]}",
                           file=sys.stderr, flush=True)
             if paused:
-                pause_seen.extend(raw)
+                #: 暂停刚发出时 VT 帧还可能是"动着的"那一帧：等 0.35 s 再开始收，
+                #: 之后的帧才是停稳后拍的（否则 y/缺口带着运动模糊的偏差）。
+                if time.monotonic() - pause_t0 >= 0.35:
+                    pause_seen.extend(raw)
                 del pause_seen[:-30]
                 waited = time.monotonic() - pause_t0
                 #: 板端 VT 2 Hz，单帧缺口偶尔整体偏几十像素：同一道墙要在 ≥2 帧里
