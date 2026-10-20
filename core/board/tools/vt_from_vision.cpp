@@ -138,6 +138,7 @@ int main(int argc, char** argv) {
     long frames = 0;
     double squash = 1.0;
     std::string jsonl, save_rect, overlay_out, quad_state;
+    bool gap_recompute = true;
     bool use_frame = false;
     int fr_x0 = 0, fr_y0 = 0, fr_x1 = 0, fr_y1 = 0;
     for (int i = 1; i < argc; ++i) {
@@ -148,6 +149,7 @@ int main(int argc, char** argv) {
         else if (k == "--skip") skip = std::atoi(next().c_str());
         else if (k == "--frames") frames = std::atol(next().c_str());
         else if (k == "--squash") squash = std::atof(next().c_str());
+        else if (k == "--no-gap-recompute") gap_recompute = false;
         else if (k == "--jsonl") jsonl = next();
         else if (k == "--quad-state") quad_state = next();
         else if (k == "--save-rect") save_rect = next();
@@ -345,7 +347,7 @@ int main(int argc, char** argv) {
         //:   rectified 里墙还残留 5~10 px 的斜率；只按 `find_walls` 给的窄行带数，
         //:   墙在 dim 的那一端会掉出行带 → 整段被判成缺口（实测底墙缺口端点每帧
         //:   在 x=8 和 x=79 之间跳）。改成"列在 ±4 行内取最大 luma"后与斜率无关。
-        if (rectified && !hat.empty()) {
+        if (rectified && !hat.empty() && gap_recompute) {
             for (auto& wl : walls) {
                 const int y0 = std::max(0, wl.y0), y1 = std::min(det_h - 1, wl.y1);
                 if (y1 < y0) continue;

@@ -579,6 +579,26 @@ def main(argv: list[str] | None = None) -> int:
                         last_prog_py, last_prog_t = py, time.monotonic()
                         link.send_move(nudge_act if time.monotonic() < nudge_until
                                        else last_act)
+                #: 走近一道已知墙时（ahead 20~90），用这一帧重测它的缺口并更新：
+                #: 行↔缺口偶发错配时，近距离这一帧的墙更大、更可信；连续两帧
+                #: 一致才采纳，避免把抖动写回去。日志里看 d_gl/d_gr 是否收敛。
+                if paused and known_detail and len(pause_seen) >= 2:
+                    _agree = consensus(pause_seen, need=2)
+                    for d in list(known_detail):
+                        _dy = float(d["y"]) - py
+                        if not (20.0 <= _dy <= 90.0):
+                            continue
+                        cand = [c for c in _agree if abs(c[0] - float(d["y"])) <= 25.0]
+                        if not cand:
+                            continue
+                        gy2, gl2, gr2 = cand[0]
+                        if (abs(gl2 - float(d["gl"])) > 12.0
+                                or abs(gr2 - float(d["gr"])) > 12.0):
+                            ev("gap_update", y=round(float(d["y"]), 1),
+                               old_gl=float(d["gl"]), old_gr=float(d["gr"]),
+                               new_gl=round(gl2, 1), new_gr=round(gr2, 1),
+                               ahead=round(_dy, 1))
+                            d["gl"], d["gr"] = round(gl2, 1), round(gr2, 1)
                 if paused:
                     _batch_gaps: list[tuple[float, float, float]] = []
                     for gy, gl, gr in accept:

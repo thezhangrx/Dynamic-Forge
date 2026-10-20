@@ -144,7 +144,7 @@ class VtFeeder:
     """
 
     def __init__(self, target: str, key: str, python: str = "python3",
-                 hz: float = 2.0) -> None:
+                 hz: float = 2.0, extra: str = "") -> None:
         self.hz = max(0.2, float(hz))
         self.frames = 0
         self.dropped = 0
@@ -155,7 +155,7 @@ class VtFeeder:
                "ffmpeg -hide_banner -loglevel error -f rawvideo -pix_fmt rgb24 "
                "-s 320x240 -r %g -i - -f rawvideo -pix_fmt rgb24 - "
                "| /root/tools/vt_board --w 320 --h 240 --frame-roi 0 0 320 240 "
-               "--jsonl /tmp/vt.jsonl" % self.hz]
+               "--jsonl /tmp/vt.jsonl" % self.hz + (" " + extra if extra else "")]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
@@ -431,6 +431,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="不开相机：把渲染出的页面帧直接喂给板端 vt_board（.rgb 流），"
                          "用于相机被别的窗口挡住时仍能验收 VT/决策链路")
     ap.add_argument("--vt-feed-hz", type=float, default=2.0)
+    ap.add_argument("--vt-board-extra", default="",
+                    help="附加给板端 vt_board 的参数，如 '--no-gap-recompute'")
     ap.add_argument("--board-extra", default="")
     ap.add_argument("--connect-timeout", type=float, default=90.0)
     a = ap.parse_args(argv)
@@ -585,7 +587,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         link = Link(a.tcp)
     if a.vt_feed and a.board_ssh:
-        feeder = VtFeeder(a.board_ssh, a.ssh_key, a.board_python, hz=a.vt_feed_hz)
+        feeder = VtFeeder(a.board_ssh, a.ssh_key, a.board_python, hz=a.vt_feed_hz,
+                          extra=a.vt_board_extra)
         print(f"  VT 喂帧通道: 板端 vt_board ← 主机渲染帧 {a.vt_feed_hz:g} Hz",
               file=sys.stderr)
     t0 = time.monotonic()
