@@ -248,6 +248,15 @@ int main(int argc, char** argv) {
                 }
             }
             auto fq = have_ext ? fq_ext : vision_board::field_frame::find(base, bw, bh);
+            if (have_ext && fq.ok && !quad_state.empty()) {
+                //: 外部四边形也要落到 qb.txt：主机靠这个文件当"相机是否动过"的指纹。
+                if (FILE* qf = std::fopen(quad_state.c_str(), "w")) {
+                    std::fprintf(qf, "%.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
+                                 fq.p[0][0], fq.p[0][1], fq.p[1][0], fq.p[1][1],
+                                 fq.p[2][0], fq.p[2][1], fq.p[3][0], fq.p[3][1]);
+                    std::fclose(qf);
+                }
+            }
             if (fq.ok && !quad_state.empty() && !have_ext) {
                 //: 四角**时间平滑**：一帧一个子进程，所以把上一帧的四角存在文件里。
                 //: 相机/屏幕固定时四角只该有 1~2 px 抖动；不平滑时墙线会左右跳，
@@ -276,11 +285,13 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                if (FILE* qf = std::fopen(quad_state.c_str(), "w")) {
-                    std::fprintf(qf, "%.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
-                                 fq.p[0][0], fq.p[0][1], fq.p[1][0], fq.p[1][1],
-                                 fq.p[2][0], fq.p[2][1], fq.p[3][0], fq.p[3][1]);
-                    std::fclose(qf);
+                if (!have_ext) {
+                    if (FILE* qf = std::fopen(quad_state.c_str(), "w")) {
+                        std::fprintf(qf, "%.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
+                                     fq.p[0][0], fq.p[0][1], fq.p[1][0], fq.p[1][1],
+                                     fq.p[2][0], fq.p[2][1], fq.p[3][0], fq.p[3][1]);
+                        std::fclose(qf);
+                    }
                 }
                 Hf = vision_board::field_frame::homography(fq, FW, FH);
                 frame_ok = Hf.ok;
