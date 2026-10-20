@@ -39,6 +39,51 @@ import pygame  # noqa: E402
 from mjpeg_client import MjpegClient  # noqa: E402
 
 
+class WindowRaiser:
+    """把窗口顶到最前（X11 `XRaiseWindow`）。
+
+    为什么要：相机对着 PC 屏幕做 VT，只要别的窗口（比如跑日志的终端）盖在
+    页面上，VT 就会把终端里的文字当成"墙行"，整轮数据全废且很难从数值上看出来。
+    这台机器没有 wmctrl/xdotool，pygame 这个构建也没有 always_on_top，
+    所以直接用 ctypes 调 libX11。
+    """
+
+    def __init__(self) -> None:
+        self.dpy = None
+        self.wid = 0
+        self.fn = None
+        try:
+            import ctypes
+            import ctypes.util
+            wid = pygame.display.get_wm_info().get("window")
+            lib = ctypes.util.find_library("X11")
+            if not wid or not lib:
+                return
+            x11 = ctypes.CDLL(lib)
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            dpy = x11.XOpenDisplay(None)
+            if not dpy:
+                return
+            self.dpy = ctypes.c_void_p(dpy)
+            self.wid = ctypes.c_ulong(wid)
+            self._x11 = x11
+            self._raise = x11.XRaiseWindow
+            self._raise.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            self._flush = x11.XFlush
+            self._flush.argtypes = [ctypes.c_void_p]
+        except Exception:                                # noqa: BLE001
+            self.dpy = None
+
+    def raise_now(self) -> None:
+        if self.dpy is None:
+            return
+        try:
+            self._raise(self.dpy, self.wid)
+            self._flush(self.dpy)
+        except Exception:                                # noqa: BLE001
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="WSLg 窗口显示 8100 的 MJPEG 页面")
     ap.add_argument("--url", default="http://127.0.0.1:8100/stream.mjpg")
@@ -61,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
     pygame.display.set_caption("platform live")
+    raiser = WindowRaiser()
+    raiser.raise_now()
     font = pygame.font.SysFont("monospace", 18)
     print(f"viewer window {args.w}x{args.h} at ({args.x},{args.y})  url={args.url}",
           flush=True)
@@ -69,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     last_seq = -1
     last_frame = None
     last_paint = 0.0
+    last_raise = 0.0
     waiting_since = time.monotonic()
     try:
         while True:
@@ -105,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"⚠ 15 s 没收到帧：{client.last_error}", file=sys.stderr)
                         waiting_since = now
                 pygame.display.flip()
+            if now - last_raise >= 1.0:
+                #: 每秒顶一次，防止终端/编辑器跑上来盖住页面（盖住 = VT 读文字）
+                last_raise = now
+                raiser.raise_now()
             if not pygame.display.get_init():
                 return 0
             time.sleep(0.005)
