@@ -715,6 +715,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="VT 墙映射回场地后与已知墙的最大匹配距离")
     ap.add_argument("--new-wall-margin", type=float, default=30.0,
                     help="候选新墙必须比已知最高墙再高多少")
+    ap.add_argument("--pause-ahead", type=float, default=160.0,
+                    help="新墙离角色还有多少场地单位时才暂停（越大越早停）")
     ap.add_argument("--pause-timeout", type=float, default=12.0)
     ap.add_argument("--init-timeout", type=float, default=20.0)
     ap.add_argument("--vt-source", choices=("camera", "none"), default="camera")
@@ -1300,13 +1302,20 @@ def main(argv: list[str] | None = None) -> int:
               f"{[round(k,1) for k in known]}）", file=sys.stderr)
 
     def pause_update() -> bool:
+        """暂停中：把**这一屏所有稳定的新墙一次加完**再恢复（批量，不逐道停）。
+
+        稳定性按"每道墙自己在相邻两帧里的世界 y"判，不再对齐某一道 target：
+        相机链路有 ~1 s 延迟，暂停瞬间拿到的那一帧其实是"角色还在 ~200 单位前"
+        时的画面，target 映射必然对不上（实测 target=556，确认出来是 748，
+        然后立刻重暂停 → 8 ms 一次的活锁）。暂停后页面已经冻结，**用当前 py 映射**
+        反而一致；两帧都在冻结之后，同一道墙的 gy 自然稳定。
+        """
         nonlocal known, known_detail, paused_total, new_wall_events
         s = vt.latest() if vt is not None else None
         if s is None:
             return False
         now = time.monotonic()
-        # 只收暂停后的稳定帧：晚 0.9 s 才开始（板子相机 + MJPEG 打包有延迟，
-        # 0.6 s 时偶尔还会拿到"暂停前那一屏"，y 就整体偏几十个单位）。
+        #: 只收暂停后的稳定帧：晚 0.9 s 才开始（板子相机 + MJPEG 打包有延迟）。
         if s["seq"] <= pause.get("last_seq", -1):
             return False
         if s["t_wall"] < pause["t0"] + 0.9:
@@ -1318,12 +1327,9 @@ def main(argv: list[str] | None = None) -> int:
         py_now = py
         walls = [w for w in s["walls"] if 20.0 <= float(w["y"]) <= 460.0]
         dets_vy = [float(w["y"]) for w in walls]
-        # 暂停中角色不动、页面已冻结在 py_now，所以**映射不能用 δ**：
-        # δ 是拿"已知墙"对齐出来的，一旦 known 里有一道偏了，δ 会把后面每一道
-        # 新墙都跟着平移（实测第 5 道之后 known 偏 +37，第 12 道偏 +100）。
-        # δ 只保留给"哪些 VT 墙是已知墙"的判重（matched）。
-        delta, matched = _shift_match(dets_vy, known, py_now, follow_half)
-        extra = None
+        _delta, matched = _shift_match(dets_vy, known, py_now, follow_half)
+        max_known = max(known) if known else -1e9
+        extras: list[tuple[float, dict]] = []
         for j, w in enumerate(walls):
             if j in matched:
                 continue
@@ -1331,69 +1337,36 @@ def main(argv: list[str] | None = None) -> int:
             if not (5.0 < gy < field_h - 8.0):
                 continue
             gl = float(w.get("gl", 0.0)); gr = float(w.get("gr", 640.0))
-            #: "同一道墙被旧帧再看一次"才会缺口完全一样；缺口**间隔 4 道墙重复**
-            #: （240/320/400/320），所以必须同时要求 y 也接近同一道已知墙，
-            #: 否则 20+ 墙的场景里每道新墙都会被当成某道旧墙的 dup 而永远加不进来。
+            #: 同一道墙被旧帧再看一次才会缺口完全一样；缺口每 4 道墙重复，
+            #: 所以必须同时要求 y 接近同一道已知墙。
             if any(abs(float(d.get("gl", 0.0)) - gl) <= 30.0
                    and abs(float(d.get("gr", 640.0)) - gr) <= 30.0
                    and abs(gy - float(d.get("y", -1e9))) <= 120.0
                    for d in known_detail):
                 continue
-            d = min((abs(gy - k) for k in known), default=1e9)
-            if d > args.wall_match_tol:
-                if (extra is None
-                        or abs(gy - pause["target_gy"])
-                        < abs(extra[0] - pause["target_gy"])):
-                    extra = (gy, w)
-        if extra is None:
-            if not timed_out:
-                return False
-            # 超时且没有新墙：恢复，不改墙集合（不再卡死）
-            ev = {"event": "resume_no_wall", "index": pause_count,
-                  "t_sim": round(t_sim, 3), "timeout": True,
-                  "samples": len(pause["samples"]),
-                  "target_gy": round(pause["target_gy"], 1)}
-            event(ev)
-            all_pauses.append(ev)
-            print(f"  ▶ t={t_sim:.2f}s 恢复：暂停超时且没拿到新墙，墙集合不变",
-                  file=sys.stderr)
-            pause_fail(pause["target_gy"])
-            paused_total += now - pause["t0"]
-            pause["active"] = False
-            return True
-        pause["samples"].append({"t_wall": s["t_wall"], "seq": s["seq"],
-                                 "gy": extra[0], "vy": float(extra[1]["y"]),
-                                 "gl": float(extra[1].get("gl", 0)),
-                                 "gr": float(extra[1].get("gr", 640)),
-                                 "n": len(walls)})
-        pause["samples"] = pause["samples"][-6:]
-        recent = pause["samples"][-3:]
-        stable = False
-        if len(recent) >= 2:
-            vys = [x["vy"] for x in recent[-3:]]
-            gys = [x["gy"] for x in recent[-3:]]
-            ns = [x["n"] for x in recent[-3:]]
-            stable = (max(vys) - min(vys) <= 8.0 and len(set(ns)) == 1
-                      and max(gys) - min(gys) <= 8.0)
-        timed_out = (now - pause["t0"]) > args.pause_timeout
-        if not stable and not timed_out:
-            return False
-        if recent:
-            new_gy = _median([x["gy"] for x in recent])
-            new_gl = _median([x["gl"] for x in recent])
-            new_gr = _median([x["gr"] for x in recent])
-            spread = max([x["vy"] for x in recent]) - min([x["vy"] for x in recent])
-        else:
-            new_gy = pause["target_gy"]
-            new_gl, new_gr, spread = 0.0, 640.0, 0.0
-        near = abs(new_gy - pause["target_gy"]) <= 80.0
-        if recent and near:
-            if not any(abs(new_gy - k) <= args.wall_match_tol for k in known):
-                known = sorted(known + [new_gy])
-                known_detail.append({"y": round(new_gy, 1), "gl": round(new_gl, 1),
-                                     "gr": round(new_gr, 1), "vt_y": None,
-                                     "source": "camera_vt_pause"})
+            if gy <= max_known + args.new_wall_margin:
+                continue
+            extras.append((gy, w))
+        #: 与上一帧的候选逐道比对（20 单位），连续两帧都在才算稳定。
+        prev = pause.get("prev_extras") or []
+        stable = [c for c in extras
+                  if any(abs(c[0] - q) <= 20.0 for q in prev)]
+        pause["prev_extras"] = [gy for gy, _w in extras]
+        if stable:
+            added = []
+            for gy_b, w_b in stable:
+                if any(abs(gy_b - k) <= args.wall_match_tol for k in known):
+                    continue
+                known.append(gy_b)
+                known_detail.append({
+                    "y": round(gy_b, 1),
+                    "gl": round(float(w_b.get("gl", 0.0)), 1),
+                    "gr": round(float(w_b.get("gr", 640.0)), 1),
+                    "vt_y": round(float(w_b["y"]), 1),
+                    "source": "camera_vt_pause"})
+                added.append(gy_b)
                 new_wall_events += 1
+            known = sorted(known)
             info = {
                 "event": "resume", "index": pause_count,
                 "t_sim": round(t_sim, 3), "step": steps,
@@ -1401,10 +1374,9 @@ def main(argv: list[str] | None = None) -> int:
                 "wall_view_y": round(pause["target_vy"], 1),
                 "wall_global_est": round(pause["target_gy"], 1),
                 "known_before": pause.get("known_before", []),
-                "new_wall": {"y": round(new_gy, 1), "gl": round(new_gl, 1),
-                             "gr": round(new_gr, 1)},
-                "stable": bool(stable), "timeout": bool(timed_out),
-                "samples": len(recent), "vy_spread": round(spread, 2),
+                "added": [round(y, 1) for y in added],
+                "stable": True, "timeout": bool(timed_out),
+                "samples": len(pause.get("prev_extras") or []),
                 "pause_wall_s": round(now - pause["t0"], 2),
                 "known_after": [round(k, 1) for k in known],
             }
@@ -1412,22 +1384,30 @@ def main(argv: list[str] | None = None) -> int:
             pause["events"].append(info)
             all_pauses.append(info)
             pause["last_resume"] = now
-            pause["last_new_y"] = new_gy
-            print(f"  ▶ t={t_sim:.2f}s 恢复：VT 墙集合更新 y={new_gy:.1f} "
-                  f"（stable={stable} spread={spread:.1f} "
-                  f"pause={now - pause['t0']:.1f}s）→ "
+            pause["last_new_y"] = added[-1] if added else None
+            print(f"  ▶ t={t_sim:.2f}s 恢复：VT 批量加入 {[round(y,1) for y in added]}"
+                  f"（pause={now - pause['t0']:.1f}s）→ "
                   f"{[round(k,1) for k in known]}", file=sys.stderr)
-        else:
-            event({"event": "resume_no_wall", "t_sim": round(t_sim, 3),
-                   "timeout": bool(timed_out), "samples": len(recent),
-                   "target_gy": round(pause["target_gy"], 1),
-                   "got_gy": round(new_gy, 1) if recent else None})
-            print(f"  ▶ t={t_sim:.2f}s 恢复：暂停期没拿到稳定的新墙"
-                  f"（samples={len(recent)}），已知墙集合不变", file=sys.stderr)
+            paused_total += now - pause["t0"]
+            pause["active"] = False
+            pause["prev_extras"] = []
+            return True
+        if timed_out:
+            ev = {"event": "resume_no_wall", "index": pause_count,
+                  "t_sim": round(t_sim, 3), "timeout": True,
+                  "samples": len(pause.get("prev_extras") or []),
+                  "target_gy": round(pause["target_gy"], 1)}
+            event(ev)
+            all_pauses.append(ev)
+            print(f"  ▶ t={t_sim:.2f}s 恢复：暂停超时且没拿到稳定的新墙，墙集合不变",
+                  file=sys.stderr)
             pause_fail(pause["target_gy"])
-        paused_total += now - pause["t0"]
-        pause["active"] = False
-        return True
+            paused_total += now - pause["t0"]
+            pause["active"] = False
+            pause["prev_extras"] = []
+            return True
+        return False
+
 
     try:
         while t_sim < args.max_seconds - 1e-12:
@@ -1512,6 +1492,15 @@ def main(argv: list[str] | None = None) -> int:
                                 if dup:
                                     continue
                                 if gy > max_known + args.new_wall_margin:
+                                    #: **尽量往前走**：按"这一帧里墙在角色前方多少"
+                                    #: 判（`vy - 半带`，与相机延迟无关），等墙进到
+                                    #: `--pause-ahead` 以内才停；0 = 不限。
+                                    ahead = vy - follow_half
+                                    if (args.pause_ahead > 0
+                                            and ahead > args.pause_ahead):
+                                        continue
+                                    if ahead < 10.0:
+                                        continue
                                     cands.append((gy, w))
                             if now < pause["cooldown_until"]:
                                 cands = [c for c in cands

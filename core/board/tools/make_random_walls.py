@@ -7,8 +7,10 @@
 
 规则（全部按场地单位）：
   * 墙 y 从 `--y0` 起每 `--dy` 一道，共 `--walls` 道；
-  * 缺口中心走**随机游走**：`c_{i+1} = c_i + U(-step, +step)`，夹在 `[cmin, cmax]`；
-    相邻缺口横向差 ≤ step，而两道墙间隔 dy、角色速度 200 → 有足够时间横移；
+  * **默认"左一个、右一个"交替**：偶数道缺口落在左带 `[left_min, left_max]`、
+    奇数道落在右带 `[right_min, right_max]`，各自带内随机；再夹一个
+    `|c_i - c_{i-1}| <= max_dx`，保证角色来得及横移；
+    `--no-alternate` 时退回旧的随机游走（`c += U(-step, step)`）；
   * 缺口宽 `U(wmin, wmax)`（默认 70~90，角色半径 10、板子膨胀 13，余量够）；
   * 生成的就是普通 `wall_static` 弹型，仿真/板子/视觉都按真值走。
 
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 from pathlib import Path
@@ -36,16 +39,34 @@ def build(*, walls: int, seed: int, y0: float, dy: float,
           gmin: float, gmax: float, gap_wmin: float, gap_wmax: float,
           step: float, spawn: tuple[float, float],
           goal: tuple[float, float], field_h: float,
-          duration: float) -> dict:
+          duration: float, alternate: bool = True,
+          left_band: tuple[float, float] = (190.0, 310.0),
+          right_band: tuple[float, float] = (330.0, 450.0),
+          max_dx: float = 200.0) -> dict:
     rng = random.Random(int(seed))
     ys: list[float] = []
     gaps: list[float] = []
     widths: list[float] = []
+    sides: list[str] = []
     c = rng.uniform(gmin, gmax)
     for i in range(int(walls)):
         y = y0 + i * dy
-        if i > 0:
-            c = min(max(c + rng.uniform(-step, step), gmin), gmax)
+        if alternate:
+            #: **左一个、右一个**：偶数道在左带、奇数道在右带，各自的带内随机。
+            side = "L" if i % 2 == 0 else "R"
+            lo, hi = left_band if side == "L" else right_band
+            c = rng.uniform(min(lo, hi), max(lo, hi))
+            if i > 0:
+                #: 夹住相邻横向差：超了就朝上一道收，收完再夹回本侧带
+                prev = gaps[i - 1]
+                if abs(c - prev) > max_dx:
+                    c = prev + math.copysign(max_dx, c - prev)
+                    c = min(max(c, min(lo, hi)), max(lo, hi))
+        else:
+            if i > 0:
+                c = min(max(c + rng.uniform(-step, step), gmin), gmax)
+        if alternate:
+            sides.append(side)
         ys.append(float(y))
         gaps.append(float(round(c, 1)))
         widths.append(float(round(rng.uniform(gap_wmin, gap_wmax), 1)))
@@ -66,7 +87,7 @@ def build(*, walls: int, seed: int, y0: float, dy: float,
                        "thickness": THICK},
         })
     return {
-        "name": f"20_walls_rand_{walls}",
+        "name": f"20_walls_{'alt' if alternate else 'rand'}_{walls}",
         "seed": int(seed),
         "duration": float(duration),
         "dt": 1.0 / 120.0,
@@ -88,7 +109,8 @@ def build(*, walls: int, seed: int, y0: float, dy: float,
         "meta": {"goal": [float(goal[0]), float(goal[1])],
                  "spawn": [float(spawn[0]), float(spawn[1])],
                  "static": True, "follow_h": 240.0,
-                 "walls_y": ys, "gaps_x": gaps, "gap_widths": widths},
+                 "walls_y": ys, "gaps_x": gaps, "gap_widths": widths,
+                 "gap_sides": sides, "alternate": bool(alternate)},
         "collision": "auto", "safety_margin": 6.0, "safety_horizon": 2.0,
         "require_valid_scenario": True, "action_space": "discrete",
         "cull_margin": 32.0,
@@ -108,7 +130,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gap-w-min", type=float, default=70.0)
     ap.add_argument("--gap-w-max", type=float, default=90.0)
     ap.add_argument("--step", type=float, default=110.0,
-                    help="相邻两道墙缺口中心的横向随机步长上限")
+                    help="--no-alternate 时相邻缺口横向随机步长上限")
+    ap.add_argument("--alternate", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="缺口左右交替（默认开：左一个、右一个）")
+    ap.add_argument("--left-band", type=float, nargs=2, default=(190.0, 310.0),
+                    help="左带缺口中心范围")
+    ap.add_argument("--right-band", type=float, nargs=2, default=(330.0, 450.0),
+                    help="右带缺口中心范围")
+    ap.add_argument("--max-dx", type=float, default=200.0,
+                    help="相邻两道墙缺口中心的最大横向差（保证来得及横移）")
     ap.add_argument("--spawn", type=float, nargs=2, default=(320.0, 40.0))
     ap.add_argument("--goal", type=float, nargs=2, default=None,
                     help="默认 = 最后一道墙上方 60")
@@ -125,17 +156,21 @@ def main(argv: list[str] | None = None) -> int:
                 gmin=a.gap_min, gmax=a.gap_max,
                 gap_wmin=a.gap_w_min, gap_wmax=a.gap_w_max, step=a.step,
                 spawn=tuple(a.spawn), goal=tuple(goal), field_h=field_h,
-                duration=a.duration)
+                duration=a.duration, alternate=bool(a.alternate),
+                left_band=tuple(a.left_band), right_band=tuple(a.right_band),
+                max_dx=a.max_dx)
     out = Path(a.out)
     if not out.is_absolute():
         out = _ROOT / out
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
                    encoding="utf-8")
-    print(f"{out}  墙 {a.walls} 道  seed={a.seed}  field 640×{field_h:g}")
-    for y, gx, gw in zip(cfg["meta"]["walls_y"], cfg["meta"]["gaps_x"],
-                         cfg["meta"]["gap_widths"]):
-        print(f"  y={y:7.1f}  gap_center={gx:6.1f}  width={gw:4.1f}")
+    print(f"{out}  墙 {a.walls} 道  seed={a.seed}  field 640×{field_h:g}"
+          f"  缺口={'左右交替' if a.alternate else '随机游走'}")
+    for i, (y, gx, gw) in enumerate(zip(cfg["meta"]["walls_y"], cfg["meta"]["gaps_x"],
+                                        cfg["meta"]["gap_widths"])):
+        side = cfg["meta"]["gap_sides"][i] if cfg["meta"]["gap_sides"] else "-"
+        print(f"  [{side}] y={y:7.1f}  gap_center={gx:6.1f}  width={gw:4.1f}")
     return 0
 
 
