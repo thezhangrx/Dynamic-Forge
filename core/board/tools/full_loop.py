@@ -732,6 +732,10 @@ def main(argv: list[str] | None = None) -> int:
                          "冻结页标定给 −5.5，但在环相机链路更慢，先用 −8）")
     ap.add_argument("--vt-y-scale", type=float, default=1.0,
                     help="VT 墙行尺度修正（冻结页标定 ~0.98；在环尚未验证，默认 1）")
+    ap.add_argument("--gap-min-width", type=float, default=75.0,
+                    help="VT 量到的缺口宽度低于此值视为不可信（真缺口 90~110）")
+    ap.add_argument("--expect-alternate", type=int, default=1,
+                    help="1 = 缺口左右交替场景：新行的缺口必须与上一行不同侧")
     ap.add_argument("--gap-margin", type=float, default=10.0,
                     help="把视觉量到的缺口两边**向外放**多少（实测 VT 偏窄；默认 10）")
     ap.add_argument("--pause-ahead", type=float, default=160.0,
@@ -1443,6 +1447,33 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if gy <= max_known + args.new_wall_margin:
                 continue
+            #: **可信度检查**（本轮新增）：
+            #: 1) 缺口宽度：真缺口 90~110，量到 <75 基本是量歪了（实测有一行
+            #:    量成 65 宽、中心偏 300，直接把角色送进墙里）；
+            #: 2) 交替场景：新行缺口应与上一行**不同侧**（左/右），同侧就是量错。
+            #: 不可信的行先不收，等下一次暂停换一帧再量。
+            if gr - gl < args.gap_min_width:
+                event({"event": "gap_reject", "t_sim": round(t_sim, 3),
+                       "y": round(gy, 1), "gl": round(gl, 1),
+                       "gr": round(gr, 1), "why": "width"})
+                continue
+            if args.expect_alternate and known_detail:
+                prev_d = None
+                for d in known_detail:
+                    if not str(d.get("source", "")).startswith("camera_vt"):
+                        continue
+                    if prev_d is None or float(d["y"]) > float(prev_d["y"]):
+                        prev_d = d
+                if prev_d is not None:
+                    c_new = 0.5 * (gl + gr)
+                    c_prev = 0.5 * (float(prev_d.get("gl", 0.0))
+                                    + float(prev_d.get("gr", 640.0)))
+                    if (c_new < 320.0) == (c_prev < 320.0):
+                        event({"event": "gap_reject", "t_sim": round(t_sim, 3),
+                               "y": round(gy, 1), "gl": round(gl, 1),
+                               "gr": round(gr, 1), "why": "side",
+                               "prev_y": round(float(prev_d["y"]), 1)})
+                        continue
             extras.append((gy, w))
         #: 与上一帧的候选逐道比对：y 差 ≤20 **且** 缺口左右边界差 ≤15，
         #: 连续两帧都一致才算稳定（只比 y 会把"同一行但缺口量歪"的帧放进来）。
@@ -1502,6 +1533,17 @@ def main(argv: list[str] | None = None) -> int:
             event(info)
             pause["events"].append(info)
             all_pauses.append(info)
+            #: **本屏还没收完就继续等**：只要这一屏（60~460）里还有没匹配到
+            #: known 的墙，就继续暂停收集，避免"加了一道就恢复"导致上面那行
+            #: 在角色越过前还没进 @STATE（实测 1900 行晚 32、2040 行晚 112）。
+            remain = 0
+            for gy_r, _w_r in extras:
+                if any(abs(gy_r - k) <= args.wall_match_tol for k in known):
+                    continue
+                remain += 1
+            if remain and not timed_out:
+                pause["prev_extras"] = []
+                return False
             pause["last_resume"] = now
             pause["last_new_y"] = added[-1] if added else None
             #: 刚加入的墙还在"前方 160"里，按缺口冷却 2 s 避免立刻再停。
