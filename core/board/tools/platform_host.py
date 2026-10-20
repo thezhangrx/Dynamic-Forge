@@ -298,36 +298,45 @@ class SshLink:
             pass
 
 
-    def start_camera_pipe(target: str, key: str, extra: str = "") -> dict:
-        """在板子上拉起相机管线：ffmpeg 抓 /dev/video0 → vt_board（VT 在板端）。
+def start_camera_pipe(target: str, key: str, extra: str = "") -> dict:
+    """在板子上拉起相机管线：ffmpeg 抓 /dev/video0 → vt_board（VT 在板端）。
 
-        **板端决策的输入只能是这条链路**（用户硬规则）。同时写 /tmp/vt_source=camera，
-        板端 agent 会校验这个标记，synthetic 输入会被直接拒绝。
-        """
-        import subprocess
-        cmd = (
-            'pkill -f "[v]t_board"; pkill -f "[f]fmpeg"; sleep 0.3; '
-            'rm -f /tmp/vt.jsonl /tmp/cam.jpg; '
-            'nohup bash -c \'ffmpeg -hide_banner -loglevel error -f v4l2 '
-            '-input_format mjpeg -video_size 640x480 -i /dev/video0 '
-            '-filter_complex "fps=2,scale=320:240,split=2[a][b]" '
-            '-map "[a]" -f rawvideo -pix_fmt rgb24 - '
-            '-map "[b]" -update 1 -q:v 5 -y /tmp/cam.jpg '
-            '| /root/tools/vt_board --w 320 --h 240 --frame-roi 0 0 320 240 '
-            '--quad-state /tmp/qb.txt --jsonl /tmp/vt.jsonl %s\' '
-            '>/tmp/campipe.log 2>&1 & '
-            'sleep 4; pidof vt_board; wc -l < /tmp/vt.jsonl'
-        ).replace("%s", extra)
-        try:
-            res = subprocess.run(["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
-                                  "-o", "ConnectTimeout=8", target, cmd],
-                                 capture_output=True, timeout=60)
-            out = (res.stdout or b"").decode("utf-8", "ignore").strip().splitlines()
-            return {"ok": res.returncode == 0,
-                    "pid": out[0] if out else "",
-                    "vt_lines": out[-1] if out else ""}
-        except (OSError, subprocess.SubprocessError) as exc:
-            return {"ok": False, "error": repr(exc)}
+    **板端决策的输入只能是这条链路**（用户硬规则）。同时写 /tmp/vt_source=camera，
+    板端 agent 会校验这个标记，synthetic 输入会被直接拒绝。
+    """
+    import subprocess
+    cmd = (
+        'pkill -f "[v]t_board"; pkill -f "[f]fmpeg"; sleep 0.3; '
+        'rm -f /tmp/vt.jsonl /tmp/cam.jpg; '
+        'nohup bash -c \'ffmpeg -hide_banner -loglevel error -f v4l2 '
+        '-input_format mjpeg -video_size 640x480 -i /dev/video0 '
+        '-filter_complex "fps=2,scale=320:240,split=2[a][b]" '
+        '-map "[a]" -f rawvideo -pix_fmt rgb24 - '
+        '-map "[b]" -update 1 -q:v 5 -y /tmp/cam.jpg '
+        '| /root/tools/vt_board --w 320 --h 240 --frame-roi 0 0 320 240 '
+        '--quad-file /tmp/quad.json --quad-state /tmp/qb.txt '
+        '--jsonl /tmp/vt.jsonl %s\' '
+        '>/tmp/campipe.log 2>&1 & '
+        'sleep 5; echo "PID=$(pidof vt_board)"; '
+        'echo "LINES=$(wc -l < /tmp/vt.jsonl 2>/dev/null || echo 0)"; '
+        'tail -2 /tmp/campipe.log'
+    ).replace("%s", extra)
+    try:
+        res = subprocess.run(["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
+                              "-o", "ConnectTimeout=8", target, cmd],
+                             capture_output=True, timeout=60)
+        txt = (res.stdout or b"").decode("utf-8", "ignore").strip()
+        lines = 0
+        for ln in txt.splitlines():
+            if ln.startswith("LINES="):
+                try:
+                    lines = int(ln.split("=", 1)[1].strip())
+                except ValueError:
+                    lines = 0
+        return {"ok": res.returncode == 0 and lines > 0, "lines": lines,
+                "detail": txt[-260:]}
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "error": repr(exc)}
 
 
 def quad_fingerprint(target: str, key: str) -> str:

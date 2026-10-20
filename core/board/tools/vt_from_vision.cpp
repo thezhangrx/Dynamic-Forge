@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
     int w = 640, h = 360, skip = 6;
     long frames = 0;
     double squash = 1.0;
-    std::string jsonl, save_rect, overlay_out, quad_state;
+    std::string jsonl, save_rect, overlay_out, quad_state, quad_file;
     bool gap_recompute = true;
     std::string bands_jsonl;
     bool use_frame = false;
@@ -154,6 +154,7 @@ int main(int argc, char** argv) {
         else if (k == "--bands-jsonl") bands_jsonl = next();
         else if (k == "--jsonl") jsonl = next();
         else if (k == "--quad-state") quad_state = next();
+        else if (k == "--quad-file") quad_file = next();
         else if (k == "--save-rect") save_rect = next();
         else if (k == "--overlay-out") overlay_out = next();
         else if (k == "--frame") use_frame = true;
@@ -194,6 +195,7 @@ int main(int argc, char** argv) {
         bool frame_ok = false;
         rectify::Homography Hf;
         vision_board::field_frame::Quad fq_used;
+        bool quad_ext = false;      // 本帧是否用了主机下发的四边形
         int roi_x = 0, roi_y = 0;
         if (use_frame) {
             int x0 = std::max(0, std::min(fr_x0, w - 1));
@@ -210,8 +212,43 @@ int main(int argc, char** argv) {
             base = crop.data();
             //: 首选：场地暗区 + 最小外接旋转矩形 → 白框**四角**透视单应。
             //: 这一步把 bbox 仿射换成四角透视；rectified 后墙才是水平的。
-            auto fq = vision_board::field_frame::find(base, bw, bh);
-            if (fq.ok && !quad_state.empty()) {
+            //: **外部四边形**（--quad-file，8 个数：x0 y0 x1 y1 x2 y2 x3 y3，输入图像坐标）。
+            //: 由主机用标记单应算出后下发：板端自己找白框在真机上会退化成"整帧当
+            //: 页面"（实测 /tmp/qb.txt = (1,1)-(639,479)），导致墙 y 系统性偏 80~130。
+            vision_board::field_frame::Quad fq_ext;
+            bool have_ext = false;
+            if (!quad_file.empty()) {
+                if (FILE* xf = std::fopen(quad_file.c_str(), "r")) {
+                    double v[8] = {0};
+                    if (std::fscanf(xf, "%lf %lf %lf %lf %lf %lf %lf %lf",
+                                    &v[0], &v[1], &v[2], &v[3],
+                                    &v[4], &v[5], &v[6], &v[7]) == 8) {
+                        bool sane = true;
+                        double area = 0.0;
+                        for (int i = 0; i < 4; ++i) {
+                            const double px = v[2 * i], py = v[2 * i + 1];
+                            if (px < -8.0 || py < -8.0 || px > bw + 8.0 || py > bh + 8.0)
+                                sane = false;
+                            const int j = (i + 1) % 4;
+                            area += px * v[2 * j + 1] - v[2 * j] * py;
+                        }
+                        area = std::fabs(area) * 0.5;
+                        if (area < 0.10 * static_cast<double>(bw) * bh) sane = false;
+                        if (sane) {
+                            for (int i = 0; i < 4; ++i) {
+                                fq_ext.p[i][0] = v[2 * i];
+                                fq_ext.p[i][1] = v[2 * i + 1];
+                            }
+                            fq_ext.ok = true;
+                            have_ext = true;
+                            quad_ext = true;
+                        }
+                    }
+                    std::fclose(xf);
+                }
+            }
+            auto fq = have_ext ? fq_ext : vision_board::field_frame::find(base, bw, bh);
+            if (fq.ok && !quad_state.empty() && !have_ext) {
                 //: 四角**时间平滑**：一帧一个子进程，所以把上一帧的四角存在文件里。
                 //: 相机/屏幕固定时四角只该有 1~2 px 抖动；不平滑时墙线会左右跳，
                 //: 视频里看就是"墙在乱飘"。新解与上一帧差 >12 px 视为换了场景，直接采用。
@@ -626,8 +663,10 @@ int main(int argc, char** argv) {
             for (int x = 0; x < 640; ++x)
                 if (x < 2 || x >= 638 || y < 2 || y >= 478) put(&out, x, y, 255, 255, 255);
         if (jf) {
-            std::fprintf(jf, "{\"frame\":%ld,\"markers\":%d,\"frame_geom\":%d,\"extent\":%d,\"walls\":[",
-                         frame, markers ? 1 : 0, frame_ok ? 1 : 0, ext.ok ? 1 : 0);
+            std::fprintf(jf, "{\"frame\":%ld,\"markers\":%d,\"frame_geom\":%d,"
+                         "\"extent\":%d,\"quad_ext\":%d,\"walls\":[",
+                         frame, markers ? 1 : 0, frame_ok ? 1 : 0, ext.ok ? 1 : 0,
+                         quad_ext ? 1 : 0);
         }
         for (size_t i = 0; i < show.size(); ++i) {
             const auto& wl = show[i];
