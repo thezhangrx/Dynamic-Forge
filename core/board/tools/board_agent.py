@@ -190,19 +190,43 @@ class StdioLink:
             pass
 
 
-def consensus(seen, tol_y: float = 25.0, tol_g: float = 15.0, need: int = 2):
-    """把暂停期间的多帧候选合成一份：≥need 帧一致才算，取一致帧的中位数。"""
+def consensus(seen, tol_y: float = 25.0, tol_g: float = 15.0, need: int = 2,
+              tol_vy: float = 7.0):
+    """把暂停期间的多帧候选合成一份：要求**同一道墙**在 ≥need 帧里一致。
+
+    关键：除了场地位姿 y（和缺口左右边界），还要比**帧内像素 vy**。
+    为什么：墙的场地 y 是用"当前 py"映射出来的，一帧旧画面的 vy 不同、映射出来
+    的 y 却可能恰好落在同一道墙上（尤其 py 只差几十时）——只比 y 就会把
+    "隔壁那道墙的缺口"当成同一道墙收下（实测就是这么换上来的）。vy 是帧内
+    坐标，与 py 无关，能直接把这种帧分开。
+    """
     import statistics
-    out: list[tuple[float, float, float]] = []
-    for gy, gl, gr in seen:
-        m = [(a, b, c) for a, b, c in seen
-             if abs(a - gy) <= tol_y and abs(b - gl) <= tol_g and abs(c - gr) <= tol_g]
+    out: list[tuple] = []
+    for item in seen:
+        gy, gl, gr = float(item[0]), float(item[1]), float(item[2])
+        vy = float(item[3]) if len(item) > 3 else None
+
+        def ok(o) -> bool:
+            if abs(o[0] - gy) > tol_y or abs(o[1] - gl) > tol_g or abs(o[2] - gr) > tol_g:
+                return False
+            if vy is not None and len(o) > 3 and abs(float(o[3]) - vy) > tol_vy:
+                return False
+            return True
+
+        m = [o for o in seen if ok(o)]
         if len(m) < need:
             continue
-        if any(abs(gy - o[0]) <= tol_y and abs(gl - o[1]) <= tol_g for o in out):
+        dup = False
+        for o in out:
+            if abs(o[0] - gy) <= tol_y and abs(o[1] - gl) <= tol_g:
+                if vy is None or len(o) <= 3 or abs(float(o[3]) - vy) <= tol_vy:
+                    dup = True
+                    break
+        if dup:
             continue
-        out.append(tuple(round(float(statistics.median([x[i] for x in m])), 1)
-                         for i in range(3)))
+        n = len(item)
+        out.append(tuple(round(float(statistics.median([o[i] for o in m])), 1)
+                         for i in range(n)))
     return out
 
 
@@ -310,6 +334,10 @@ def main(argv: list[str] | None = None) -> int:
             state_f = None
     known: list[float] = []
     known_detail: list[dict] = []
+    #: 缺口窗口 -> 已入库的墙 y。同一道物理墙远/近两次测量会被映射成不同的 y
+    #: （映射依赖 py，实测 215 → 345），按 y 去重就会重复入表、出现"同侧两道墙"。
+    #: 缺口位置与 py 无关，用它当身份最稳。
+    known_by_gap: dict[tuple[int, int], float] = {}
     seq = 0
     last_act = 0
     last_vt_seq = -1
@@ -449,12 +477,11 @@ def main(argv: list[str] | None = None) -> int:
             #: 竖直方向的"帧新鲜度"：页面按当前 py 画角色，所以角色在帧里的 vy
             #: 必然是 (py-lo)/scale。实测偏差 >15 就说明这一帧还是"角色更靠下时"
             #: 拍的 —— 用当前 py 去映射它，墙的 y 会整体偏大 70~140（实测 +69）。
-            lo_now = py - half
-            if lo_now < 0.0:
-                lo_now = 0.0
-            elif lo_now > a.field_h - 2.0 * half:
-                lo_now = max(0.0, a.field_h - 2.0 * half)
-            vy_expect = (py - lo_now) / max(1e-6, a.y_scale)
+            #: 页面**不做夹取**：它总是把 py 画在视口正中间（实测静止时角色
+            #: vy 恒为 ~240，即使 py=40 在场地底端）。所以"预期的 vy"就是
+            #: half/scale 这个常数；之前按 clamp 算成 (py-lo)/scale，在起点给出
+            #: vy_expect≈41 → 误判成"旧帧"并把 py 修正掉 200，墙的 y 全带 200 错。
+            vy_expect = (half - a.y_bias) / max(1e-6, a.y_scale)
             dy_p = None if pv is None else float(pv[1]) - vy_expect
             #: 帧新鲜度门：VT 帧比当前位姿旧 ~0.5 s，角色一秒走 200 单位，
             #: 所以"帧里的角色 x"和主机 px 差多少，就等于这一帧旧了多少。
@@ -499,7 +526,7 @@ def main(argv: list[str] | None = None) -> int:
                         and any(abs(g[0] - gl) <= 30.0 and abs(g[1] - gr) <= 30.0
                                 for g in cooldown_gaps)):
                     continue
-                extras.append((gy, gl, gr))
+                extras.append((gy, gl, gr, float(w["y"])))
                 raw_dbg.append((gy, round(float(w["y"]), 1),
                                 round(float(w.get("gl", 0.0)), 1),
                                 round(float(w.get("gr", 640.0)), 1)))
@@ -540,7 +567,8 @@ def main(argv: list[str] | None = None) -> int:
                 accept = agree if (warmed and waited >= 0.9 and agree) else []
                 if force_fix:
                     fixed = 0
-                    for gy, gl, gr in (agree or raw):
+                    for _fix in (agree or raw):
+                        gy, gl, gr = _fix[0], _fix[1], _fix[2]
                         near = [d for d in known_detail
                                 if abs(float(d["y"]) - gy) <= 70.0]
                         if not near:
@@ -579,30 +607,39 @@ def main(argv: list[str] | None = None) -> int:
                         last_prog_py, last_prog_t = py, time.monotonic()
                         link.send_move(nudge_act if time.monotonic() < nudge_until
                                        else last_act)
-                #: 走近一道已知墙时（ahead 20~90），用这一帧重测它的缺口并更新：
-                #: 行↔缺口偶发错配时，近距离这一帧的墙更大、更可信；连续两帧
-                #: 一致才采纳，避免把抖动写回去。日志里看 d_gl/d_gr 是否收敛。
-                if paused and known_detail and len(pause_seen) >= 2:
-                    _agree = consensus(pause_seen, need=2)
-                    for d in list(known_detail):
-                        _dy = float(d["y"]) - py
-                        if not (20.0 <= _dy <= 90.0):
-                            continue
-                        cand = [c for c in _agree if abs(c[0] - float(d["y"])) <= 25.0]
-                        if not cand:
-                            continue
-                        gy2, gl2, gr2 = cand[0]
-                        if (abs(gl2 - float(d["gl"])) > 12.0
-                                or abs(gr2 - float(d["gr"])) > 12.0):
-                            ev("gap_update", y=round(float(d["y"]), 1),
-                               old_gl=float(d["gl"]), old_gr=float(d["gr"]),
-                               new_gl=round(gl2, 1), new_gr=round(gr2, 1),
-                               ahead=round(_dy, 1))
-                            d["gl"], d["gr"] = round(gl2, 1), round(gr2, 1)
                 if paused:
                     _batch_gaps: list[tuple[float, float, float]] = []
-                    for gy, gl, gr in accept:
+                    for _acc in accept:
+                        gy, gl, gr = _acc[0], _acc[1], _acc[2]
                         if any(abs(gy - k) <= 55.0 for k in known):
+                            continue
+                        #: 同一个缺口窗口 = 同一道物理墙。远/近两次测量会被映射成
+                        #: 不同的 y（映射依赖 py，实测同一道墙 215 → 355），旧逻辑
+                        #: 就把它当成"新墙"再加一条，于是出现同侧两道墙、缺口相同。
+                        #: 这里按"缺口身份"去重：命中已知墙就更新它的 y（取更近一次的
+                        #: 测量），绝不重复入表。
+                        _key = (int(round(gl / 10.0)), int(round(gr / 10.0)))
+                        _same_y = known_by_gap.get(_key)
+                        _same = None
+                        if _same_y is not None:
+                            _same = {"y": _same_y}
+                        if _same is not None:
+                            _old_y = float(_same["y"])
+                            _new_ahead = abs(gy - py)
+                            _old_ahead = abs(_old_y - py)
+                            if _new_ahead + 20.0 < _old_ahead:
+                                known_by_gap[_key] = round(gy, 1)
+                                for _d in known_detail:
+                                    if abs(float(_d["y"]) - _old_y) <= 1e-6:
+                                        _d["y"] = round(gy, 1)
+                                        break
+                                for _i, _k in enumerate(known):
+                                    if abs(_k - _old_y) <= 1e-6:
+                                        known[_i] = round(gy, 1)
+                                        break
+                            ev("wall_same_gap", y=round(gy, 1), old_y=_old_y,
+                               gl=round(gl, 1), gr=round(gr, 1),
+                               updated=bool(_new_ahead + 20.0 < _old_ahead))
                             continue
                         _why = gap_suspect(gy, gl, gr)
                         if not _why:
@@ -617,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
                             continue
                         _batch_gaps.append((gy, gl, gr))
                         known.append(gy)
+                        known_by_gap[_key] = round(gy, 1)
                         known_detail.append({"y": round(gy, 1), "gl": round(gl, 1),
                                              "gr": round(gr, 1),
                                              "source": "board_vt"})
@@ -642,7 +680,7 @@ def main(argv: list[str] | None = None) -> int:
                               if not any(abs(e[0] - k) <= 30.0 for k in known)]
                     if ((accept and not remain)
                             or (waited > 4.5 and warmed and (known or waited > 10.0))):
-                        added_gaps = [(gl, gr) for _gy, gl, gr in accept]
+                        added_gaps = [(a_[1], a_[2]) for a_ in accept]
                         if added_gaps:
                             cooldown_gaps[:] = (cooldown_gaps + added_gaps)[-12:]
                             cooldown_until = time.monotonic() + 2.0

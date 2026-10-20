@@ -139,6 +139,7 @@ int main(int argc, char** argv) {
     double squash = 1.0;
     std::string jsonl, save_rect, overlay_out, quad_state;
     bool gap_recompute = true;
+    std::string bands_jsonl;
     bool use_frame = false;
     int fr_x0 = 0, fr_y0 = 0, fr_x1 = 0, fr_y1 = 0;
     for (int i = 1; i < argc; ++i) {
@@ -150,6 +151,7 @@ int main(int argc, char** argv) {
         else if (k == "--frames") frames = std::atol(next().c_str());
         else if (k == "--squash") squash = std::atof(next().c_str());
         else if (k == "--no-gap-recompute") gap_recompute = false;
+        else if (k == "--bands-jsonl") bands_jsonl = next();
         else if (k == "--jsonl") jsonl = next();
         else if (k == "--quad-state") quad_state = next();
         else if (k == "--save-rect") save_rect = next();
@@ -164,6 +166,8 @@ int main(int argc, char** argv) {
     }
     FILE* jf = nullptr;
     if (!jsonl.empty()) { jf = std::fopen(jsonl.c_str(), "w"); }
+    FILE* bf = nullptr;
+    if (!bands_jsonl.empty()) { bf = std::fopen(bands_jsonl.c_str(), "w"); }
     FILE* of = nullptr;
     if (!overlay_out.empty()) { of = std::fopen(overlay_out.c_str(), "wb"); }
     const size_t need = static_cast<size_t>(w) * h * 3;
@@ -541,6 +545,27 @@ int main(int argc, char** argv) {
                 }
                 if (!merged) show.push_back(o);
             }
+        }
+
+        if (bf) {
+            //: 每条 band 的原始行带 + 缺口重算窗口，用于定位"行↔缺口配错"。
+            std::fprintf(bf, "{\"frame\":%ld,\"det\":%d,\"bands\":[", frame,
+                         det_w * 10000 + det_h);
+            for (size_t i = 0; i < walls.size(); ++i) {
+                const auto& wl = walls[i];
+                std::fprintf(bf,
+                             "%s{\"y0\":%d,\"y1\":%d,\"cy\":%.1f,\"has_gap\":%d,"
+                             "\"gx0\":%d,\"gx1\":%d,\"bf\":%.2f}",
+                             i ? "," : "", wl.y0, wl.y1, wl.cy,
+                             wl.has_gap ? 1 : 0, wl.gap_x0, wl.gap_x1, wl.bright_frac);
+            }
+            std::fprintf(bf, "],\"show\":[");
+            for (size_t i = 0; i < show.size(); ++i) {
+                std::fprintf(bf, "%s{\"y\":%.1f,\"gl\":%.1f,\"gr\":%.1f}",
+                             i ? "," : "", show[i].y, show[i].gl, show[i].gr);
+            }
+            std::fprintf(bf, "]}\n");
+            std::fflush(bf);
         }
 
         //: 相机视角叠加：把白框四角、检测到的墙/缺口、角色、目标画回**原始相机帧**。
