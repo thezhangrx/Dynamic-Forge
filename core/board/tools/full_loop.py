@@ -1424,7 +1424,7 @@ def main(argv: list[str] | None = None) -> int:
         py_now = py
         #: 只信画面**中段**的墙：画框上下沿的墙会被裁掉一截，缺口量出来常常
         #: 宽得离谱（离线测试里出现过 230–593）。60~420 之外的行一律不收。
-        walls = [w for w in s["walls"] if 60.0 <= float(w["y"]) <= 420.0]
+        walls = [w for w in s["walls"] if 60.0 <= float(w["y"]) <= 460.0]
         dets_vy = [float(w["y"]) for w in walls]
         _delta, matched = _shift_match(dets_vy, known, py_now, follow_half)
         max_known = max(known) if known else -1e9
@@ -1586,6 +1586,43 @@ def main(argv: list[str] | None = None) -> int:
                             walls = [w for w in s["walls"]
                                      if 20.0 <= float(w["y"]) <= 456.0]
                             max_known = max(known) if known else -1e9
+                            #: **近距离复核**：VT 偶尔会把某一行量歪（实测 1900 行量成
+                            #: 102–167，真值 396–502，偏了 300），之前只靠"两帧一致"
+                            #: 挡不住。当已确认的墙进到 100 单位以内、且连续两帧量到的
+                            #: 缺口都和已存的差 >40 时，用新测量**纠正**这一行。
+                            gap_fix = pause.setdefault("gap_fix", {})
+                            for w in walls:
+                                gy_w = vt_world_y(float(w["y"]), py)
+                                ahead_w = gy_w - py
+                                if not (20.0 < ahead_w < 100.0):
+                                    continue
+                                gl_w = float(w.get("gl", 0.0))
+                                gr_w = float(w.get("gr", 640.0))
+                                for d in known_detail:
+                                    if abs(gy_w - float(d["y"])) > 30.0:
+                                        continue
+                                    if (abs(gl_w - float(d.get("gl", 0.0))) <= 40.0
+                                            and abs(gr_w - float(d.get("gr", 640.0))) <= 40.0):
+                                        gap_fix.pop(id(d), None)
+                                        break
+                                    prev_fix = gap_fix.get(id(d))
+                                    if (prev_fix is not None
+                                            and abs(prev_fix[0] - gl_w) <= 15.0
+                                            and abs(prev_fix[1] - gr_w) <= 15.0):
+                                        d["gl"] = round(gl_w, 1)
+                                        d["gr"] = round(gr_w, 1)
+                                        d["source"] = "camera_vt_fix"
+                                        event({"event": "gap_fix",
+                                               "y": round(float(d["y"]), 1),
+                                               "old": [round(prev_fix[2], 1),
+                                                       round(prev_fix[3], 1)],
+                                               "new": [round(gl_w, 1), round(gr_w, 1)]})
+                                        gap_fix.pop(id(d), None)
+                                    else:
+                                        gap_fix[id(d)] = (gl_w, gr_w,
+                                                          float(d.get("gl", 0.0)),
+                                                          float(d.get("gr", 640.0)))
+                                    break
                             dets_vy = [float(w["y"]) for w in walls]
                             # 公共平移对齐：已知墙整体偏 δ 不是新墙
                             delta, matched = _shift_match(dets_vy, known,
@@ -1607,7 +1644,7 @@ def main(argv: list[str] | None = None) -> int:
                                     continue
                                 #: 与 pause_update 一致：只信画面中段的行，
                                 #: 画框上下沿的墙缺口量不准，不为它暂停。
-                                if not (60.0 <= vy <= 420.0):
+                                if not (60.0 <= vy <= 460.0):
                                     continue
                                 #: 这里**不再用** stale 的 py_cap 算出来的 gy 去比
                                 #: `max_known`：相机链路 ~1 s 延迟会让 gy 偏低 ~200，
@@ -1618,13 +1655,21 @@ def main(argv: list[str] | None = None) -> int:
                                 # 场地外的"墙"是帧线/反光，不是墙
                                 if not (5.0 < gy < field_h - 8.0):
                                     continue
+                                #: **只对未确认的行暂停**：映射用当前 py（标定后±4），
+                                #: 不再用 stale 的 py_cap；否则已知行会一直是最"近"的
+                                #: 候选 → 反复暂停又"全部已知"，把真正的新行饿死
+                                #: （实测 53 次暂停、最后一行只提前 4.5 单位）。
+                                if any(abs(gy - k) <= 30.0 for k in known):
+                                    continue
                                 # 目标环正好在 (·,470)：只挡目标上的假墙；
                                 # y=440 的最后一道墙离目标只有 30，不能被挡。
                                 if abs(gy - goal[1]) < 12.0:
                                     continue
                                 gl = float(w.get("gl", 0.0)); gr = float(w.get("gr", 640.0))
-                                #: 刚加入的墙（刚批量确认过）在冷却期里不再触发。
-                                if (now < pause["cooldown_until"]
+                                #: 刚加入的墙（刚批量确认过）在冷却期里不再触发；
+                                #: 但**已经贴到 80 单位以内**时不再看冷却——宁可多停
+                                #: 一次，也不能让角色越过还没进 @STATE 的行。
+                                if (ahead > 80.0 and now < pause["cooldown_until"]
                                         and any(abs(g[0] - gl) <= 30.0
                                                 and abs(g[1] - gr) <= 30.0
                                                 for g in pause["cooldown_gaps"])):
@@ -1634,7 +1679,9 @@ def main(argv: list[str] | None = None) -> int:
                                 cands = [c for c in cands
                                          if abs(c[0] - pause["skip_gy"]) > 100.0]
                             if cands:
-                                cand_gy, cand_w = max(cands, key=lambda c: c[0])
+                                #: **选最近的前方行**（不是最远的）：一次暂停先服务
+                                #: 下一行，保证它在角色越过前被确认；远处的行下次再说。
+                                cand_gy, cand_w = min(cands, key=lambda c: c[0])
                                 pause_begin(s, cand_gy, cand_w)
                 else:
                     if now - last_keepalive >= 0.10:
