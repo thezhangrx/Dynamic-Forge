@@ -706,6 +706,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--board-binary", default="/root/tools/field_decision_cli")
     ap.add_argument("--ssh-key", default="data/fpga/board_ssh/board_key")
     ap.add_argument("--board-host", default="root@192.168.137.242")
+    ap.add_argument("--board-ema", type=float, default=None,
+                    help="板端方向平滑（不给=用二进制默认）")
+    ap.add_argument("--board-hyst", type=int, default=None,
+                    help="板端换向滞回帧数")
+    ap.add_argument("--board-reflex", type=int, default=None,
+                    help="1/0 开关板端安全反射")
+    ap.add_argument("--board-trace", default=None,
+                    help="板端逐帧决策轨迹文件（诊断用）")
     ap.add_argument("--board-view-h", type=float, default=0.0,
                     help="板子 --view-h（0 = 全幅 = 场高）")
     ap.add_argument("--stall-s", type=float, default=5.0)
@@ -722,8 +730,8 @@ def main(argv: list[str] | None = None) -> int:
                          "冻结页标定给 −5.5，但在环相机链路更慢，先用 −8）")
     ap.add_argument("--vt-y-scale", type=float, default=1.0,
                     help="VT 墙行尺度修正（冻结页标定 ~0.98；在环尚未验证，默认 1）")
-    ap.add_argument("--gap-margin", type=float, default=6.0,
-                    help="把视觉量到的缺口两边各收多少（保守通过，纯视觉不掺真值）")
+    ap.add_argument("--gap-margin", type=float, default=10.0,
+                    help="把视觉量到的缺口两边**向外放**多少（实测 VT 偏窄；默认 10）")
     ap.add_argument("--pause-ahead", type=float, default=160.0,
                     help="新墙离角色还有多少场地单位时才暂停（越大越早停）")
     ap.add_argument("--pause-timeout", type=float, default=12.0)
@@ -1259,11 +1267,18 @@ def main(argv: list[str] | None = None) -> int:
                 gl = float(d.get("gl", 0.0)); gr = float(d.get("gr", 640.0))
                 if not (5.0 < y < field_h - 5.0) or gr - gl < 40.0:
                     continue
-                #: 视觉量到的缺口两边各收 `--gap-margin`：VT 的缺口边界有 ~10 单位
-                #: 误差（实测），收一点让板子瞄中间，不从边缘擦过去。
-                gl = gl + args.gap_margin
-                gr = gr - args.gap_margin
-                if gr - gl < 30.0:
+                #: 实测 VT 的缺口**两边都往内收**（左 +0~+12，右 −8~−37），所以
+                #: 这里按 `--gap-margin` **向外放**（默认 10），把量窄的缺口补回来；
+                #: 量得特别窄（<60）的行会把整行堵死（膨胀 13 后无格可过），
+                #: 这时以测量中心向外补到 70 宽——真缺口 ~90，补完仍在真缺口内。
+                gl = gl - args.gap_margin
+                gr = gr + args.gap_margin
+                if gr - gl < 60.0:
+                    c = 0.5 * (gl + gr)
+                    gl, gr = c - 35.0, c + 35.0
+                gl = max(0.0, min(640.0, gl))
+                gr = max(0.0, min(640.0, gr))
+                if gr - gl < 50.0:
                     continue
                 if gl > 4.0:
                     obs.append(f"{gl * 0.5:.1f} {y:.1f} {gl * 0.5:.1f} 4.0 0.0")

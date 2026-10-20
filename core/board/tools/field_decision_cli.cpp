@@ -45,6 +45,10 @@ int main(int argc, char** argv) {
   double field_w = 640.0, field_h = 480.0;
   double goal_x = 320.0, goal_y = 470.0;
   double view_h = 0.0;               // 0 = 全幅（老行为）
+  double ema = 0.5;                  // 方向平滑（板端默认更跟手）
+  int hyst = 1;                      // 新方向连续几帧才换
+  int reflex = 1;                    // 1 = 贴墙时改用"最安全方向"
+  const char* trace_path = nullptr;  // 逐帧决策轨迹（离线诊断用）
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
     auto next = [&](double def) -> double {
@@ -57,6 +61,10 @@ int main(int argc, char** argv) {
       goal_x = next(goal_x);
       goal_y = next(goal_y);
     } else if (std::strcmp(a, "--view-h") == 0) view_h = next(view_h);
+    else if (std::strcmp(a, "--ema") == 0) ema = next(ema);
+    else if (std::strcmp(a, "--hyst") == 0) hyst = static_cast<int>(next(hyst));
+    else if (std::strcmp(a, "--reflex") == 0) reflex = static_cast<int>(next(reflex));
+    else if (std::strcmp(a, "--trace") == 0 && i + 1 < argc) trace_path = argv[++i];
   }
   if (field_w <= 0 || field_h <= 0) {
     std::fprintf(stderr, "field 尺寸必须 > 0\n");
@@ -69,10 +77,13 @@ int main(int argc, char** argv) {
   cfg.field_h = field_h;
   cfg.goal_x = goal_x;
   cfg.goal_y = goal_y;
+  cfg.ema = ema;
+  cfg.hyst = hyst;
   field_m1::Field field;
   field.configure(cfg);
 
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
+  FILE* trace_f = trace_path ? std::fopen(trace_path, "w") : nullptr;
   std::vector<field_m1::Rect> walls;
   char line[65536];
   int frames = 0, last_act = 0, last_n = -1;
@@ -135,7 +146,7 @@ int main(int argc, char** argv) {
       const double dy = std::max(std::abs(py - w.y) - w.hh, 0.0);
       min_clear = std::min(min_clear, std::hypot(dx, dy) - pr);
     }
-    if (min_clear < 2.0) {
+    if (reflex && min_clear < 2.0) {
       //: 已经在墙边/墙里时不能一律停（会僵死）：在 9 个动作里挑"下一步离墙最远"
       //: 的那个；M1 的动作如果也不差就优先它。这样贴近时是往外退/贴着滑，
       //: 不是原地卡住。
@@ -168,6 +179,12 @@ int main(int argc, char** argv) {
                      min_clear, act);
         printed_reflex = true;
       }
+    }
+    if (trace_f) {
+      std::fprintf(trace_f, "%d %.1f %.1f %d %.2f %d\n",
+                   frames, px, py, act, min_clear,
+                   static_cast<int>(walls.size()));
+      std::fflush(trace_f);
     }
     ++frames;
     if (act != last_act || frames % 8 == 1) std::printf("@MOVE %d\n", act);
