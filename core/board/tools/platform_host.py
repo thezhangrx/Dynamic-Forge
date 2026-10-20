@@ -132,6 +132,74 @@ class FieldRecorder:
         self._t.join(timeout=10.0)
 
 
+class VtFeeder:
+    """把主机渲染的页面帧按 320×240 rgb24 喂给板端 vt_board（走独立 ssh 管道）。
+
+    为什么需要：相机拍的是 PC 屏幕，屏幕上任何别的窗口（终端）盖住页面，
+    VT 就只能读到文字。这条通道让"板端 VT + 决策"仍跑真图像、真帧率，
+    只是图像来源是主机渲染帧而不是照片；物理相机那条路仍是最终验收口径。
+
+    **写管道必须走独立线程**：板端 vt_board 只有 ~1.4 Hz，管道很快写满，
+    主循环里直接 write 会永久阻塞（实测把主循环卡死 15 分钟，t_sim 不动）。
+    """
+
+    def __init__(self, target: str, key: str, python: str = "python3",
+                 hz: float = 2.0) -> None:
+        self.hz = max(0.2, float(hz))
+        self.frames = 0
+        self.dropped = 0
+        self._stop = False
+        self.q: queue.Queue = queue.Queue(2)
+        cmd = ["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
+               "-o", "ServerAliveInterval=5", target,
+               "ffmpeg -hide_banner -loglevel error -f rawvideo -pix_fmt rgb24 "
+               "-s 320x240 -r %g -i - -f rawvideo -pix_fmt rgb24 - "
+               "| /root/tools/vt_board --w 320 --h 240 --frame-roi 0 0 320 240 "
+               "--jsonl /tmp/vt.jsonl" % self.hz]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def submit(self, frame_640) -> None:
+        if self._stop or self.proc.poll() is not None:
+            return
+        try:
+            small = cv2.resize(frame_640, (320, 240), interpolation=cv2.INTER_AREA)
+            self.q.put_nowait(small.tobytes())
+        except queue.Full:
+            self.dropped += 1
+        except cv2.error:
+            pass
+
+    def _run(self) -> None:
+        while True:
+            data = self.q.get()
+            if data is None:
+                return
+            try:
+                self.proc.stdin.write(data)
+                self.proc.stdin.flush()
+                self.frames += 1
+            except (OSError, ValueError):
+                return
+
+    def stop(self) -> None:
+        self._stop = True
+        try:
+            self.q.put_nowait(None)
+        except queue.Full:
+            pass
+        try:
+            self.proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            self.proc.wait(timeout=3)
+        except Exception:                            # noqa: BLE001
+            pass
+
+
 class Link:
     """TCP 服务端：等板子连上来，收 @MOVE，发 @POSE。"""
 
@@ -342,10 +410,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--viewer-pos", default="320,60")
     ap.add_argument("--viewer-size", default="1280x960")
     ap.add_argument("--hold", type=float, default=2.0)
-    ap.add_argument("--wall-rgb", default="200,60,0",
-                    help="墙颜色（相机 VT 对比度不够时可以调成纯色）")
-    ap.add_argument("--field-rgb", default="34,40,55", help="场地底色")
-    ap.add_argument("--bg-rgb", default="8,10,14", help="场地外底色")
+    ap.add_argument("--wall-rgb", default="255,240,200",
+                    help="墙颜色。**必须够亮**：VT 的墙检测是亮度门，实测 200,60,0 "
+                         "一堵墙都测不到，换成 255,240,200 后缺口边界误差 ≤1 px")
+    ap.add_argument("--field-rgb", default="12,14,20", help="场地底色（要够暗）")
+    ap.add_argument("--bg-rgb", default="0,0,0", help="场地外底色")
     ap.add_argument("--viewer-margin", type=int, default=0,
                     help="页面窗口四周留黑边（实测 24 会把黑边算进四边形，默认 0）")
     ap.add_argument("--frame-px", type=int, default=2,
@@ -358,6 +427,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ssh-key", default=str(ROOT / "data/fpga/board_ssh/board_key"))
     ap.add_argument("--board-agent", default="/root/tools/board_agent.py")
     ap.add_argument("--board-python", default="python3")
+    ap.add_argument("--vt-feed", action="store_true",
+                    help="不开相机：把渲染出的页面帧直接喂给板端 vt_board（.rgb 流），"
+                         "用于相机被别的窗口挡住时仍能验收 VT/决策链路")
+    ap.add_argument("--vt-feed-hz", type=float, default=2.0)
     ap.add_argument("--board-extra", default="")
     ap.add_argument("--connect-timeout", type=float, default=90.0)
     a = ap.parse_args(argv)
@@ -408,9 +481,9 @@ def main(argv: list[str] | None = None) -> int:
             pass
         return default
 
-    wall_rgb = _rgb(a.wall_rgb, (200, 60, 0))
-    field_rgb = _rgb(a.field_rgb, (34, 40, 55))
-    bg_rgb = _rgb(a.bg_rgb, (8, 10, 14))
+    wall_rgb = _rgb(a.wall_rgb, (255, 240, 200))
+    field_rgb = _rgb(a.field_rgb, (12, 14, 20))
+    bg_rgb = _rgb(a.bg_rgb, (0, 0, 0))
     common = dict(mode="rgb_array", window_size=(640, 480), show_hud=False,
                   show_text=False, show_fiducials=False, show_world_axes=False,
                   show_field_border=True, frame_px=int(a.frame_px),
@@ -468,6 +541,7 @@ def main(argv: list[str] | None = None) -> int:
     board_files = {"state": str(run_dir / "board_state.txt"),
                    "events": str(run_dir / "board_events.jsonl"),
                    "vt": str(run_dir / "board_vt.jsonl")}
+    feeder = None
     fw = VideoWriterThread(follow_mp4, a.render_hz)
     vw_ = VideoWriterThread(field_mp4, a.field_hz)
     field_rec = (FieldRecorder(field_view, vw_, a.field_hz)
@@ -487,6 +561,15 @@ def main(argv: list[str] | None = None) -> int:
                     capture_output=True, timeout=20)
         except (OSError, _sp.SubprocessError):
             pass
+        if a.vt_feed:
+            try:
+                _sp.run(["ssh", "-i", a.ssh_key, "-o", "StrictHostKeyChecking=no",
+                         "-o", "ConnectTimeout=8", a.board_ssh,
+                         'pkill -f "[v]t_board"; pkill -f "[f]fmpeg"; '
+                         'sleep 0.3; rm -f /tmp/vt.jsonl'],
+                        capture_output=True, timeout=20)
+            except (OSError, _sp.SubprocessError):
+                pass
         link = SshLink(a.board_ssh, a.ssh_key, a.board_agent,
                        python=a.board_python, extra=a.board_extra)
         t_wait = time.monotonic()
@@ -501,6 +584,10 @@ def main(argv: list[str] | None = None) -> int:
                   waited_s=round(time.monotonic() - t_wait, 2))
     else:
         link = Link(a.tcp)
+    if a.vt_feed and a.board_ssh:
+        feeder = VtFeeder(a.board_ssh, a.ssh_key, a.board_python, hz=a.vt_feed_hz)
+        print(f"  VT 喂帧通道: 板端 vt_board ← 主机渲染帧 {a.vt_feed_hz:g} Hz",
+              file=sys.stderr)
     t0 = time.monotonic()
     next_page = t0
     next_field = t0
@@ -509,6 +596,7 @@ def main(argv: list[str] | None = None) -> int:
     last_field = 0.0
     last_pose_t = 0.0
     last_page_render_t = t0
+    next_vt_feed = t0
     reached = False
     collisions = 0
     min_clear: float | None = None
@@ -615,6 +703,9 @@ def main(argv: list[str] | None = None) -> int:
             if fr is not None:
                 publisher.submit(fr)
                 fw.write(fr)
+                if feeder is not None and now >= next_vt_feed:
+                    next_vt_feed = now + 1.0 / max(0.2, a.vt_feed_hz)
+                    feeder.submit(fr)
                 log.frame("page", t_sim=round(t_sim, 3), ms=round(_pg_ms, 2),
                           px=round(px, 1), py=round(py, 1),
                           gap_ms=round(1000.0 * (now - last_page_render_t), 2))
@@ -665,6 +756,9 @@ def main(argv: list[str] | None = None) -> int:
         "peer": link.peer,
         "videos": {"follow": str(follow_mp4), "field": str(field_mp4)},
         "abort_reason": abort_reason,
+        "vt_feed": None if feeder is None else {"frames": feeder.frames,
+                                                "dropped": feeder.dropped,
+                                                "hz": a.vt_feed_hz},
         "run_dir": str(run_dir),
         "logs": log.counts(),
     }
@@ -683,6 +777,8 @@ def main(argv: list[str] | None = None) -> int:
     fw.close()
     vw_.close()
     link.stop()
+    if feeder is not None:
+        feeder.stop()
     if viewer is not None:
         try:
             viewer.send_signal(2)

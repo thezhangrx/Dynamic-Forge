@@ -28,18 +28,18 @@ WALL_THICK = 8.0
 
 def vt_world_y(vy: float, py: float, half: float, y_scale: float, y_bias: float,
                field_h: float = 3420.0) -> float:
-    """VT 帧内 y → 场地 y（**按跟随视口被场地边界夹住后的可见带**算）。
+    """VT 帧内 y → 场地 y。
 
-    页面视口中心是 (场地中线, py)，接近场地两端时可见带被夹在 [0, field_h]。
-    实测页面在 py=40 时把真值 y=80 / 220 的两道墙画在像素行 200 / 60，也就是
-    **vy 是从可见带上沿往下数的像素**，所以场地 y = 可见带上沿 - vy：
-    上沿 = min(py+half, field_h)，起点时 = 280 → 280-200=80、280-60=220 ✓。
-    旧公式 py+(vy-240) 既翻错了符号又没管夹取，墙 y 才一直偏。
+    标定方法（对照画面里缺口已知的两道墙）：起点 py=40、真值 y=220 的墙 VT 报
+    vy=424，真值 y=80 的墙报 vy=280 —— 两点拟合得
+
+        world = (py - half) + y_scale*vy + y_bias,  y_scale=0.972, y_bias=+8
+
+    也就是 VT 的 vy 是"从可见带下沿往上数"的像素，而白框加粗后行坐标被放大
+    1.0286 倍（所以 scale≈1/1.0286）。**不要**再按 clamp 后的可见带算：那会把
+    起点附近的墙整体错一行，而且缺口会配到隔壁那道墙上（实测左右侧各错 180）。
     """
-    top = py + half
-    if top > field_h:
-        top = field_h
-    return (top - float(vy) * (2.0 * half / 480.0)) * y_scale + y_bias
+    return (float(py) - float(half)) + y_scale * float(vy) + y_bias
 
 
 class VtTail:
@@ -244,8 +244,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--view-h", type=float, default=480.0)
     ap.add_argument("--inflate", type=float, default=26.0)
     ap.add_argument("--pause-ahead", type=float, default=220.0)
-    ap.add_argument("--y-bias", type=float, default=0.0)
-    ap.add_argument("--y-scale", type=float, default=1.0)
+    ap.add_argument("--y-bias", type=float, default=8.0,
+                    help="标定：world=(py-half)+0.972*vy+8（用两道已知缺口的墙拟合）")
+    ap.add_argument("--y-scale", type=float, default=0.972,
+                    help="白框加粗后四边形按框外沿算，实测行坐标 = 1.0286*真值+12.6，"
+                         "所以这里 1/1.0286")
     ap.add_argument("--gap-margin", type=float, default=10.0)
     ap.add_argument("--state-file", default="/tmp/board_state.txt",
                     help="把发给决策的 @STATE 逐行落盘（事后核查墙覆盖率）")
@@ -253,6 +256,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="VT 角色 x 与主机 px 偏差超过这个值 → 判为几何坏帧（整帧作废）")
     ap.add_argument("--warmup", type=float, default=2.5,
                     help="开局预热：前 N 秒不收墙（白框四角还在收敛）")
+    ap.add_argument("--consensus-frames", type=int, default=3,
+                    help="同一道墙要几帧一致才入表（2 帧时偶发错行缺口会被收下）")
     ap.add_argument("--settle", type=float, default=0.9,
                     help="暂停后等多久再收候选帧（VT 有 ~0.5 s 延迟）")
     ap.add_argument("--from-end", action="store_true",
@@ -416,11 +421,15 @@ def main(argv: list[str] | None = None) -> int:
             walls = [w for w in s.get("walls", [])
                      if 60.0 <= float(w["y"]) <= 480.0]
             extras = []
+            raw_dbg: list[tuple] = []
             #: 几何自检：页面把角色画在它的场地 x 上（视口中线固定 320），所以
             #: VT 量到的角色 x 应该 ≈ 主机 px。偏了就说明白框/四边形检测坏了，
             #: 这一帧的缺口 x 一律不可信 —— 整帧丢掉，别让它污染 known。
             pv = s.get("player")
-            if pv is not None and a.player_tol > 0:
+            #: 只在"停住"时做几何判据：角色在动的时候，VT 帧比当前位姿旧
+            #: ~0.5 s，|dx| 天然就有一两百（200 单位/s × 0.5 s），会把好帧误杀。
+            still = (int(last_act) == 0) and not paused
+            if pv is not None and a.player_tol > 0 and (still or paused):
                 dx_p = float(pv[0]) - px
                 if abs(dx_p) > a.player_tol:
                     geom_rej_n += 1
@@ -460,6 +469,9 @@ def main(argv: list[str] | None = None) -> int:
                                 for g in cooldown_gaps)):
                     continue
                 extras.append((gy, gl, gr))
+                raw_dbg.append((gy, round(float(w["y"]), 1),
+                                round(float(w.get("gl", 0.0)), 1),
+                                round(float(w.get("gr", 640.0)), 1)))
             _pv = s.get("player") or [None, None]
             ev("vt_tick", vt_seq=int(s["seq"]), frame=s.get("frame"),
                geom=int(s.get("frame_geom") or 0), n_vt=len(s.get("walls", [])),
@@ -493,7 +505,7 @@ def main(argv: list[str] | None = None) -> int:
                 #: 板端 VT 2 Hz，单帧缺口偶尔整体偏几十像素：同一道墙要在 ≥2 帧里
                 #: 一致（y±25、缺口±15）才算数；等不到就退化成超时整批收下。
                 warmed = (time.monotonic() - t_start) >= a.warmup
-                agree = consensus(pause_seen)
+                agree = consensus(pause_seen, need=max(2, a.consensus_frames))
                 accept = agree if (warmed and waited >= 0.9 and agree) else []
                 if force_fix:
                     fixed = 0
@@ -544,11 +556,16 @@ def main(argv: list[str] | None = None) -> int:
                         known_detail.append({"y": round(gy, 1), "gl": round(gl, 1),
                                              "gr": round(gr, 1),
                                              "source": "board_vt"})
+                        _dbg = min(raw_dbg, key=lambda t: abs(t[0] - gy)) if raw_dbg else None
                         ev("add_wall", y=round(gy, 1), gl=round(gl, 1),
                            gr=round(gr, 1), gap_w=round(gr - gl, 1),
                            ahead=round(gy - py, 1), vt_seq=int(s["seq"]),
                            vt_frame=s.get("frame"), waited=round(waited, 2),
-                           n_agree=len(accept))
+                           n_agree=len(accept),
+                           vt_vy=None if _dbg is None else _dbg[1],
+                           raw_gl=None if _dbg is None else _dbg[2],
+                           raw_gr=None if _dbg is None else _dbg[3],
+                           margin=round(margin, 1))
                         if a.verbose:
                             print(f"  + wall y={gy:.1f} gap {gl:.0f}-{gr:.0f}",
                                   file=sys.stderr, flush=True)
@@ -559,7 +576,8 @@ def main(argv: list[str] | None = None) -> int:
                     known.sort(key=lambda v: v)
                     remain = [e for e in extras
                               if not any(abs(e[0] - k) <= 30.0 for k in known)]
-                    if (accept and not remain) or (waited > 4.5 and warmed):
+                    if ((accept and not remain)
+                            or (waited > 4.5 and warmed and (known or waited > 10.0))):
                         added_gaps = [(gl, gr) for _gy, gl, gr in accept]
                         if added_gaps:
                             cooldown_gaps[:] = (cooldown_gaps + added_gaps)[-12:]
@@ -573,7 +591,8 @@ def main(argv: list[str] | None = None) -> int:
                            next_act=int(last_act))
         #: 暂停超时要在主循环里判：VT 断流时（没有新帧）也要能恢复。
         if (paused and time.monotonic() - pause_t0 > 4.0
-                and time.monotonic() - t_start >= a.warmup):
+                and time.monotonic() - t_start >= a.warmup
+                and (known or time.monotonic() - pause_t0 > 10.0)):
             paused = False
             prev_extras = []
             last_prog_py, last_prog_t = py, time.monotonic()
