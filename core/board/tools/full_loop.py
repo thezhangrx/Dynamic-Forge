@@ -1153,7 +1153,10 @@ def main(argv: list[str] | None = None) -> int:
             ys_b = _wall_ys(base[1]["walls"])
             ys = [0.5 * (a + b) for a, b in zip(ys_a, ys_b)]
             py_now = py
-            known = sorted(vt_world_y(vy, py_now) for vy in ys)
+            #: 初始化也要按场地范围过滤：画框上下沿会被 VT 当成墙（y<0 或 >场高），
+            #: 写进 known 会让后面的"新墙"判断和代价场一开始就错。
+            known = sorted(y for y in (vt_world_y(vy, py_now) for vy in ys)
+                           if 5.0 < y < field_h - 8.0)
             known_detail = []
             for k in known:
                 # 取最接近该已知 y 的 VT 墙（同一个样本里的缺口端点）
