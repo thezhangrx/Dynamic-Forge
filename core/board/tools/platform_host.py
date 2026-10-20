@@ -298,7 +298,9 @@ class SshLink:
             pass
 
 
-def start_camera_pipe(target: str, key: str, extra: str = "") -> dict:
+def start_camera_pipe(target: str, key: str, extra: str = "",
+                      vt_bin: str = "/root/tools/vt_board",
+                      fps: float = 2.0) -> dict:
     """在板子上拉起相机管线：ffmpeg 抓 /dev/video0 → vt_board（VT 在板端）。
 
     **板端决策的输入只能是这条链路**（用户硬规则）。同时写 /tmp/vt_source=camera，
@@ -306,18 +308,25 @@ def start_camera_pipe(target: str, key: str, extra: str = "") -> dict:
     """
     import subprocess
     cmd = (
-        'pkill -f "[v]t_board"; pkill -f "[f]fmpeg"; sleep 0.3; '
+        #: 注意：这里必须用 `pkill -x`（按进程名精确匹配）而不是 `pkill -f`。
+        #: 这条命令是**通过 ssh 传过去的一整行**，remote bash 自己的 cmdline 里就
+        #: 含有 "/root/tools/vt_sparse" 和 "ffmpeg"，用 -f 会把自己杀掉 ——
+        #: 表现就是"管线没起来，而且一点输出都没有"（排查过一次，记在这里）。
+        'pkill -x vt_board; pkill -x vt_sparse; pkill -x ffmpeg; sleep 0.3; '
         'rm -f /tmp/vt.jsonl /tmp/cam.jpg; '
-        'nohup bash -c \'ffmpeg -hide_banner -loglevel error -f v4l2 '
-        '-input_format mjpeg -video_size 640x480 -i /dev/video0 '
-        '-filter_complex "fps=2,scale=320:240,split=2[a][b]" '
+        'nohup bash -c \'ffmpeg -hide_banner -loglevel error '
+        '-fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 '
+        '-f v4l2 -input_format mjpeg -video_size 640x480 -i /dev/video0 '
+        f'-filter_complex "fps={fps:g},scale=320:240,split=2[a][b]" '
         '-map "[a]" -f rawvideo -pix_fmt rgb24 - '
         '-map "[b]" -update 1 -q:v 5 -y /tmp/cam.jpg '
-        '| /root/tools/vt_board --w 320 --h 240 --frame-roi 0 0 320 240 '
+        f'| {vt_bin} --w 320 --h 240 --frame-roi 0 0 320 240 '
         '--quad-file /tmp/quad.json --quad-state /tmp/qb.txt '
-        '--jsonl /tmp/vt.jsonl %s\' '
+        '--jsonl /tmp/vt.jsonl %s >/dev/null\' '
         '>/tmp/campipe.log 2>&1 & '
-        'sleep 5; echo "PID=$(pidof vt_board)"; '
+        'for i in $(seq 1 25); do '
+        'if [ -s /tmp/vt.jsonl ]; then break; fi; sleep 1; done; '
+        'echo "PID=$(pidof vt_board vt_sparse)"; '
         'echo "LINES=$(wc -l < /tmp/vt.jsonl 2>/dev/null || echo 0)"; '
         'tail -2 /tmp/campipe.log'
     ).replace("%s", extra)
@@ -386,8 +395,18 @@ def fetch_board_files(target: str, key: str, run_dir: Path,
         "board_vt.jsonl": "tail -n 6000 /tmp/vt.jsonl",
         #: 相机快照必须连带时间戳一起取：/tmp/cam.jpg 只在管线带 jpeg 输出时才刷，
         #: 之前吃过亏 —— 读到的是几分钟前的旧文件，误判成"窗口被盖住"。
-        "camera_last.jpg": "cat /tmp/cam.jpg 2>/dev/null; echo; "
-                           "stat -c %Y /tmp/cam.jpg 2>/dev/null",
+        #: 板子的墙钟是 2023-03-03（没对时），用**板子自己的 now** 减 mtime 才
+        #: 是真正的"快照年龄"；用主机的 time.time() 会算出 1.7e9 秒的假年龄。
+        "camera_last.jpg": "python3 - <<\'EOF\'\n"
+                           "import os,sys,time\n"
+                           "p=\'/tmp/cam.jpg\'\n"
+                           "try:\n"
+                           "    d=open(p,\'rb\').read()\n"
+                           "    sys.stdout.buffer.write(d)\n"
+                           "    sys.stdout.write(\'\\n%.1f\\n\' % (time.time()-os.path.getmtime(p)))\n"
+                           "except OSError:\n"
+                           "    pass\n"
+                           "EOF",
     }
     for name, cmd in jobs.items():
         dest = run_dir / name
@@ -398,10 +417,11 @@ def fetch_board_files(target: str, key: str, run_dir: Path,
                 if name == "camera_last.jpg":
                     #: 末行是 mtime（秒）；据此算出快照年龄，过期的直接标记
                     parts = body.rsplit(b"\n", 2)
-                    mtxt = parts[-1].strip() if len(parts) > 1 else b""
+                    atxt = parts[-1].strip() if len(parts) > 1 else b""
                     body = parts[0] + (b"\n" if len(parts) > 1 else b"")
+                    #: 末行是**板端算好的年龄（秒）**，不是 mtime 了
                     try:
-                        age = time.time() - float(mtxt or 0)
+                        age = float(atxt or -1.0)
                     except ValueError:
                         age = -1.0
                     dest.write_bytes(body)
@@ -416,6 +436,29 @@ def fetch_board_files(target: str, key: str, run_dir: Path,
         except (OSError, subprocess.SubprocessError) as exc:
             out[name] = {"error": repr(exc)}
     return out
+
+
+_STOP = threading.Event()
+
+
+def install_stop_signals() -> None:
+    """让 SIGTERM/SIGINT 变成"有序退出"。
+
+    SDL 会在 pygame.init 时接管 SIGTERM/SIGINT 并把它们变成 SDL_QUIT 事件；
+    如果主循环不处理 QUIT（本程序就是），进程会**收不到终止信号**、只能 -9。
+    这里在 pygame 初始化之后再装一遍，把信号落实到 `_STOP` 标志上。
+    """
+    import signal
+
+    def _on_sig(signum, _frame):
+        print(f"  收到信号 {signum}：准备退出 ...", file=sys.stderr)
+        _STOP.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _on_sig)
+        except (ValueError, OSError):
+            pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -476,6 +519,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--start-camera-pipe", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="开跑前在板子上拉起相机管线（唯一允许的决策输入来源）")
+    ap.add_argument("--cam-vt-bin", default="/root/tools/vt_board",
+                    help="板端 VT 可执行文件（A/B：vt_board 稠密 / vt_sparse 稀疏）")
+    ap.add_argument("--cam-fps", type=float, default=2.0,
+                    help="相机降采样后的 VT 帧率（决策新鲜度上限）")
     a = ap.parse_args(argv)
 
     spec = ScenarioSpec.load(a.scenario)
@@ -540,6 +587,7 @@ def main(argv: list[str] | None = None) -> int:
                   wall_color=wall_rgb, background=bg_rgb,
                   field_bg=field_rgb, resizable=False)
     page = PygameRenderer(show_potential=False, **common)
+    install_stop_signals()
     field_view = PygameRenderer(show_potential=True,
                                 potential_every=max(1, int(a.field_every)),
                                 **common)
@@ -610,7 +658,8 @@ def main(argv: list[str] | None = None) -> int:
           file=sys.stderr)
 
     if a.board_ssh and a.start_camera_pipe:
-        _cam = start_camera_pipe(a.board_ssh, a.ssh_key, extra=a.vt_board_extra)
+        _cam = start_camera_pipe(a.board_ssh, a.ssh_key, extra=a.vt_board_extra,
+                                 vt_bin=a.cam_vt_bin, fps=a.cam_fps)
         print(f"  相机管线: {_cam}", file=sys.stderr)
         if not _cam.get("ok"):
             print("  ⚠ 相机管线没起来：板端会没有图像，本轮不会产生有效决策",
@@ -645,7 +694,8 @@ def main(argv: list[str] | None = None) -> int:
         link = SshLink(a.board_ssh, a.ssh_key, a.board_agent,
                        python=a.board_python, extra=a.board_extra)
         t_wait = time.monotonic()
-        while link.moves == 0 and time.monotonic() - t_wait < a.connect_timeout:
+        while (link.moves == 0 and time.monotonic() - t_wait < a.connect_timeout
+               and not _STOP.is_set()):
             if not link.send_pose(*[float(v) for v in (env.world.player[0],
                                                        env.world.player[1],
                                                        env.world.player[4])]):
@@ -677,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
     view_half = 240.0
     last_truth_snap = 0.0
     last_pose_seq = link.pose_seq
-    while t_sim < a.max_seconds and not reached:
+    while t_sim < a.max_seconds and not reached and not _STOP.is_set():
         now = time.monotonic()
         prof["it"] += 1
 

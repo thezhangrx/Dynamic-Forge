@@ -287,6 +287,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="开局预热：前 N 秒不收墙（白框四角还在收敛）")
     ap.add_argument("--consensus-frames", type=int, default=3,
                     help="同一道墙要几帧一致才入表（2 帧时偶发错行缺口会被收下）")
+    ap.add_argument("--collect-moving", action="store_true",
+                    help="发现新墙时**不停车**，边走边收（需要 VT ≥8 fps）。"
+                         "原来每道墙都停一次：12 fps 下墙在可见带里只待 ~7 s，"
+                         "一停一开会把连续的几道墙全错过（实测漏 500/640/780/920）")
+    ap.add_argument("--pause-timeout", type=float, default=4.0,
+                    help="一次暂停最多等这么久；VT 越快这个值越该小（现在 6 fps"
+                         "下 consensus 通常 <0.5 s 就够，4 s 会把整轮时间全吃掉）")
     ap.add_argument("--settle", type=float, default=0.9,
                     help="暂停后等多久再收候选帧（VT 有 ~0.5 s 延迟）")
     ap.add_argument("--from-end", action="store_true",
@@ -369,9 +376,33 @@ def main(argv: list[str] | None = None) -> int:
     last_prog_py = -1e9
     last_prog_t = time.monotonic()
     paused = False
+    collecting = False        #: 边走边收：与 paused 共用 pause_seen/pause_t0，
+                              #: 区别是**不发 move(0)**、不压住 @MOVE
     pause_t0 = 0.0
     cooldown_until = 0.0
     cooldown_gaps: list[tuple[float, float]] = []
+
+    def gap_plausible(gl: float, gr: float) -> bool:
+        """缺口形状是否像"这道墙上的一个洞"（不含场景真值，只用几何常识）。
+
+        本场景真缺口宽 90~110；VT 观测到 45~200 都算正常。太窄（<40）是墙缝/像素线，
+        太宽（>210）或贴到画面边缘（gl<15 / gr>625）基本都是配错行或页面白框。
+        """
+        w = gr - gl
+        return 40.0 <= w <= 210.0 and gl >= 15.0 and gr <= 625.0
+
+    def gap_width_outlier(gl: float, gr: float) -> bool:
+        """用**已知墙的缺口宽度中位数**做参考，挡掉"宽度明显不像缺口"的行。
+
+        本场景所有墙的缺口宽度都差不多（真值 91~106，板端入表后 ~67~92）。
+        一旦某一行量出来的宽度偏离中位数 >45，多半是暗段配错了行（实测
+        wall@220 被量成 152 宽、右边界偏 +80）。不依赖任何真值，只用已学到的墙。
+        """
+        import statistics
+        ws = [float(d["gr"]) - float(d["gl"]) for d in known_detail]
+        if len(ws) < 4:
+            return False
+        return abs((gr - gl) - statistics.median(ws)) > 45.0
 
     def gap_suspect(gy: float, gl: float, gr: float) -> str:
         """判断这条候选的缺口是不是"配错行配来的"。
@@ -511,6 +542,15 @@ def main(argv: list[str] | None = None) -> int:
                 #: 帧里的角色比"当前 py 应有的位置"偏下多少，就说明这一帧是
                 #: 角色还低那么多的时候拍的 → 用 py_cap 去映射，y 就不会偏。
                 #: 丢帧会让墙学不到（实测只学到 4 道、整轮卡死），修正更好。
+                #: 只有"角色检测可信"时才敢用它修正位姿：跟随视口里角色恒在页面
+                #: 正中，所以 dy_p 超过 ~80 一定是检测被墙/白框骗走了；这时把
+                #: py_cap 拿去映射墙 y 会偏上百单位，多帧永远一致不了（实测
+                #: collect-moving 下一道墙都学不到就是这么来的）。放弃这一帧比
+                #: 用错位姿更安全。
+                if abs(dy_p) > 80.0 or abs(dx_p) > 110.0:
+                    ev("stale_drop", dy=round(dy_p, 1), dx=round(dx_p, 1),
+                       vt_seq=int(s["seq"]), py=round(py, 1))
+                    walls = []
                 py_cap = py - dy_p * a.y_scale
                 #: 只有"帧里的角色与当前位姿基本重合"的帧才算同拍（|dy|≤5 → 位移
                 #: ≤5 单位）。这类帧的墙行才可信；旧帧只用来触发暂停，不进测量。
@@ -540,6 +580,16 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 #: 贴近的墙（视野下沿）几何误差更大，缺口再放宽一点。
                 margin = a.gap_margin if ahead >= 60.0 else a.gap_margin + 6.0
+                #: 单帧原始缺口宽度先过一道闸：本场景墙缺口 90~110（VT 实测
+                #: 45~200 属正常）。超出这个范围的多半是"配错行"（把页面白框、
+                #: 场外黑区、被角色挡住的段落当成缺口），宽度离谱时宁可丢帧。
+                _raw_w = float(w.get("gr", 640.0)) - float(w.get("gl", 0.0))
+                if not (45.0 <= _raw_w <= 200.0):
+                    ev("reject_gap", why="raw_width", y=round(gy, 1),
+                       gl=round(float(w.get("gl", 0.0)), 1),
+                       gr=round(float(w.get("gr", 640.0)), 1),
+                       w=round(_raw_w, 1))
+                    continue
                 gl = float(w.get("gl", 0.0)) + margin
                 gr = float(w.get("gr", 640.0)) - margin
                 if gr - gl < 60.0:
@@ -564,22 +614,38 @@ def main(argv: list[str] | None = None) -> int:
                cand=[[round(e[0], 1), round(e[1], 1), round(e[2], 1)] for e in extras[:6]])
             raw = list(extras)
             #: 已经进 known 的墙不再是"新墙"，否则恢复运动后立刻又被同一批触发暂停。
+            #: 触发"停车测量"前先按**缺口身份**过滤：同一个缺口窗口（±25 px）我们
+            #: 已经量过了，就不该再停一次车。以前只按 y 过滤（±55），而同一道墙
+            #: 在移动中映射出来的 y 会差 60~150，于是同一道墙被反复"发现"→ 反复
+            #: 停车 → 一轮 274 次 wall_same_gap、59 次暂停，时间全耗在停车上。
+            #: 回退记录（std8）：试过"按缺口身份预过滤候选"来减少重复停车，结果
+            #: 覆盖率 24/24 → 17/24、min_clearance +18.2 → −10 —— 因为相邻两道墙
+            #: 的缺口窗口可能落在 ±25 内，把**真的新墙**也滤掉了，板子于是盲开撞墙。
+            #: 这个预过滤已删除；减少停车只能从"暂停时长"想办法，不能牺牲候选。
             extras = [e for e in raw
                       if not any(abs(e[0] - k) <= 55.0 for k in known)]
             prev_extras = list(extras)
             extras_t = time.monotonic()
-            if extras and not paused:
-                paused = True
-                pause_t0 = extras_t
-                pause_seen = []
-                link.send_move(0)          # 立刻停住，等确认
-                ev("pause", cands=[[round(e[0], 1), round(e[1], 1), round(e[2], 1)]
-                                   for e in extras[:6]],
-                   vt_seq=int(s["seq"]))
-                if a.verbose:
-                    print(f"  pause: {[round(e[0], 1) for e in extras]}",
-                          file=sys.stderr, flush=True)
-            if paused:
+            if extras and not paused and not collecting:
+                if a.collect_moving:
+                    #: 不停车：墙在可见带里只待几秒，停车会把后面的墙也错过
+                    collecting = True
+                    pause_t0 = extras_t
+                    pause_seen = []
+                    ev("collect", cands=[[round(e[0], 1), round(e[1], 1),
+                                          round(e[2], 1)] for e in extras[:6]])
+                else:
+                    paused = True
+                    pause_t0 = extras_t
+                    pause_seen = []
+                    link.send_move(0)      # 立刻停住，等确认
+                    ev("pause", cands=[[round(e[0], 1), round(e[1], 1),
+                                        round(e[2], 1)] for e in extras[:6]],
+                       vt_seq=int(s["seq"]))
+                    if a.verbose:
+                        print(f"  pause: {[round(e[0], 1) for e in extras]}",
+                              file=sys.stderr, flush=True)
+            if paused or collecting:
                 #: 暂停刚发出时 VT 帧还可能是"动着的"那一帧：等 0.35 s 再开始收，
                 #: 之后的帧才是停稳后拍的（否则 y/缺口带着运动模糊的偏差）。
                 if time.monotonic() - pause_t0 >= a.settle:
@@ -596,8 +662,15 @@ def main(argv: list[str] | None = None) -> int:
                 accept = agree if (warmed and waited >= 0.9 and agree) else []
                 if force_fix:
                     fixed = 0
-                    for _fix in (agree or raw):
+                    #: **只用多帧一致的结果**。以前写的是 `(agree or raw)`：等不到
+                    #: 一致就退化成"单帧原始值"，于是把别的一行的缺口（实测
+                    #: 21.5–172、宽 150）直接改到已知墙上，板子照着它侧移撞墙。
+                    for _fix in (agree if agree else []):
                         gy, gl, gr = _fix[0], _fix[1], _fix[2]
+                        if not gap_plausible(gl, gr):
+                            ev("fix_reject", why="implausible", y=round(gy, 1),
+                               gl=round(gl, 1), gr=round(gr, 1))
+                            continue
                         near = [d for d in known_detail
                                 if abs(float(d["y"]) - gy) <= 70.0]
                         if not near:
@@ -605,6 +678,16 @@ def main(argv: list[str] | None = None) -> int:
                         d = min(near, key=lambda q: abs(float(q["y"]) - gy))
                         if (abs(float(d["gl"]) - gl) > 0.5
                                 or abs(float(d["gr"]) - gr) > 0.5):
+                            #: "重测"是细化，不是搬家：中心跳 >70 说明配错行了
+                            _dc = abs(0.5 * (float(d["gl"]) + float(d["gr"]))
+                                      - 0.5 * (gl + gr))
+                            if _dc > 70.0:
+                                ev("fix_reject", why="jump",
+                                   y=round(gy, 1), gl=round(gl, 1), gr=round(gr, 1),
+                                   old_gl=round(float(d["gl"]), 1),
+                                   old_gr=round(float(d["gr"]), 1),
+                                   dc=round(_dc, 1))
+                                continue
                             d["gl"], d["gr"] = round(gl, 1), round(gr, 1)
                             fixed += 1
                     if fixed:
@@ -631,12 +714,16 @@ def main(argv: list[str] | None = None) -> int:
                             stuck_tries = 0
                         force_fix = False
                         paused = False
+                        collecting = False
                         prev_extras = []
                         pause_seen = []
                         last_prog_py, last_prog_t = py, time.monotonic()
                         link.send_move(nudge_act if time.monotonic() < nudge_until
                                        else last_act)
-                if paused:
+                #: 这里以前写的是 `if paused:` —— 于是"边走边收"收到了好数据也
+                #: **永远不入表**（实测 std2/std3：21 次 collect、候选每帧都一致，
+                #: add_wall 却只有开局那 2 道）。入表必须对 collecting 同样生效。
+                if paused or collecting:
                     _batch_gaps: list[tuple[float, float, float]] = []
                     for _acc in accept:
                         gy, gl, gr = _acc[0], _acc[1], _acc[2]
@@ -671,6 +758,8 @@ def main(argv: list[str] | None = None) -> int:
                                updated=bool(_new_ahead + 20.0 < _old_ahead))
                             continue
                         _why = gap_suspect(gy, gl, gr)
+                        if not _why and gap_width_outlier(gl, gr):
+                            _why = "width_outlier"
                         if not _why:
                             for (_by, _bgl, _bgr) in _batch_gaps:
                                 if abs(_bgl - gl) <= 20.0 and abs(_bgr - gr) <= 20.0 \
@@ -714,6 +803,7 @@ def main(argv: list[str] | None = None) -> int:
                             cooldown_gaps[:] = (cooldown_gaps + added_gaps)[-12:]
                             cooldown_until = time.monotonic() + 2.0
                         paused = False
+                        collecting = False
                         prev_extras = []
                         pause_seen = []
                         last_prog_py, last_prog_t = py, time.monotonic()
@@ -721,10 +811,16 @@ def main(argv: list[str] | None = None) -> int:
                         ev("resume", kind="accepted", n_known=len(known),
                            next_act=int(last_act))
         #: 暂停超时要在主循环里判：VT 断流时（没有新帧）也要能恢复。
-        if (paused and time.monotonic() - pause_t0 > 4.0
+        if ((paused or collecting) and time.monotonic() - pause_t0 > a.pause_timeout
                 and time.monotonic() - t_start >= a.warmup
                 and (known or time.monotonic() - pause_t0 > 10.0)):
+            #: **必须同时清 collecting**：否则"(paused or collecting)"永远为真，
+            #: 这个分支会每轮迭代都打一次 resume（实测 3418 次/38s ≈ 90 Hz），
+            #: 而"发现新墙 → 开始收"的条件里有 `not collecting`，从此再也不会触发
+            #: ——整轮一道墙都学不到，板子以为全场没墙，直线穿墙到终点（sparse7）。
             paused = False
+            collecting = False
+            pause_t0 = time.monotonic()
             prev_extras = []
             last_prog_py, last_prog_t = py, time.monotonic()
             link.send_move(last_act)

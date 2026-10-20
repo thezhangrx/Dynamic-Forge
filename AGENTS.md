@@ -1,6 +1,7 @@
 # 硬规则（任何改动都必须遵守，不许绕过）
 
-> 这些是用户明确要求、并已在代码里做了强制校验的约束。改代码前先读这一页。
+> 这些是用户明确要求的约束。其中**只有一部分**在代码里做了强制校验，其余的只是
+> 纪律（哪条是哪种，R1 里写清楚了）。改代码前先读这一页。
 
 ## R1. 板端决策的输入只能是真实相机
 
@@ -10,24 +11,37 @@
 允许的唯一链路：
 
 ```
-板子相机 /dev/video0 → ffmpeg 解码/降采样 → 板端 vt_board（白框正射 + 找墙/缺口 + 角色）
+板子相机 /dev/video0 → ffmpeg 解码/降采样（12 fps）→ 板端 vt_sparse（稀疏采样 + 找墙/缺口/角色）
    → board_agent（暂停采样、一致性、入表）→ field_cli_board（Dijkstra）
    → @MOVE → 主机（只渲染虚拟平台 + 收动作 + 发位姿 @POSE）
 ```
 
-代码强制点：
+代码现状（**如实记录，别信过期文档**）：
 
 - `core/board/tools/platform_host.py`
-  - `--vt-feed` 默认被拒绝：必须显式加 `--i-know-this-is-not-the-camera` 才允许，
-    且 summary 里固定写 `decision_source: "synthetic(PC渲染帧)"`，**不能当作验收结果**。
-  - `--start-camera-pipe`（默认开）由主机在板子上拉起相机管线，并写
-    `/tmp/vt_source=camera`。
-- `core/board/tools/board_agent.py`
-  - 启动时校验 `--source-file /tmp/vt_source`，值不是 `camera` 直接退出（返回码 3），
-    除非显式 `--allow-synthetic-vt`（仅算法单测）。
+  - `--vt-feed`（PC 渲染帧 → 板端 VT）**已彻底删除**，代码里只剩一行注释说明它曾经存在。
+  - `--start-camera-pipe`（默认开）由主机在板子上拉起相机管线（`ffmpeg | vt_sparse`），
+    summary 写 `decision_source: "camera"`。
+- `core/board/tools/start_cam.sh`
+  - 板端管线脚本，写 `/tmp/vt_source=camera` 作标记。
+- ⚠ **`board_agent.py` 目前没有任何"源不是相机就退出"的校验**。之前这一条写在文档里
+  但代码没实现（`/tmp/vt_source` 写了却没人读）。所以"别把渲染帧塞给板子"现在**只靠
+  这条纪律**，不靠代码。要做成硬约束就得补上校验，不许反过来把文档当成已有校验。
 
 推论：任何“板子跑得很好”的结论，必须来自相机链路；用合成帧得到的数字只能说明
 算法本身没错，不能代表闭环可用。
+
+## R1b. 标准配置
+
+当前最好的一轮（`run_20261020_224848_sparse6`：到达、18/24 道墙、|Δy| 3.2 px、12 fps）
+的参数**只维护在一个地方**：
+
+- 脚本：`core/board/tools/loop_standard.sh`（`--check` 只体检，不开跑）
+- 说明与证据索引：`docs/闭环标准配置.md`
+
+不要在命令行手敲别的参数组合当作"标准"；要改就跑前后两轮、用
+`check_run_logs.py` 的数字说话（R4），并且把脚本和文档一起更新。
+已知坏点（`--collect-moving`、残留 `--hold` 冻结窗口）也记在那份文档第 5 节。
 
 ## R2. 真值（ground truth）只留在 PC 上
 
