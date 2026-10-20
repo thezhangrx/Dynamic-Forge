@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import math
 import os
 import socket
@@ -288,12 +289,28 @@ def main(argv: list[str] | None = None) -> int:
                     help="从 jsonl 末尾开始读（换场景重跑）")
     ap.add_argument("--stdio", action="store_true",
                     help="走 stdin/stdout（主机用 ssh 起本进程时）")
+    ap.add_argument("--source-file", default="/tmp/vt_source",
+                    help="VT 输入来源标记（camera / synthetic）。非 camera 直接拒绝")
+    ap.add_argument("--allow-synthetic-vt", action="store_true",
+                    help="[仅算法测试] 允许 synthetic 输入（结果不算验收）")
     ap.add_argument("--events-file", default="/tmp/board_events.jsonl",
                     help="板端结构化事件（JSONL）：VT 帧/pause/add_wall/fix/nudge/move")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
 
     t_boot = time.monotonic()
+    #: ⚠ 硬规则：板端决策的输入必须是真实相机。这里校验来源标记，
+    #: 避免"PC 渲染帧 → 板端 VT"这种链路悄悄跑起来当成验收结果。
+    try:
+        _src = Path(a.source_file).read_text(encoding="utf-8").strip()
+    except OSError:
+        _src = "unknown"
+    if _src != "camera" and not a.allow_synthetic_vt:
+        print(f"\n[拒绝执行] 板端 VT 输入来源={_src!r}，必须是 'camera'。\n"
+              f"  - 相机链路：板子 ffmpeg 抓 /dev/video0 → vt_board（会写 {a.source_file}=camera）\n"
+              f"  - 若只做算法单测，显式加 --allow-synthetic-vt，且结果不算验收。\n",
+              file=sys.stderr, flush=True)
+        return 3
     half = a.view_h * 0.5
     kill_stale_clis()
     vt = VtTail(a.vt_jsonl, from_end=a.from_end)

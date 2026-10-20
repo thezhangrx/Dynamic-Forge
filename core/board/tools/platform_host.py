@@ -155,7 +155,11 @@ class VtFeeder:
                "ffmpeg -hide_banner -loglevel error -f rawvideo -pix_fmt rgb24 "
                "-s 320x240 -r %g -i - -f rawvideo -pix_fmt rgb24 - "
                "| /root/tools/vt_board --w 320 --h 240 --frame-roi 0 0 320 240 "
-               "--jsonl /tmp/vt.jsonl" % self.hz + (" " + extra if extra else "")]
+               "sh -c 'echo synthetic > /tmp/vt_source; exec ffmpeg -hide_banner "
+               "-loglevel error -f rawvideo -pix_fmt rgb24 -s 320x240 -r %g -i - "
+               "-f rawvideo -pix_fmt rgb24 - | /root/tools/vt_board --w 320 --h 240 "
+               "--frame-roi 0 0 320 240 --jsonl /tmp/vt.jsonl %s'"
+               % (self.hz, extra)]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
@@ -366,6 +370,38 @@ class SshLink:
             pass
 
 
+    def start_camera_pipe(target: str, key: str) -> dict:
+        """在板子上拉起相机管线：ffmpeg 抓 /dev/video0 → vt_board（VT 在板端）。
+
+        **板端决策的输入只能是这条链路**（用户硬规则）。同时写 /tmp/vt_source=camera，
+        板端 agent 会校验这个标记，synthetic 输入会被直接拒绝。
+        """
+        import subprocess
+        cmd = (
+            'pkill -f "[v]t_board"; pkill -f "[f]fmpeg"; sleep 0.3; '
+            'rm -f /tmp/vt.jsonl /tmp/cam.jpg; '
+            'echo camera > /tmp/vt_source; '
+            'nohup bash -c \'ffmpeg -hide_banner -loglevel error -f v4l2 '
+            '-input_format mjpeg -video_size 640x480 -i /dev/video0 '
+            '-filter_complex "fps=2,scale=320:240,split=2[a][b]" '
+            '-map "[a]" -f rawvideo -pix_fmt rgb24 - '
+            '-map "[b]" -update 1 -q:v 5 -y /tmp/cam.jpg '
+            '| /root/tools/vt_board --w 320 --h 240 --frame-roi 0 0 320 240 '
+            '--jsonl /tmp/vt.jsonl\' >/tmp/campipe.log 2>&1 & '
+            'sleep 4; pidof vt_board; wc -l < /tmp/vt.jsonl'
+        )
+        try:
+            res = subprocess.run(["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
+                                  "-o", "ConnectTimeout=8", target, cmd],
+                                 capture_output=True, timeout=60)
+            out = (res.stdout or b"").decode("utf-8", "ignore").strip().splitlines()
+            return {"ok": res.returncode == 0,
+                    "pid": out[0] if out else "",
+                    "vt_lines": out[-1] if out else ""}
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"ok": False, "error": repr(exc)}
+
+
 def fetch_board_files(target: str, key: str, run_dir: Path,
                       python: str = "python3") -> dict[str, Any]:
     """把板端证据拷进 run 目录：@STATE 流 / 板端事件 / VT 原始帧。"""
@@ -444,15 +480,34 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ssh-key", default=str(ROOT / "data/fpga/board_ssh/board_key"))
     ap.add_argument("--board-agent", default="/root/tools/board_agent.py")
     ap.add_argument("--board-python", default="python3")
+    #: ⚠ 硬规则（用户 2026-10-20 明确要求）：板端决策的输入**只能是真实相机**，
+    #: 不允许用 PC 渲染帧。下面的 --vt-feed 因此被禁用，只保留给"纯算法单元测试"，
+    #: 且必须同时给 --i-know-this-is-not-the-camera，跑出来的记录也会被标成
+    #: decision_source="synthetic"，不能当成验收结果。
     ap.add_argument("--vt-feed", action="store_true",
-                    help="不开相机：把渲染出的页面帧直接喂给板端 vt_board（.rgb 流），"
-                         "用于相机被别的窗口挡住时仍能验收 VT/决策链路")
+                    help="[禁用] 用 PC 渲染帧喂板端 VT。仅限纯算法测试，需额外 "
+                         "--i-know-this-is-not-the-camera；验收一律用相机")
     ap.add_argument("--vt-feed-hz", type=float, default=2.0)
+    ap.add_argument("--i-know-this-is-not-the-camera", dest="allow_synthetic",
+                    action="store_true",
+                    help="确认本次不是相机输入（只做算法测试，结果不算验收）")
     ap.add_argument("--vt-board-extra", default="",
                     help="附加给板端 vt_board 的参数，如 '--no-gap-recompute'")
     ap.add_argument("--board-extra", default="")
     ap.add_argument("--connect-timeout", type=float, default=90.0)
+    ap.add_argument("--start-camera-pipe", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="开跑前在板子上拉起相机管线（唯一允许的决策输入来源）")
     a = ap.parse_args(argv)
+
+    if a.vt_feed and not a.allow_synthetic:
+        print("\n[拒绝执行] 板端决策输入必须是真实相机。\n"
+              "  PC 渲染帧 → 板端 VT 这条路仅供算法单测，需要显式加 "
+              "--i-know-this-is-not-the-camera，\n"
+              "  且那次结果不能作为验收依据（summary 会标 decision_source=synthetic）。\n"
+              "  相机路径：板子 ffmpeg 抓 /dev/video0 → vt_board → board_agent → @MOVE。\n",
+              file=sys.stderr)
+        return 2
 
     spec = ScenarioSpec.load(a.scenario)
     env = BulletHellEnv(spec, seed=spec.seed)
@@ -568,6 +623,12 @@ def main(argv: list[str] | None = None) -> int:
     render_t = 0.0
 
     import subprocess as _sp
+    if a.board_ssh and a.start_camera_pipe and not a.vt_feed:
+        _cam = start_camera_pipe(a.board_ssh, a.ssh_key)
+        print(f"  相机管线: {_cam}", file=sys.stderr)
+        if not _cam.get("ok"):
+            print("  ⚠ 相机管线没起来：板端会没有图像，本轮不会产生有效决策",
+                  file=sys.stderr)
     if a.board_ssh:
         #: 开跑前先确认板端 VT 正在出新帧：否则整轮都是"读旧画面"，
         #: 结论会和现实脱节（我自己就被旧 cam.jpg 骗过一次）。
@@ -791,6 +852,7 @@ def main(argv: list[str] | None = None) -> int:
         "peer": link.peer,
         "videos": {"follow": str(follow_mp4), "field": str(field_mp4)},
         "abort_reason": abort_reason,
+        "decision_source": "synthetic(PC渲染帧)" if feeder is not None else "camera",
         "vt_feed": None if feeder is None else {"frames": feeder.frames,
                                                 "dropped": feeder.dropped,
                                                 "hz": a.vt_feed_hz},
