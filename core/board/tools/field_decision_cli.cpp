@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
   std::vector<field_m1::Rect> walls;
   char line[65536];
   int frames = 0, last_act = 0, last_n = -1;
-  bool printed_parse = false, printed_build = false;
+  bool printed_parse = false, printed_build = false, printed_reflex = false;
 
   while (std::fgets(line, sizeof(line), stdin)) {
     double px = 0, py = 0, pr = 10;
@@ -124,7 +124,51 @@ int main(int argc, char** argv) {
       }
     }
 
-    const int act = field.step(px, py);
+    int act = field.step(px, py);
+
+    //: **安全反射**：不管 M1 给出什么，只要角色边缘离最近一段墙 < 2 单位，
+    //: 就改成"停"（act=0），别再往里挤。实测相机几何有 ±10 单位的误差，
+    //: 偶尔会让 M1 贴着墙角过；这一层是纯板端的兜底，不依赖主机。
+    double min_clear = 1e9;
+    for (const auto& w : walls) {
+      const double dx = std::max(std::abs(px - w.x) - w.hw, 0.0);
+      const double dy = std::max(std::abs(py - w.y) - w.hh, 0.0);
+      min_clear = std::min(min_clear, std::hypot(dx, dy) - pr);
+    }
+    if (min_clear < 2.0) {
+      //: 已经在墙边/墙里时不能一律停（会僵死）：在 9 个动作里挑"下一步离墙最远"
+      //: 的那个；M1 的动作如果也不差就优先它。这样贴近时是往外退/贴着滑，
+      //: 不是原地卡住。
+      static const double dirs[9][2] = {{0, 0}, {-1, 0}, {1, 0}, {0, 1}, {0, -1},
+                                        {-0.70710678, 0.70710678},
+                                        {0.70710678, 0.70710678},
+                                        {-0.70710678, -0.70710678},
+                                        {0.70710678, -0.70710678}};
+      const double step = 8.0;
+      auto clear_at = [&](double x, double y) {
+        double m = 1e9;
+        for (const auto& w : walls) {
+          const double dx = std::max(std::abs(x - w.x) - w.hw, 0.0);
+          const double dy = std::max(std::abs(y - w.y) - w.hh, 0.0);
+          m = std::min(m, std::hypot(dx, dy) - pr);
+        }
+        return m;
+      };
+      double best = clear_at(px, py);
+      int best_act = 0;
+      for (int k = 1; k <= 8; ++k) {
+        const double c = clear_at(px + dirs[k][0] * step, py + dirs[k][1] * step);
+        if (c > best + 1e-9) { best = c; best_act = k; }
+      }
+      const double c_m1 = clear_at(px + dirs[act][0] * step, py + dirs[act][1] * step);
+      if (c_m1 >= best - 0.5) best_act = act;
+      act = best_act;
+      if (!printed_reflex) {
+        std::fprintf(stderr, "[field] 安全反射：clear=%.2f < 2 → 改走 act=%d\n",
+                     min_clear, act);
+        printed_reflex = true;
+      }
+    }
     ++frames;
     if (act != last_act || frames % 8 == 1) std::printf("@MOVE %d\n", act);
     last_act = act;

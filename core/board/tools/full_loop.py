@@ -718,7 +718,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--new-wall-margin", type=float, default=30.0,
                     help="候选新墙必须比已知最高墙再高多少")
     ap.add_argument("--vt-y-bias", type=float, default=-8.0,
-                    help="VT 墙行相对真实墙行的固定偏移（相机/屏幕标定；实测 +8）")
+                    help="VT 墙行固定偏移（**在环实测**：−8 时最小间隙转正；"
+                         "冻结页标定给 −5.5，但在环相机链路更慢，先用 −8）")
+    ap.add_argument("--vt-y-scale", type=float, default=1.0,
+                    help="VT 墙行尺度修正（冻结页标定 ~0.98；在环尚未验证，默认 1）")
     ap.add_argument("--gap-margin", type=float, default=6.0,
                     help="把视觉量到的缺口两边各收多少（保守通过，纯视觉不掺真值）")
     ap.add_argument("--pause-ahead", type=float, default=160.0,
@@ -889,6 +892,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---------------- 状态历史（VT 角色映射用） ---------------------------
     sim_hist: deque[tuple[float, float]] = deque(maxlen=20000)
+
+    def vt_world_y(vy: float, py_ref: float) -> float:
+        """VT 整流图的 y（0=带底、240=角色）→ 场地 y。
+
+        标定（冻结页 + 真值，三个角色 y、共 13 道墙）：误差 ≈ +5.5 + 0.02·d
+        （d = vy-240）。先按 0.98 收掉尺度，再减 5.5 的固定偏移。
+        """
+        d = float(vy) - follow_half
+        return float(py_ref) + d * args.vt_y_scale + args.vt_y_bias
 
     def note_py(y: float) -> None:
         sim_hist.append((time.monotonic(), float(y)))
@@ -1133,7 +1145,7 @@ def main(argv: list[str] | None = None) -> int:
             ys_b = _wall_ys(base[1]["walls"])
             ys = [0.5 * (a + b) for a, b in zip(ys_a, ys_b)]
             py_now = py
-            known = sorted(vy + (py_now - follow_half) for vy in ys)
+            known = sorted(vt_world_y(vy, py_now) for vy in ys)
             known_detail = []
             for k in known:
                 # 取最接近该已知 y 的 VT 墙（同一个样本里的缺口端点）
@@ -1141,7 +1153,7 @@ def main(argv: list[str] | None = None) -> int:
                 bd = 1e9
                 for s in base:
                     for w in s["walls"]:
-                        gy = float(w["y"]) + (py_now - follow_half)
+                        gy = vt_world_y(float(w["y"]), py_now)
                         if abs(gy - k) < bd:
                             bd = abs(gy - k)
                             best = w
@@ -1241,9 +1253,9 @@ def main(argv: list[str] | None = None) -> int:
             for d in known_detail:
                 if d.get("source") not in ("camera_vt_pause", "camera_vt_init"):
                     continue
-                #: VT 的墙行有固定的标定偏移（实测 +8 单位，来自相机/屏幕几何），
-                #: 用 --vt-y-bias 折掉；这是**一次性标定常数**，不是每帧真值。
-                y = float(d["y"]) + args.vt_y_bias
+                #: 已知墙的 y 在写入 known_detail 时已经过 vt_world_y 标定
+                #: （尺度 + 偏置），这里**不能再加一次**，否则会偏两倍。
+                y = float(d["y"])
                 gl = float(d.get("gl", 0.0)); gr = float(d.get("gr", 640.0))
                 if not (5.0 < y < field_h - 5.0) or gr - gl < 40.0:
                     continue
@@ -1373,13 +1385,15 @@ def main(argv: list[str] | None = None) -> int:
         if not s["frame_geom"]:
             return False
         py_now = py
-        walls = [w for w in s["walls"] if 20.0 <= float(w["y"]) <= 460.0]
+        #: 只信画面**中段**的墙：画框上下沿的墙会被裁掉一截，缺口量出来常常
+        #: 宽得离谱（离线测试里出现过 230–593）。60~420 之外的行一律不收。
+        walls = [w for w in s["walls"] if 60.0 <= float(w["y"]) <= 420.0]
         dets_vy = [float(w["y"]) for w in walls]
         _delta, matched = _shift_match(dets_vy, known, py_now, follow_half)
         max_known = max(known) if known else -1e9
         extras: list[tuple[float, dict]] = []
         for j, w in enumerate(walls):
-            gy = float(w["y"]) + (py_now - follow_half)
+            gy = vt_world_y(float(w["y"]), py_now)
             if not (5.0 < gy < field_h - 8.0):
                 continue
             gl = float(w.get("gl", 0.0)); gr = float(w.get("gr", 640.0))
@@ -1393,11 +1407,18 @@ def main(argv: list[str] | None = None) -> int:
             if gy <= max_known + args.new_wall_margin:
                 continue
             extras.append((gy, w))
-        #: 与上一帧的候选逐道比对（20 单位），连续两帧都在才算稳定。
+        #: 与上一帧的候选逐道比对：y 差 ≤20 **且** 缺口左右边界差 ≤15，
+        #: 连续两帧都一致才算稳定（只比 y 会把"同一行但缺口量歪"的帧放进来）。
         prev = pause.get("prev_extras") or []
-        stable = [c for c in extras
-                  if any(abs(c[0] - q) <= 20.0 for q in prev)]
-        pause["prev_extras"] = [gy for gy, _w in extras]
+        def _same(c, q) -> bool:
+            gy, w_x = c
+            return (abs(gy - q[0]) <= 20.0
+                    and abs(float(w_x.get("gl", 0.0)) - q[1]) <= 15.0
+                    and abs(float(w_x.get("gr", 640.0)) - q[2]) <= 15.0)
+        stable = [c for c in extras if any(_same(c, q) for q in prev)]
+        pause["prev_extras"] = [
+            (gy, float(w_x.get("gl", 0.0)), float(w_x.get("gr", 640.0)))
+            for gy, w_x in extras]
         if not extras:
             #: 这一屏的墙**都已经知道了**（触发它的是刚加过的墙/重复候选）：
             #: 立刻恢复，不等 12 s 超时；按缺口冷却 2 s，别马上再停。
@@ -1547,12 +1568,16 @@ def main(argv: list[str] | None = None) -> int:
                                     continue
                                 if ahead < 15.0:
                                     continue
+                                #: 与 pause_update 一致：只信画面中段的行，
+                                #: 画框上下沿的墙缺口量不准，不为它暂停。
+                                if not (60.0 <= vy <= 420.0):
+                                    continue
                                 #: 这里**不再用** stale 的 py_cap 算出来的 gy 去比
                                 #: `max_known`：相机链路 ~1 s 延迟会让 gy 偏低 ~200，
                                 #: 曾经因此漏掉终点前最后一道墙（板子靠 send-all-walls
                                 #: 直接开过去）。"是不是新墙"交给暂停后冻结页面的
                                 #: pause_update 判，那里 py 是准的。
-                                gy = vy + (py - follow_half)
+                                gy = vt_world_y(vy, py)
                                 # 场地外的"墙"是帧线/反光，不是墙
                                 if not (5.0 < gy < field_h - 8.0):
                                     continue
