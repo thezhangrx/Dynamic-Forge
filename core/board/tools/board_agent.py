@@ -26,9 +26,20 @@ import time
 WALL_THICK = 8.0
 
 
-def vt_world_y(vy: float, py: float, half: float, y_scale: float, y_bias: float) -> float:
-    d_px = float(vy) - 240.0
-    return py + d_px * (2.0 * half / 480.0) * y_scale + y_bias
+def vt_world_y(vy: float, py: float, half: float, y_scale: float, y_bias: float,
+               field_h: float = 3420.0) -> float:
+    """VT 帧内 y → 场地 y（**按跟随视口被场地边界夹住后的可见带**算）。
+
+    页面视口中心是 (场地中线, py)，但接近场地两端时会被夹在 [0, field_h]：
+    起点 py=40 时可见带是 [0,480] 而不是 [-200,280]。旧公式 py+(vy-240) 在
+    夹住时整体偏掉 clamp 的量（起点偏 40~240），墙的场地 y 就系统性错位。
+    """
+    lo = py - half
+    if lo < 0.0:
+        lo = 0.0
+    if lo > field_h - 2.0 * half:
+        lo = max(0.0, field_h - 2.0 * half)
+    return lo + float(vy) * (2.0 * half / 480.0) * y_scale + y_bias
 
 
 class VtTail:
@@ -171,6 +182,32 @@ def consensus(seen, tol_y: float = 25.0, tol_g: float = 15.0, need: int = 2):
     return out
 
 
+def kill_stale_clis(keep: int = 0) -> None:
+    """清掉上一轮 agent 死后残留的决策进程。
+
+    残留的 `field_cli_board` 会以 120 Hz 空转，4 个就把板子 4 核吃满，
+    vt_board 从 1.4 Hz 掉到 0.4 Hz，VT 数据全废。
+    """
+    killed = 0
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == keep or int(pid) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode("utf-8", "ignore")
+        except OSError:
+            continue
+        if "field_cli_board" not in cmd or "board_agent" in cmd:
+            continue
+        try:
+            os.kill(int(pid), 15)
+            killed += 1
+        except OSError:
+            pass
+    if killed:
+        time.sleep(0.3)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="板端：VT → @STATE → 决策 → @MOVE")
     ap.add_argument("--vt-jsonl", default="/tmp/vt.jsonl")
@@ -188,6 +225,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gap-margin", type=float, default=10.0)
     ap.add_argument("--state-file", default="/tmp/board_state.txt",
                     help="把发给决策的 @STATE 逐行落盘（事后核查墙覆盖率）")
+    ap.add_argument("--settle", type=float, default=0.9,
+                    help="暂停后等多久再收候选帧（VT 有 ~0.5 s 延迟）")
     ap.add_argument("--from-end", action="store_true",
                     help="从 jsonl 末尾开始读（换场景重跑）")
     ap.add_argument("--stdio", action="store_true",
@@ -196,6 +235,7 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     half = a.view_h * 0.5
+    kill_stale_clis()
     vt = VtTail(a.vt_jsonl, from_end=a.from_end)
     link = StdioLink() if a.stdio else HostLink(a.host, a.port)
     cli = subprocess.Popen(
@@ -310,16 +350,12 @@ def main(argv: list[str] | None = None) -> int:
                      if 60.0 <= float(w["y"]) <= 480.0]
             extras = []
             now_m = time.monotonic()
-            #: 关键：VT 帧是 0.5 s 前拍的，用"当前 py"映射会把同一条墙映射成
-            #: 一串递增的 y（重复入表、重复暂停）。用帧里角色自己的 y 反推
-            #: 拍照那一刻的 py，墙的场地 y 就稳定了。
-            pv = s.get("player") or (320.0, 240.0)
-            dy_cap = float(pv[1]) - 240.0
-            dy_cap = max(-140.0, min(140.0, dy_cap))
-            py_cap = py - dy_cap
+            #: 暂停时姿态是停住的，VT 帧（0.5 s 延迟）用的就是当前 py；再叠一层
+            #: "用帧内角色 y 反推拍照位姿"反而会把视口被夹住的情况算错，所以直接
+            #: 用当前 py + 可见带夹取。
             for w in walls:
-                gy = vt_world_y(w["y"], py_cap, half, a.y_scale, a.y_bias)
-                ahead = (float(w["y"]) - 240.0) * (2.0 * half / 480.0)
+                gy = vt_world_y(w["y"], py, half, a.y_scale, a.y_bias, a.field_h)
+                ahead = gy - py
                 if not (5.0 < gy < a.field_h - 8.0) or ahead < -20.0:
                     continue
                 #: 贴近的墙（视野下沿）几何误差更大，缺口再放宽一点。
@@ -354,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
             if paused:
                 #: 暂停刚发出时 VT 帧还可能是"动着的"那一帧：等 0.35 s 再开始收，
                 #: 之后的帧才是停稳后拍的（否则 y/缺口带着运动模糊的偏差）。
-                if time.monotonic() - pause_t0 >= 0.35:
+                if time.monotonic() - pause_t0 >= a.settle:
                     pause_seen.extend(raw)
                 del pause_seen[:-30]
                 waited = time.monotonic() - pause_t0
@@ -411,6 +447,10 @@ def main(argv: list[str] | None = None) -> int:
                         if a.verbose:
                             print(f"  + wall y={gy:.1f} gap {gl:.0f}-{gr:.0f}",
                                   file=sys.stderr, flush=True)
+                    if a.verbose and not accept and waited > 2.5:
+                        print(f"  [dbg] seen={len(pause_seen)} agree={len(agree)} "
+                              f"raw={[round(v[0], 1) for v in raw[:3]]}",
+                              file=sys.stderr, flush=True)
                     known.sort(key=lambda v: v)
                     remain = [e for e in extras
                               if not any(abs(e[0] - k) <= 30.0 for k in known)]
@@ -445,4 +485,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    finally:
+        kill_stale_clis()

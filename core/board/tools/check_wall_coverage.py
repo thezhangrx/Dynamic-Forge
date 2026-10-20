@@ -18,9 +18,17 @@ for line in open(run + "/state.txt"):
     if not line.startswith("@STATE"):
         continue
     p = line.split()
-    py = float(p[3])
-    n = int(p[5])
-    vals = [float(v) for v in p[6:6 + 5 * n]]
+    try:
+        py = float(p[3])
+        n = int(p[5])
+    except (IndexError, ValueError):
+        continue
+    try:
+        vals = [float(v) for v in p[6:6 + 5 * n]]
+    except ValueError:
+        continue
+    if len(vals) < 5 * n:
+        continue
     rows = {vals[5 * i + 1] for i in range(n)}
     for t in truth:
         if t in first_seen:
