@@ -35,6 +35,66 @@ FW, FH = 640, 480          # 正射图尺寸（= 页面尺寸 = 场地宽度）
 
 
 # ----------------------------------------------------------------------
+
+
+# ======================================================================
+# 视口四角标定块（红/绿/蓝/黄）→ 相机像素 ↔ 页面坐标 的单应
+# ======================================================================
+MARKER_COLORS = {           # 名字 -> HSV 区间（H 0..179, S/V 0..255）
+    "red":    [((0, 120, 60), (10, 255, 255)), ((170, 120, 60), (179, 255, 255))],
+    "green":  [((40, 100, 60), (85, 255, 255))],
+    "blue":   [((95, 120, 60), (135, 255, 255))],
+    "yellow": [((20, 120, 90), (35, 255, 255))],
+}
+#: 与渲染器一致：marker_side=18、margin=10 → 中心离页面边 19 个单位
+MARKER_INSET = 19.0
+
+
+def detect_markers(img: np.ndarray) -> dict[str, tuple[float, float]]:
+    """按颜色找 4 个标定块的中心（相机像素坐标）。"""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    found: dict[str, tuple[float, float]] = {}
+    for name, ranges in MARKER_COLORS.items():
+        mask = np.zeros(hsv.shape[:2], np.uint8)
+        for lo, hi in ranges:
+            mask |= cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        n, lab, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
+        best = None
+        for i in range(1, n):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area < 25:
+                continue
+            if best is None or area > best[0]:
+                best = (area, cents[i][0], cents[i][1])
+        if best:
+            found[name] = (float(best[1]), float(best[2]))
+    return found
+
+
+def page_homography(markers: dict[str, tuple[float, float]]) -> tuple[np.ndarray | None, dict]:
+    """4 个标定块 → 相机像素到页面坐标(0..640, 0..480)的单应。"""
+    r, g, b, y = (markers.get(k) for k in ("red", "green", "blue", "yellow"))
+    if None in (r, g, b, y):
+        return None, {"missing": [k for k, v in markers.items() if v is None]}
+    src = np.array([r, g, b, y], np.float32)
+    dst = np.array([[MARKER_INSET, MARKER_INSET],
+                    [FW - MARKER_INSET, MARKER_INSET],
+                    [FW - MARKER_INSET, FH - MARKER_INSET],
+                    [MARKER_INSET, FH - MARKER_INSET]], np.float32)
+    H = cv2.getPerspectiveTransform(src, dst)
+    proj = cv2.perspectiveTransform(src.reshape(-1, 1, 2), H).reshape(-1, 2)
+    err = float(np.abs(proj - dst).max())
+    return H, {"marker_fit_px": round(err, 2), "src": src.tolist()}
+
+
+def page_corners_in_camera(H: np.ndarray) -> np.ndarray:
+    """把页面四角反投影回相机像素（用于和板端白框四角对比）。"""
+    Hi = np.linalg.inv(H)
+    page = np.array([[0, 0], [FW - 1, 0], [FW - 1, FH - 1], [0, FH - 1]], np.float32)
+    return cv2.perspectiveTransform(page.reshape(-1, 1, 2), Hi).reshape(-1, 2)
+
+
 def grab_frames(url: str, n: int, timeout: float = 20.0) -> list[np.ndarray]:
     """从 MJPEG 流抓 n 帧（也可以传视频文件路径）。"""
     cap = cv2.VideoCapture(url)
@@ -227,6 +287,63 @@ def main(argv: list[str] | None = None) -> int:
     print(f"抓到 {len(frames)} 帧（{a.url}）")
     if not frames:
         return 3
+
+    # ---------- 首选：视口四角标定块（OpenCV 单应） ----------
+    mk_res = None
+    for fr in frames:
+        mk = detect_markers(fr)
+        if len(mk) < 4:
+            continue
+        H, info = page_homography(mk)
+        if H is None:
+            continue
+        corners = page_corners_in_camera(H)
+        #: 用单应把页面四角映射回相机，再正射一遍（这就是"矩阵变换附加在视觉上"）
+        wp = warp_page(fr, corners.astype(np.float32))
+        walls = detect_walls(wp)
+        pl = detect_player(wp)
+        mk_res = {"H": H.tolist(), "corners": corners.tolist(), "info": info,
+                  "markers": {k: list(v) for k, v in mk.items()},
+                  "walls": walls, "player": pl, "warped": wp}
+        break
+    if mk_res is not None:
+        print(f"标定块：4 个全部找到；单应残差 {mk_res['info']['marker_fit_px']} px")
+        print(f"  页面四角（相机像素）：{[tuple(round(v,1) for v in c) for c in mk_res['corners']]}")
+        print(f"  角色：{mk_res['player']}  墙：{len(mk_res['walls'])} 道")
+        warped_best = mk_res["warped"]
+        all_walls = mk_res["walls"]
+        players = [mk_res["player"]] if mk_res["player"] else []
+        matched = match_rows(all_walls, truth_y)
+        coef = {"scale": 1.0, "bias": 0.0, "samples": 0, "rmse": None}
+        if len(matched) >= 3:
+            xs = [m["measured_y"] for m in matched]
+            ys = [m["true_y"] for m in matched]
+            sc, bi, n, rmse = robust_line(xs, ys)
+            coef = {"scale": round(sc, 5), "bias": round(bi, 3),
+                    "samples": n, "rmse": round(rmse, 2)}
+        res = {"mode": "markers", "scale": coef["scale"], "bias": coef["bias"],
+               "rows_matched": len(matched), "fit": coef,
+               "quad": [[round(float(x), 1), round(float(y), 1)]
+                        for x, y in mk_res["corners"]],
+               "markers": mk_res["markers"], "H": mk_res["H"],
+               "walls": all_walls, "matched": matched,
+               "url": a.url, "scenario": a.scenario}
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.out).write_text(json.dumps(res, ensure_ascii=False, indent=2) + "\n",
+                               encoding="utf-8")
+        if warped_best is not None:
+            Path(a.save_warped).parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(a.save_warped, warped_best)
+            ov = warped_best.copy()
+            for w in all_walls:
+                cv2.line(ov, (0, int(FH - w["y"])), (FW - 1, int(FH - w["y"])), (0, 220, 0), 1)
+            for t in truth_y:
+                r = int(FH - t)
+                if 0 <= r < FH:
+                    cv2.line(ov, (0, r), (FW - 1, r), (0, 255, 255), 1)
+            cv2.imwrite(a.save_overlay, ov)
+            print(f"写出 {a.out} / overlay {a.save_overlay} / warped {a.save_warped}")
+        return 0
 
     ok_quad = 0
     all_walls: list[dict] = []

@@ -121,6 +121,9 @@ class PygameRenderer:
         show_hitboxes: bool = True,
         show_world_axes: bool = True,
         show_calibration_marker: bool = False,
+        show_viewport_markers: bool = False,
+        viewport_marker_side: float = 18.0,
+        fiducial_anchor: str = "field",
         calibration_marker: tuple[float, float] = (0.90, 0.90),
         calibration_marker_color: tuple[int, int, int] = (128, 0, 128),
         wall_color: tuple[int, int, int] = WALL_COLOR,
@@ -209,6 +212,9 @@ class PygameRenderer:
         #: 相机拍屏幕时用它建立场地坐标系（见 core/vision/calibration.py）。
         #: 默认关闭，免得污染正常回放。
         self.show_calibration_marker = bool(show_calibration_marker)
+        self.show_viewport_markers = bool(show_viewport_markers)
+        self.fiducial_anchor = str(fiducial_anchor)
+        self.viewport_marker_side = float(viewport_marker_side)
         self.calibration_marker = (float(calibration_marker[0]),
                                    float(calibration_marker[1]))
         #: 参考物的**颜色**。默认洋红 (255,0,255)：它是整个场景里唯一一个
@@ -571,6 +577,25 @@ class PygameRenderer:
         # --- 标定参考物：画在**所有东西之上** ---------------------------
         # 位置在这里是有意的：障碍物/玩家先画，参考物最后覆盖上去，
         # 于是它绝不会被一条墙线切开（见 _draw_calibration_marker 的说明）。
+        if self.show_viewport_markers and self._band is not None:
+            #: 视口四角的标定块：**世界坐标每帧已知**（见下），所以相机一拍到
+            #: 就能用 getPerspectiveTransform 解出"像素 → 场地"的单应。
+            #: 四角配四色：不靠位图解码，颜色分割即可，抗模糊/斜视。
+            lo, hi = self._band
+            s_px = max(6.0, self.viewport_marker_side)
+            m = 10.0
+            fw = float(world.state.env.field_w)
+            spots = [((m, hi - m - s_px), (255, 0, 0)),        # 左上 红
+                     ((fw - m - s_px, hi - m - s_px), (0, 255, 0)),   # 右上 绿
+                     ((fw - m - s_px, lo + m), (0, 0, 255)),          # 右下 蓝
+                     ((m, lo + m), (255, 255, 0))]                    # 左下 黄
+            for (wx, wy), col in spots:
+                a1 = vp.world_to_screen(wx, wy)
+                a2 = vp.world_to_screen(wx + s_px, wy + s_px)
+                x0, y0 = int(round(min(a1[0], a2[0]))), int(round(min(a1[1], a2[1])))
+                x1, y1 = int(round(max(a1[0], a2[0]))), int(round(max(a1[1], a2[1])))
+                pygame.draw.rect(screen, col,
+                                 pygame.Rect(x0, y0, max(2, x1 - x0), max(2, y1 - y0)))
         if self.show_calibration_marker:
             self._draw_calibration_marker(screen, world, vp)
 
@@ -597,9 +622,20 @@ class PygameRenderer:
         from standard.fiducial import (FIDUCIAL_LEVEL, FiducialLayout,
                                        snap_marker_side)
 
-        layout = FiducialLayout(field_w=float(world.state.env.field_w),
-                                field_h=float(world.state.env.field_h),
-                                marker_side=self.fiducial_side)
+        band = self._band
+        if self.fiducial_anchor == "band" and band is not None:
+            #: 锚在**当前视口**四角：跟随模式下场地高 3420，锚在场地四角时中途
+            #: 一枚都看不到；锚在 band 上则每帧都可见，且世界坐标 = band 下沿 + 局部 y。
+            _lo, _hi = band
+            _y_off = float(_lo)
+            layout = FiducialLayout(field_w=float(world.state.env.field_w),
+                                    field_h=max(1.0, float(_hi) - float(_lo)),
+                                    marker_side=self.fiducial_side)
+        else:
+            _y_off = 0.0
+            layout = FiducialLayout(field_w=float(world.state.env.field_w),
+                                    field_h=float(world.state.env.field_h),
+                                    marker_side=self.fiducial_side)
         layout = snap_marker_side(layout, float(vp.scale))
         # 亮块用 FIDUCIAL_LEVEL（中灰）而**不是纯白**：纯白会满足视觉链的
         # "亮块"判据（min(R,G,B) > 195，见 vision.primitives），四角就出现
@@ -610,8 +646,8 @@ class PygameRenderer:
             for (x, y, side, white) in layout.rects(slot):
                 # 场地 y **向上**为正（Viewport 把 y 翻了），所以矩形的 (x,y) 是
                 # **下边缘**：把两个对角都映射过去再取 min/max，就与 y 方向无关了。
-                ax, ay = vp.world_to_screen(x, y)
-                bx, by = vp.world_to_screen(x + side, y + side)
+                ax, ay = vp.world_to_screen(x, y + _y_off)
+                bx, by = vp.world_to_screen(x + side, y + side + _y_off)
                 sx0, sy0 = min(ax, bx), min(ay, by)
                 px = max(1, int(round(vp.len_to_screen(side))))
                 rect = pygame.Rect(int(round(sx0)), int(round(sy0)), px, px)

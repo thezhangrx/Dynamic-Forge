@@ -432,6 +432,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--bg-rgb", default="0,0,0", help="场地外底色")
     ap.add_argument("--viewer-margin", type=int, default=0,
                     help="页面窗口四周留黑边（实测 24 会把黑边算进四边形，默认 0）")
+    ap.add_argument("--fiducials", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="画四角 ArUco 标定标记（现有 standard.fiducial 那套）")
+    ap.add_argument("--fiducial-side", type=float, default=28.0,
+                    help="标记边长（场地单位）；相机离得远/画面模糊时可以加大")
+    ap.add_argument("--fiducial-anchor", default="band", choices=("field", "band"),
+                    help="标记锚点：band=当前视口四角（跟随时永远可见）")
+    ap.add_argument("--calib-markers", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="在视口四角画 4 个纯色标定块（红绿蓝黄），供 OpenCV 单应标定")
     ap.add_argument("--frame-px", type=int, default=2,
                     help="页面白框粗细（相机 VT 靠它定四边形，太细会锁错框）")
     ap.add_argument("--field-every", type=int, default=2,
@@ -509,8 +519,12 @@ def main(argv: list[str] | None = None) -> int:
     field_rgb = _rgb(a.field_rgb, (12, 14, 20))
     bg_rgb = _rgb(a.bg_rgb, (0, 0, 0))
     common = dict(mode="rgb_array", window_size=(640, 480), show_hud=False,
-                  show_text=False, show_fiducials=False, show_world_axes=False,
+                  show_text=False, show_fiducials=bool(a.fiducials),
+                  fiducial_anchor=str(a.fiducial_anchor),
+                  fiducial_side=float(a.fiducial_side),
+                  show_world_axes=False,
                   show_field_border=True, frame_px=int(a.frame_px),
+                  show_viewport_markers=bool(a.calib_markers),
                   show_hitboxes=False,
                   follow_player=True, follow_h=240.0,
                   follow_scale=float(a.follow_scale),
