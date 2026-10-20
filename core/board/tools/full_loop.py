@@ -417,6 +417,8 @@ class CameraVT:
             cmd = [self.vt_bin, "--w", str(w), "--h", str(h),
                    "--frames", "1", "--skip", "0",
                    "--frame-roi", "0", "0", str(w), str(h),
+                   #: 四角跨帧平滑（存在文件里，因为一帧一个子进程）
+                   "--quad-state", str(self.run_dir / "quad_state.txt"),
                    "--jsonl", str(self._tmp_jsonl)]
             try:
                 proc = subprocess.run(cmd, input=rgb.tobytes(),
@@ -791,7 +793,9 @@ def main(argv: list[str] | None = None) -> int:
         resizable=False,
     )
     page_view = PygameRenderer(show_potential=False, **common)
-    field_view = PygameRenderer(show_potential=True, potential_every=30, **common)
+    #: 势场录像：每帧重算（原来 30 帧才更新一次，5 fps 下就是 6 s 一跳，
+    #: 看起来像"势在闪"）。
+    field_view = PygameRenderer(show_potential=True, potential_every=1, **common)
 
     env = BulletHellEnv(spec, seed=spec.seed)
     env.reset(seed=spec.seed)
@@ -908,7 +912,10 @@ def main(argv: list[str] | None = None) -> int:
              "events": [], "last_resume": 0.0, "last_new_y": None,
              #: 一次暂停没确认到墙时，给同一个候选加冷却，否则"帧里那道墙还在"
              #: 会让主循环立刻再暂停一次 —— 实测 t_sim 卡在 7.3 s 反复暂停 32 次。
-             "cooldown_until": 0.0, "skip_gy": 1.0e9}
+             "cooldown_until": 0.0, "skip_gy": 1.0e9,
+             #: 刚加入的墙的缺口（gl,gr）：冷却期里同缺口的候选不再触发暂停，
+             #: 否则"刚加完的墙还在 160 以内"会立刻再停一次。
+             "cooldown_gaps": [], "target_gl": 0.0, "target_gr": 640.0}
     all_pauses: list[dict] = []
 
     def render_page(force: bool = False) -> None:
@@ -1274,6 +1281,7 @@ def main(argv: list[str] | None = None) -> int:
         """暂停没换到新墙：同一候选冷却 4 s（墙集合不变，继续走）。"""
         pause["cooldown_until"] = time.monotonic() + 4.0
         pause["skip_gy"] = float(cand_gy)
+        pause["cooldown_gaps"] = []
 
     def pause_begin(sample: dict, cand_gy: float, cand_w: dict) -> None:
         nonlocal pause_count
@@ -1282,6 +1290,8 @@ def main(argv: list[str] | None = None) -> int:
         pause["t0"] = time.monotonic()
         pause["target_gy"] = float(cand_gy)
         pause["target_vy"] = float(cand_w["y"])
+        pause["target_gl"] = float(cand_w.get("gl", 0.0))
+        pause["target_gr"] = float(cand_w.get("gr", 640.0))
         pause["known_before"] = [round(k, 1) for k in known]
         pause["samples"] = []
         pause["events"] = []
@@ -1331,8 +1341,6 @@ def main(argv: list[str] | None = None) -> int:
         max_known = max(known) if known else -1e9
         extras: list[tuple[float, dict]] = []
         for j, w in enumerate(walls):
-            if j in matched:
-                continue
             gy = float(w["y"]) + (py_now - follow_half)
             if not (5.0 < gy < field_h - 8.0):
                 continue
@@ -1352,6 +1360,21 @@ def main(argv: list[str] | None = None) -> int:
         stable = [c for c in extras
                   if any(abs(c[0] - q) <= 20.0 for q in prev)]
         pause["prev_extras"] = [gy for gy, _w in extras]
+        if not extras:
+            #: 这一屏的墙**都已经知道了**（触发它的是刚加过的墙/重复候选）：
+            #: 立刻恢复，不等 12 s 超时；按缺口冷却 2 s，别马上再停。
+            pause["cooldown_until"] = now + 2.0
+            pause["cooldown_gaps"] = (pause["cooldown_gaps"] + [
+                (float(pause["target_gl"]), float(pause["target_gr"]))])[-12:]
+            paused_total += now - pause["t0"]
+            pause["active"] = False
+            pause["prev_extras"] = []
+            event({"event": "resume_known", "index": pause_count,
+                   "t_sim": round(t_sim, 3),
+                   "target_gy": round(pause["target_gy"], 1)})
+            print(f"  ▶ t={t_sim:.2f}s 恢复：这一屏的墙都已知，立即继续"
+                  f"（暂停 {now - pause['t0']:.1f}s）", file=sys.stderr)
+            return True
         if stable:
             added = []
             for gy_b, w_b in stable:
@@ -1385,6 +1408,11 @@ def main(argv: list[str] | None = None) -> int:
             all_pauses.append(info)
             pause["last_resume"] = now
             pause["last_new_y"] = added[-1] if added else None
+            #: 刚加入的墙还在"前方 160"里，按缺口冷却 2 s 避免立刻再停。
+            pause["cooldown_until"] = now + 2.0
+            pause["cooldown_gaps"] = (pause["cooldown_gaps"] + [
+                (float(w_b.get("gl", 0.0)), float(w_b.get("gr", 640.0)))
+                for _gy, w_b in stable])[-12:]
             print(f"  ▶ t={t_sim:.2f}s 恢复：VT 批量加入 {[round(y,1) for y in added]}"
                   f"（pause={now - pause['t0']:.1f}s）→ "
                   f"{[round(k,1) for k in known]}", file=sys.stderr)
@@ -1468,12 +1496,25 @@ def main(argv: list[str] | None = None) -> int:
                                                           py_cap, follow_half)
                             cands = []
                             for j, w in enumerate(walls):
-                                if j in matched:
-                                    continue
+                                #: **不再用 matched 跳过**：δ 估偏时会把"新墙"误判成
+                                #: 已知墙，于是不停 → 板子不知道它 → 直接撞上去
+                                #: （实测 y=520 那道墙就是这么穿过去的）。已知墙由
+                                #: 暂停后的冻结画面判（extras 为空 → 立即继续）。
                                 vy = float(w["y"])
-                                if vy <= 120.0:
+                                #: **尽量往前走**：按"这一帧里墙在角色前方多少"判
+                                #: （`vy - 半带`，与相机延迟无关），进到 `--pause-ahead`
+                                #: 以内才停；0 = 不限。
+                                ahead = vy - follow_half
+                                if args.pause_ahead > 0 and ahead > args.pause_ahead:
                                     continue
-                                gy = vy + (py_cap - delta - follow_half)
+                                if ahead < 15.0:
+                                    continue
+                                #: 这里**不再用** stale 的 py_cap 算出来的 gy 去比
+                                #: `max_known`：相机链路 ~1 s 延迟会让 gy 偏低 ~200，
+                                #: 曾经因此漏掉终点前最后一道墙（板子靠 send-all-walls
+                                #: 直接开过去）。"是不是新墙"交给暂停后冻结页面的
+                                #: pause_update 判，那里 py 是准的。
+                                gy = vy + (py - follow_half)
                                 # 场地外的"墙"是帧线/反光，不是墙
                                 if not (5.0 < gy < field_h - 8.0):
                                     continue
@@ -1481,27 +1522,14 @@ def main(argv: list[str] | None = None) -> int:
                                 # y=440 的最后一道墙离目标只有 30，不能被挡。
                                 if abs(gy - goal[1]) < 12.0:
                                     continue
-                                # 延迟大时同一道墙会被旧帧再"看到"一次（y 平移、
-                                # 但缺口 x 完全相同）。缺口和已冻结墙几乎一样 → 不是新墙。
                                 gl = float(w.get("gl", 0.0)); gr = float(w.get("gr", 640.0))
-                                #: 见 pause_update 里的说明：缺口重复，必须同时比 y。
-                                dup = any(abs(float(d.get("gl", 0.0)) - gl) <= 30.0
-                                          and abs(float(d.get("gr", 640.0)) - gr) <= 30.0
-                                          and abs(gy - float(d.get("y", -1e9))) <= 120.0
-                                          for d in known_detail)
-                                if dup:
+                                #: 刚加入的墙（刚批量确认过）在冷却期里不再触发。
+                                if (now < pause["cooldown_until"]
+                                        and any(abs(g[0] - gl) <= 30.0
+                                                and abs(g[1] - gr) <= 30.0
+                                                for g in pause["cooldown_gaps"])):
                                     continue
-                                if gy > max_known + args.new_wall_margin:
-                                    #: **尽量往前走**：按"这一帧里墙在角色前方多少"
-                                    #: 判（`vy - 半带`，与相机延迟无关），等墙进到
-                                    #: `--pause-ahead` 以内才停；0 = 不限。
-                                    ahead = vy - follow_half
-                                    if (args.pause_ahead > 0
-                                            and ahead > args.pause_ahead):
-                                        continue
-                                    if ahead < 10.0:
-                                        continue
-                                    cands.append((gy, w))
+                                cands.append((gy, w))
                             if now < pause["cooldown_until"]:
                                 cands = [c for c in cands
                                          if abs(c[0] - pause["skip_gy"]) > 100.0]

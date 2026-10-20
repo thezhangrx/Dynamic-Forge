@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
     int w = 640, h = 360, skip = 6;
     long frames = 0;
     double squash = 1.0;
-    std::string jsonl, save_rect, overlay_out;
+    std::string jsonl, save_rect, overlay_out, quad_state;
     bool use_frame = false;
     int fr_x0 = 0, fr_y0 = 0, fr_x1 = 0, fr_y1 = 0;
     for (int i = 1; i < argc; ++i) {
@@ -149,6 +149,7 @@ int main(int argc, char** argv) {
         else if (k == "--frames") frames = std::atol(next().c_str());
         else if (k == "--squash") squash = std::atof(next().c_str());
         else if (k == "--jsonl") jsonl = next();
+        else if (k == "--quad-state") quad_state = next();
         else if (k == "--save-rect") save_rect = next();
         else if (k == "--overlay-out") overlay_out = next();
         else if (k == "--frame") use_frame = true;
@@ -203,8 +204,41 @@ int main(int argc, char** argv) {
             base = crop.data();
             //: 首选：场地暗区 + 最小外接旋转矩形 → 白框**四角**透视单应。
             //: 这一步把 bbox 仿射换成四角透视；rectified 后墙才是水平的。
-            const auto fq = vision_board::field_frame::find(base, bw, bh);
-            if (fq.ok) {
+            auto fq = vision_board::field_frame::find(base, bw, bh);
+            if (fq.ok && !quad_state.empty()) {
+                //: 四角**时间平滑**：一帧一个子进程，所以把上一帧的四角存在文件里。
+                //: 相机/屏幕固定时四角只该有 1~2 px 抖动；不平滑时墙线会左右跳，
+                //: 视频里看就是"墙在乱飘"。新解与上一帧差 >12 px 视为换了场景，直接采用。
+                std::array<double, 8> prev{};
+                bool have = false;
+                if (FILE* qf = std::fopen(quad_state.c_str(), "r")) {
+                    if (std::fscanf(qf, "%lf %lf %lf %lf %lf %lf %lf %lf",
+                                    &prev[0], &prev[1], &prev[2], &prev[3],
+                                    &prev[4], &prev[5], &prev[6], &prev[7]) == 8)
+                        have = true;
+                    std::fclose(qf);
+                }
+                if (have) {
+                    double dmax = 0.0;
+                    for (int i = 0; i < 4; ++i) {
+                        const double dx = fq.p[i][0] - prev[2 * i];
+                        const double dy = fq.p[i][1] - prev[2 * i + 1];
+                        dmax = std::max(dmax, std::hypot(dx, dy));
+                    }
+                    if (dmax <= 12.0) {
+                        constexpr double a = 0.6;      // 上一帧权重
+                        for (int i = 0; i < 4; ++i) {
+                            fq.p[i][0] = a * prev[2 * i] + (1.0 - a) * fq.p[i][0];
+                            fq.p[i][1] = a * prev[2 * i + 1] + (1.0 - a) * fq.p[i][1];
+                        }
+                    }
+                }
+                if (FILE* qf = std::fopen(quad_state.c_str(), "w")) {
+                    std::fprintf(qf, "%.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
+                                 fq.p[0][0], fq.p[0][1], fq.p[1][0], fq.p[1][1],
+                                 fq.p[2][0], fq.p[2][1], fq.p[3][0], fq.p[3][1]);
+                    std::fclose(qf);
+                }
                 Hf = vision_board::field_frame::homography(fq, FW, FH);
                 frame_ok = Hf.ok;
                 fq_used = fq;
