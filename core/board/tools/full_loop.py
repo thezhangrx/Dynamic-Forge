@@ -738,6 +738,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="1 = 缺口左右交替场景：新行的缺口必须与上一行不同侧")
     ap.add_argument("--gap-margin", type=float, default=10.0,
                     help="把视觉量到的缺口两边**向外放**多少（实测 VT 偏窄；默认 10）")
+    ap.add_argument("--follow-scale", type=float, default=1.0,
+                    help="跟随视口额外缩放（<1 看得更远，墙同比例变小）")
     ap.add_argument("--pause-ahead", type=float, default=160.0,
                     help="新墙离角色还有多少场地单位时才暂停（越大越早停）")
     ap.add_argument("--pause-timeout", type=float, default=12.0)
@@ -813,10 +815,12 @@ def main(argv: list[str] | None = None) -> int:
         wall_color=(200, 60, 0), background=(8, 10, 14), field_bg=(34, 40, 55),
         resizable=False,
     )
-    page_view = PygameRenderer(show_potential=False, **common)
+    page_view = PygameRenderer(show_potential=False,
+                               follow_scale=float(args.follow_scale), **common)
     #: 势场录像：每帧重算（原来 30 帧才更新一次，5 fps 下就是 6 s 一跳，
     #: 看起来像"势在闪"）。
-    field_view = PygameRenderer(show_potential=True, potential_every=1, **common)
+    field_view = PygameRenderer(show_potential=True, potential_every=1,
+                                follow_scale=float(args.follow_scale), **common)
 
     env = BulletHellEnv(spec, seed=spec.seed)
     env.reset(seed=spec.seed)
@@ -913,8 +917,11 @@ def main(argv: list[str] | None = None) -> int:
         标定（冻结页 + 真值，三个角色 y、共 13 道墙）：误差 ≈ +5.5 + 0.02·d
         （d = vy-240）。先按 0.98 收掉尺度，再减 5.5 的固定偏移。
         """
-        d = float(vy) - follow_half
-        return float(py_ref) + d * args.vt_y_scale + args.vt_y_bias
+        #: 视口缩放不是 1:1 时（--follow-scale<1，画面更高），整流图 480 px
+        #: 对应 2*follow_half 个场地单位，先把像素差换成场地单位再套标定。
+        d_px = float(vy) - 240.0
+        d_world = d_px * (2.0 * follow_half / 480.0)
+        return float(py_ref) + d_world * args.vt_y_scale + args.vt_y_bias
 
     def note_py(y: float) -> None:
         sim_hist.append((time.monotonic(), float(y)))
@@ -1428,7 +1435,7 @@ def main(argv: list[str] | None = None) -> int:
         py_now = py
         #: 只信画面**中段**的墙：画框上下沿的墙会被裁掉一截，缺口量出来常常
         #: 宽得离谱（离线测试里出现过 230–593）。60~420 之外的行一律不收。
-        walls = [w for w in s["walls"] if 60.0 <= float(w["y"]) <= 460.0]
+        walls = [w for w in s["walls"] if 60.0 <= float(w["y"]) <= 480.0]
         dets_vy = [float(w["y"]) for w in walls]
         _delta, matched = _shift_match(dets_vy, known, py_now, follow_half)
         max_known = max(known) if known else -1e9
@@ -1679,14 +1686,15 @@ def main(argv: list[str] | None = None) -> int:
                                 #: **尽量往前走**：按"这一帧里墙在角色前方多少"判
                                 #: （`vy - 半带`，与相机延迟无关），进到 `--pause-ahead`
                                 #: 以内才停；0 = 不限。
-                                ahead = vy - follow_half
+                                #: 换算成**场地单位**（视口缩放<1 时像素≠场地单位）
+                                ahead = (vy - 240.0) * (2.0 * follow_half / 480.0)
                                 if args.pause_ahead > 0 and ahead > args.pause_ahead:
                                     continue
                                 if ahead < 15.0:
                                     continue
                                 #: 与 pause_update 一致：只信画面中段的行，
                                 #: 画框上下沿的墙缺口量不准，不为它暂停。
-                                if not (60.0 <= vy <= 460.0):
+                                if not (60.0 <= vy <= 480.0):
                                     continue
                                 #: 这里**不再用** stale 的 py_cap 算出来的 gy 去比
                                 #: `max_known`：相机链路 ~1 s 延迟会让 gy 偏低 ~200，

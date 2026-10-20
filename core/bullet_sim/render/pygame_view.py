@@ -129,6 +129,8 @@ class PygameRenderer:
         #: 水平仍是全宽。墙/角色超出这一带的会被裁掉（真实相机只拍这一屏）。
         follow_player: bool = False,
         follow_h: float = 240.0,
+        #: 跟随视口的额外缩放（1.0 = 场地全宽铺满窗口；<1 = 看得更远、墙小一点）。
+        follow_scale: float = 1.0,
         fiducial_side: float = 28.0,   # 28 场地单位：够定边界，又不会挡住宅的墙/缺口
         show_field_border: bool = True,
         window_timeout_s: float = 20.0,
@@ -230,6 +232,7 @@ class PygameRenderer:
                 follow_h = 240.0
         self.follow_player = bool(follow_player)
         self.follow_h = float(follow_h)
+        self.follow_scale = float(follow_scale) if follow_scale > 0 else 1.0
         self.fiducial_side = float(fiducial_side)
         #: 场地外框那 1 像素的线。相机拍屏幕时它是一条**横贯画面的长线**，会被
         #: 视觉判成矩形（实测：几何帧里多出一条贴底边的"墙"），板子在环里时关掉。
@@ -393,7 +396,7 @@ class PygameRenderer:
         """
         vp = self.viewport
         fw = float(world.state.env.field_w)
-        want = vp.usable_w / max(1e-9, fw)          # 场地全宽 → 窗口宽
+        want = (vp.usable_w / max(1e-9, fw)) * self.follow_scale
         vp.set_zoom(want / max(1e-9, vp.fit_scale))
         py = float(world.player[1]) if hasattr(world, "player") else 0.0
         vp.center = (fw * 0.5, py)
