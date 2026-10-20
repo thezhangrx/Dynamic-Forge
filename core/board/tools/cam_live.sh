@@ -229,7 +229,8 @@ capture \
       else
         cat
       fi; } \
-  | "$APP" --stdin-rgb --skip-frames "$SKIP" --host-epoch "$(date +%s.%N)" "$@"
+  | "$APP" --stdin-rgb --skip-frames "$SKIP" \
+        --host-epoch "${HOST_EPOCH:-$(date +%s.%N)}" "$@"
 # ⚠ 两个退出码要**分开看**：脚本上面开了 `set -o pipefail`，于是 ffmpeg 的
 #   "broken pipe" 会把整条管道判成失败 —— 但那恰恰是**正常收尾**：程序处理够
 #   `--frames N` 就不再读 stdin，ffmpeg 写不进去只好退出。以前这会报

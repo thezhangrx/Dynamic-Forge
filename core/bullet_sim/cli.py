@@ -110,6 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="板子信号来自标准输入（--input board）")
     p.add_argument("--hold-ms", type=int, default=500, help="断流多久回中（默认 500ms）")
     p.add_argument("--json", action="store_true")
+    _add_state_pipe_args(p)
 
     # -- record ----------------------------------------------------------
     p = sub.add_parser("record", help="headless batch dataset generation")
@@ -213,13 +214,7 @@ def _add_play_args(p: argparse.ArgumentParser, *, input_default: str = "manual")
     p.add_argument("--danger-every", type=int, default=4,
                    help="recompute the danger field every N rendered frames")
     p.add_argument("--horizon", type=int, default=90)
-    p.add_argument(
-        "--state-pipe",
-        default=None,
-        metavar="FILE",
-        help="**实时状态包输出**：每帧一行 `@STATE`（场地单位），供外部决策端消费。"
-             "与 --state-log（JSON 日志）不同：这是控制回路用的紧凑协议，逐行 flush",
-    )
+    _add_state_pipe_args(p)
     p.add_argument(
         "--state-log",
         default=None,
@@ -263,6 +258,9 @@ def _add_play_args(p: argparse.ArgumentParser, *, input_default: str = "manual")
                         "外框是一条横贯画面的长线，视觉会把它判成矩形（实测几何帧里多出"
                         "一条贴底边的「墙」）；网格线同理会变成细长假矩形。板子在环里时加")
     p.add_argument("--scale", type=float, default=1.0)
+    p.add_argument("--window-size", type=int, nargs=2, default=None, metavar=("W", "H"),
+                   help="窗口像素尺寸（默认 field×scale）。相机拍屏幕时给一个比 4:3 更高的窗口"
+                        "（如 800 700），场地上下会留黑边 —— frame_geom 要求框外比框内暗")
     p.add_argument("--no-switch", action="store_true",
                    help="disable runtime MANUAL<->AUTO switching (no TAB binding)")
     p.add_argument("--max-seconds", type=float, default=None,
@@ -345,6 +343,29 @@ def _add_scenario_args(
                         "(default: the scenario's own choice)")
     _add_obstacle_args(p)
     _add_safety_args(p)
+
+
+def _add_state_pipe_args(p: argparse.ArgumentParser) -> None:
+    """`--state-pipe`：把真值写成 `@STATE` 行，供外部决策端（板子）消费。
+
+    `play` 每渲染帧一行；`run` / `board-control --headless` 每 `--state-every` 步一行。
+    以前只有 `play` 有，无窗口的真值在环拿不到真值流。
+    """
+    p.add_argument(
+        "--state-pipe",
+        default=None,
+        metavar="FILE",
+        help="**实时状态包输出**：每次采样一行 `@STATE`（场地单位），逐行 flush。"
+             "`play` 每渲染帧一行；`run` / `board-control --headless` 见 `--state-every`",
+    )
+    p.add_argument(
+        "--state-every",
+        type=int,
+        default=1,
+        metavar="N",
+        help="无窗口路径（`run` / `board-control --headless`）的采样间隔：每 N 步一行"
+             "（默认 1）。`play` 忽略本项（按渲染帧出）",
+    )
 
 
 def _add_obstacle_args(p: argparse.ArgumentParser) -> None:
@@ -908,6 +929,45 @@ def cmd_board_control(args: argparse.Namespace) -> int:
     return cmd_play(args)
 
 
+def _state_pipe_line(env, seq: int = 0,
+                     y_min: float | None = None,
+                     y_max: float | None = None) -> str:
+    """一行 `@STATE`：角色 + **矩形**障碍（`half_w > half_h`，即墙）。
+
+    圆障碍不进这一行（真值在环的决策端只认矩形）。`play` 与 `run` 共用这一份格式，
+    避免两处各写一份后字段悄悄错位。`seq` 只写进 `<ver>` 位（板子忽略），
+    外部回路可以拿它做延迟对齐。
+
+    `y_min/y_max`（场地单位）可选：只保留**中心**落在区间里的墙。视角跟随模式用它
+    只发当前视口里的墙 —— 板子看不到视野外的东西，势场自然也只能按当前视角算。
+    """
+    pl = env.world.player
+    obs: list[str] = []
+    pool = getattr(getattr(env.world, "state", None), "bullets", None)
+    if pool is not None:
+        try:
+            n = int(getattr(pool, "count", len(pool.alive)))
+        except Exception:
+            n = 0
+        for i in range(min(n, int(getattr(pool, "capacity", n)))):
+            try:
+                if not bool(pool.alive[i]):
+                    continue
+                x = float(pool.x[i]); y = float(pool.y[i])
+                hw = float(pool.half_w[i]); hh = float(pool.half_h[i])
+                if hw <= hh:            # 只报矩形（墙）；圆另计
+                    continue
+                if y_min is not None and y < y_min:
+                    continue
+                if y_max is not None and y > y_max:
+                    continue
+                obs.append(f"{x:.1f} {y:.1f} {hw:.1f} {hh:.1f} 0.0")
+            except Exception:
+                continue
+    return (f"@STATE {int(seq)} {float(pl[0]):.1f} {float(pl[1]):.1f} {float(pl[4]):.1f} "
+            f"{len(obs)} " + (" ".join(obs) if obs else "") + "\n")
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     from bullet_sim.interface.controller import controller_from
     from bullet_sim.simulator.env import BulletHellEnv
@@ -927,6 +987,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         collision_log=getattr(args, "collision_log", None),
         **_collision_kwargs(args, spec),
     )
+    _state_pipe = None
+    _state_every = max(1, int(getattr(args, "state_every", 1) or 1))
+
+    def _on_step(i: int) -> None:
+        """i=0 时世界刚 reset；按 `--state-every` 采样写 `@STATE`。"""
+        if _state_pipe is None or (i % _state_every):
+            return
+        try:
+            _state_pipe.write(_state_pipe_line(env))
+            _state_pipe.flush()
+        except Exception:               # 写盘失败不该把仿真带崩
+            pass
+
+    if getattr(args, "state_pipe", None):
+        _state_pipe = open(args.state_pipe, "w", encoding="utf-8")
     # 「一直跑」的无窗口路径也要能被干净停掉：不装处理函数的话 SIGTERM 是硬杀，
     # 既不收尾（source.close()）也不出汇总。装成 KeyboardInterrupt，`env.run` 里
     # 已经有对应的 except（它会收尾并返回已有统计）。
@@ -955,13 +1030,17 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 2
         result = env.run(input_source=play.source, steps=_run_steps(args, spec),
                          seed=args.seed,
-                         stop_on_done=not bool(getattr(args, "nostop", False)))
+                         stop_on_done=not bool(getattr(args, "nostop", False)),
+                         on_step=_on_step if _state_pipe is not None else None)
     else:
         ctrl = controller_from(_controller(args.controller, env.action_space, args.seed),
                                space=env.action_space, seed=args.seed)
         result = env.run(ctrl, steps=_run_steps(args, spec), seed=args.seed,
-                         stop_on_done=not bool(getattr(args, "nostop", False)))
+                         stop_on_done=not bool(getattr(args, "nostop", False)),
+                         on_step=_on_step if _state_pipe is not None else None)
     env.close()
+    if _state_pipe is not None:
+        _state_pipe.close()
     for _sig, _h in _prev.items():
         try:
             _signal.signal(_sig, _h)
@@ -1260,6 +1339,7 @@ def cmd_play(args: argparse.Namespace) -> int:
             controller=play.controller,
             # 标定参考物：相机拍屏幕时用它建场地坐标系
             fullscreen=args.fullscreen,
+            window_size=(tuple(args.window_size) if getattr(args, "window_size", None) else None),
             show_calibration_marker=args.calib_marker,
             calibration_marker=(args.calib_marker_w, args.calib_marker_h),
             calibration_marker_color=parse_hex_color(args.calib_marker_color),
@@ -1400,28 +1480,7 @@ def cmd_play(args: argparse.Namespace) -> int:
                     renderer.danger = None
             frame_index += 1
             if _state_pipe is not None:
-                _pl = env.world.player
-                _obs = []
-                _pool = getattr(getattr(env.world, "state", None), "bullets", None)
-                if _pool is not None:
-                    try:
-                        _n = int(getattr(_pool, "count", len(_pool.alive)))
-                    except Exception:
-                        _n = 0
-                    for _i in range(min(_n, int(getattr(_pool, "capacity", _n)))):
-                        try:
-                            if not bool(_pool.alive[_i]):
-                                continue
-                            _x = float(_pool.x[_i]); _y = float(_pool.y[_i])
-                            _hw = float(_pool.half_w[_i]); _hh = float(_pool.half_h[_i])
-                            if _hw <= _hh:          # 只报矩形（墙）；圆另计
-                                continue
-                            _obs.append(f"{_x:.1f} {_y:.1f} {_hw:.1f} {_hh:.1f} 0.0")
-                        except Exception:
-                            continue
-                _state_pipe.write(
-                    f"@STATE 0 {float(_pl[0]):.1f} {float(_pl[1]):.1f} {float(_pl[4]):.1f} "
-                    f"{len(_obs)} " + (" ".join(_obs) if _obs else "") + "\n")
+                _state_pipe.write(_state_pipe_line(env))
                 _state_pipe.flush()
             if _state_log is not None:
                 # 真值：角色 + 所有障碍（矩形带 half_w/half_h/rotation，圆带半径）

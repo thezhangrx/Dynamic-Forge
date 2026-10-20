@@ -283,6 +283,7 @@ class BulletHellEnv:
         seed: int | None = None,
         stop_on_done: bool = True,
         input_source: Any = None,
+        on_step: Callable[[int], None] | None = None,
     ) -> dict[str, Any]:
         """Headless episode loop for **any** input source.
 
@@ -291,6 +292,9 @@ class BulletHellEnv:
         source (mode A), a scripted replay, or a development-board adapter
         (mode B).  All of them produce the same ``Action`` and go through the
         same ``World.step``.
+
+        ``on_step(i)`` 在**第 i 步真正执行之前**调用（i=0 时世界刚 reset），
+        用来看/写真值（例如 `--state-pipe` 的外部决策回路）。默认不装钩子。
         """
         from bullet_sim.action.base import (
             Action,
@@ -322,7 +326,9 @@ class BulletHellEnv:
 
         _interrupted = False
         try:
-            for _ in (itertools.count() if unlimited else range(int(n))):
+            for step_index in (itertools.count() if unlimited else range(int(n))):
+                if on_step is not None:
+                    on_step(int(step_index))
                 if needs_observation:
                     action = source.poll_observation(obs, info)
                 else:

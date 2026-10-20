@@ -92,6 +92,9 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> src(need), out(need);
     vision_board::contour::Params cp;              // 角色候选用（亮、紧凑、近似圆）
     vision_board::wall_gap::Params wp;
+    wp.keep_no_gap = true;           // 同时显示所有墙，不只画选中的那道
+    wp.all_bands = true;
+    wp.min_bright_frac = 0.0;
 
     const auto t_start = std::chrono::steady_clock::now();
     long frame = 0, n_wall = 0, n_gap = 0;
@@ -181,7 +184,7 @@ int main(int argc, char** argv) {
             //   橙=缺口中心、品红=角色候选。第一版把选中墙画成 (0,255,255)，
             //   那是青色，和"角色"的框一样，看视频时根本分不清哪个是哪个。
             if (sel) box(&out, a.w, a.h, wl.x0, wl.y0 - 3, wl.x1, wl.y1 + 3, 0, 255, 0, 2);
-            else     box(&out, a.w, a.h, wl.x0, wl.y0 - 3, wl.x1, wl.y1 + 3, 0, 130, 0, 1);
+            else     box(&out, a.w, a.h, wl.x0, wl.y0 - 3, wl.x1, wl.y1 + 3, 0, 200, 0, 2);
             if (wl.has_gap) {
                 ++n_gap;
                 box(&out, a.w, a.h, wl.gap_x0, wl.y0 - 8, wl.gap_x1, wl.y1 + 8, 255, 0, 0);

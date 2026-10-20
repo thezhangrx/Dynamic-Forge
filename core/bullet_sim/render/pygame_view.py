@@ -262,6 +262,47 @@ class PygameRenderer:
         finally:
             _done.set()
 
+    def _force_window_front(self) -> None:
+        """把本窗口提到最前（WSLg/X11）。失败静默。
+
+        为什么需要：在 WSLg 下 `set_mode` 只创建窗口，不保证它压过 Windows
+        侧浏览器；全流程录制时相机必须看到平台，不能靠用户手动 Alt-Tab。
+        X11 至少能 raise + 设 `_NET_WM_STATE_ABOVE`；Wayland/WSLg 若忽略，
+        仍会在启动时 raise 一次，比默认可靠。
+        """
+        try:
+            info = pygame.display.get_wm_info()
+        except Exception:  # pragma: no cover - driver dependent
+            return
+        win = info.get("window")
+        disp = info.get("display")
+        if not win or not disp:
+            return
+        try:
+            import ctypes
+            x11 = ctypes.CDLL("libX11.so.6")
+            x11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            x11.XSetInputFocus.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                           ctypes.c_int, ctypes.c_ulong]
+            x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+            x11.XInternAtom.restype = ctypes.c_ulong
+            x11.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                            ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
+                                            ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+            x11.XFlush.argtypes = [ctypes.c_void_p]
+            d = ctypes.c_void_p(disp)
+            w = ctypes.c_ulong(win)
+            x11.XRaiseWindow(d, w)
+            x11.XSetInputFocus(d, w, 1, 0)   # RevertToParent, CurrentTime
+            state = x11.XInternAtom(d, b"_NET_WM_STATE", 0)
+            above = x11.XInternAtom(d, b"_NET_WM_STATE_ABOVE", 0)
+            if state and above:
+                atom = ctypes.c_ulong(above)
+                x11.XChangeProperty(d, w, state, 4, 32, 0, ctypes.byref(atom), 1)
+            x11.XFlush(d)
+        except Exception:  # pragma: no cover - no libX11 / Wayland
+            pass
+
     def _ensure_init_body(self, world: Any) -> None:
         # ⚠ 只初始化**要用的**子系统：`pygame.init()` 会连 **mixer（音频）**一起初始化，
         #   而跑这个仿真根本不需要声音 —— 在没有声卡的机器/容器里它只会刷一屏 ALSA 报错
@@ -299,6 +340,9 @@ class PygameRenderer:
             elif self.resizable:
                 flags = pygame.RESIZABLE
             self._screen = pygame.display.set_mode(self._size, flags)
+            #: 注意：X11 raise/置顶在 WSLg 上会把进程直接搞退（实测），
+            #: 先只保留创建窗口；窗口置顶交给浏览器内嵌方案。
+            pygame.display.flip()
         try:
             self._font = pygame.font.SysFont("monospace", 13)
         except Exception:  # pragma: no cover - font backend dependent
@@ -339,6 +383,23 @@ class PygameRenderer:
         th.start()
         return done
 
+    def _follow_viewport(self, world: Any) -> None:
+        """跟随视口：中心 (场地中线, 角色 y)，缩放固定为**场地全宽铺满窗口宽**。
+
+        4 道墙平台（场地 640×480）的 `fit_scale` 本身就是 1，所以这与旧口径
+        “保持原缩放”完全等价；24/40 道墙的场地高达 2500~4100，按整场 fit 会把
+        墙缩到 1/5（平台小得看不清），这里显式按场地全宽定缩放 —— 墙的像素大小
+        与旧平台一致，画面里只出现当前这一屏（上下各 `half`）。
+        """
+        vp = self.viewport
+        fw = float(world.state.env.field_w)
+        want = vp.usable_w / max(1e-9, fw)          # 场地全宽 → 窗口宽
+        vp.set_zoom(want / max(1e-9, vp.fit_scale))
+        py = float(world.player[1]) if hasattr(world, "player") else 0.0
+        vp.center = (fw * 0.5, py)
+        half = 0.5 * (vp.usable_h / max(1e-9, vp.scale))
+        self._band = (py - half, py + half)
+
     def render(self, world: Any) -> Any:
         self._ensure_init(world)
         self._pump_events()
@@ -350,13 +411,7 @@ class PygameRenderer:
 
         vp = self.viewport
         if self.follow_player:
-            # 视口跟着角色：中心 = (场地中线, 角色 y)，缩放让 follow_h 刚好铺满窗口高度。
-            # 水平仍是全宽（640），于是画面里永远只有"当前这一屏"的 1~2 道墙。
-            py = float(world.player[1]) if hasattr(world, "player") else 0.0
-            vp.center = (float(world.state.env.field_w) * 0.5, py)
-            half = max(60.0, 0.5 * self.follow_h)
-            vp.zoom = (vp.usable_h / (2.0 * half)) / max(1e-9, vp.fit_scale)
-            self._band = (py - half, py + half)
+            self._follow_viewport(world)
         else:
             vp.center = None
             self._band = None
@@ -367,6 +422,10 @@ class PygameRenderer:
         # --- world frame / letterbox -----------------------------------
         x0, y0 = vp.world_to_screen(0.0, 0.0)
         x1, y1 = vp.world_to_screen(world.state.env.field_w, fh)
+        if self.follow_player:
+            # 跟随模式下**整个视口都铺平台平面**：场地边界之外不要留黑
+            # （用户口径："黑色（场地外）渲染成深蓝平台平面"）。
+            screen.fill(self.field_bg)
         field_rect = pygame.Rect(
             int(min(x0, x1)), int(min(y0, y1)), int(abs(x1 - x0)), int(abs(y1 - y0))
         )
@@ -390,6 +449,19 @@ class PygameRenderer:
                 label = self._font.render("COLLISION  (penalty, episode continues)",
                                           True, (255, 220, 220))
                 screen.blit(label, (8, self._size[1] - label.get_height() - 8))
+
+        # --- 目标点：**绿圈**（跟随/静态墙平台里终点的可视化）-----------
+        try:
+            _t = world.state.target
+            _tp = vp.world_to_screen(float(_t.x), float(_t.y))
+            if -50 < _tp[0] < self._size[0] + 50 and -50 < _tp[1] < self._size[1] + 50:
+                _r = max(6, int(vp.len_to_screen(float(_t.radius))))
+                _c = (int(_tp[0]), int(_tp[1]))
+                # 实心小点（精确位置）+ **加粗外圈**（到达判定范围，"看到圈=到了"）
+                pygame.draw.circle(screen, (60, 230, 120), _c, max(2, _r // 6))
+                pygame.draw.circle(screen, (60, 230, 120), _c, _r, max(3, _r // 5))
+        except Exception:
+            pass
 
         # --- target zone (off by default, see show_target) --------------
         if self.show_target:
@@ -807,13 +879,7 @@ class PygameRenderer:
             return
         vp = self.viewport
         if self.follow_player:
-            # 视口跟着角色：中心 = (场地中线, 角色 y)，缩放让 follow_h 刚好铺满窗口高度。
-            # 水平仍是全宽（640），于是画面里永远只有"当前这一屏"的 1~2 道墙。
-            py = float(world.player[1]) if hasattr(world, "player") else 0.0
-            vp.center = (float(world.state.env.field_w) * 0.5, py)
-            half = max(60.0, 0.5 * self.follow_h)
-            vp.zoom = (vp.usable_h / (2.0 * half)) / max(1e-9, vp.fit_scale)
-            self._band = (py - half, py + half)
+            self._follow_viewport(world)
         else:
             vp.center = None
             self._band = None
@@ -889,13 +955,7 @@ class PygameRenderer:
             return
         vp = self.viewport
         if self.follow_player:
-            # 视口跟着角色：中心 = (场地中线, 角色 y)，缩放让 follow_h 刚好铺满窗口高度。
-            # 水平仍是全宽（640），于是画面里永远只有"当前这一屏"的 1~2 道墙。
-            py = float(world.player[1]) if hasattr(world, "player") else 0.0
-            vp.center = (float(world.state.env.field_w) * 0.5, py)
-            half = max(60.0, 0.5 * self.follow_h)
-            vp.zoom = (vp.usable_h / (2.0 * half)) / max(1e-9, vp.fit_scale)
-            self._band = (py - half, py + half)
+            self._follow_viewport(world)
         else:
             vp.center = None
             self._band = None

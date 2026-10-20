@@ -24,6 +24,7 @@
 #include "geometry.hpp"
 #include "frame_geom.hpp"
 #include "virt_truth.hpp"
+#include "field_m1.hpp"
 #include "marker_refine.hpp"
 #include "player.hpp"
 #include "robust.hpp"
@@ -235,11 +236,21 @@ struct Args {
     //: `markers` = 老路径；`auto` = 白框优先、失败退标记。
     std::string geom = "auto";
     //: `--virt`（默认开）：墙/角色的位置由**虚拟真值**维持（视觉只做初始化 +
-    //: 发现新墙 + 慢校正）。`--no-virt` 回到"每帧都用视觉"，用于 A/B。
+    //: 发现新墙 + 对照）。`--no-virt` 回到"每帧都用视觉"，用于 A/B。
     bool virt = true;
-    //: 角色慢校正的残差门（场地单位）与比例；漂移超过门 → 该帧视觉**不喂**。
+    //: 角色残差门（场地单位）；只用于"统计/是否重锚"，**不做校正**。
     double virt_gate = 60.0;
     double virt_alpha = 0.25;
+    //: 平台 v2：墙在世界系**静止**（表观运动来自跟随视口）。冻结后不积分；
+    //: 旧移动墙平台用 `--virt-wall-motion integrate` 回到老行为。
+    std::string virt_wall_motion = "static";
+    //: 全幅可见时场上最多几道墙（v2 = 4）。
+    int virt_wall_cap = 4;
+    //: 决策器：`m1` = VT + Dijkstra 代价场（真值在环验过的那套，默认）；
+    //: `gap` = 旧 `gap_avoid::plan`，用于 A/B 回退。
+    std::string decision = "m1";
+    //: M1 的目标点（场地单位）。v2 静态墙平台是 (320,470)。
+    double goal_x = 320.0, goal_y = 470.0;
 };
 
 Args parse_args(int argc, char** argv) {
@@ -296,6 +307,13 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--no-virt") a.virt = false;
         else if (k == "--virt-gate") a.virt_gate = std::atof(next());
         else if (k == "--virt-alpha") a.virt_alpha = std::atof(next());
+        else if (k == "--virt-wall-motion") a.virt_wall_motion = next();
+        else if (k == "--virt-wall-cap") a.virt_wall_cap = std::atoi(next());
+        else if (k == "--decision") a.decision = next();
+        else if (k == "--goal") {
+            a.goal_x = std::atof(next());
+            a.goal_y = std::atof(next());
+        }
         else if (k == "--no-player-pred") a.no_player_pred = true;
         else if (k == "--local-refine") a.local_refine = true;
         else if (k == "--legacy-gap") a.legacy_gap = true;
@@ -576,12 +594,12 @@ struct DecisionState {
     gap_avoid::AlgoConfig cfg;
     //: P1：上一帧**实际发出**的单位方向（预测要用它，不能用帧间差分的"看到的速度"）
     gap_avoid::Vec2 last_cmd{0.0, 0.0};
-    //: 虚拟真值：角色（积分 + 慢校正）、墙（队列 + 冻结 + 积分）
+    //: 虚拟真值：角色（积分，零校正）、墙（相对观测 + 冻结，v2 不积分）
     virt::PlayerState vp;
     virt::WallQueue wq;
-    //: 这一帧"选中那扇门"的场地量（墙队列的输入）
-    double wq_last_y = 0.0, wq_last_gl = 0.0, wq_last_gr = 0.0;
-    bool wq_last_seen = false;
+    //: M1 决策器：墙/角色都来自上面的 VT（不是视觉绝对量）
+    field_m1::Field m1;
+    int n_m1 = 0;
     //: 线协议**不带速度**，所以 PS 侧自己推（见 `core/cpu/cpp/motion.hpp`）。
     //: 角色与障碍各一个跟踪器：关联是"最近邻 + 门限"，两类目标的运动模型
     //: 完全无关，混在一起只会互相抢检测。
@@ -1051,13 +1069,16 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
         1.0,
     };
 
-    // ---- 虚拟真值：角色（视觉只做初始化 + 慢校正）------------------------
+    // ---- 虚拟真值：角色（视觉只做初始化 + 对照，位置只由积分决定）--------
     // 为什么不再每帧都用视觉：相机端到端 0.56 板秒（= 78 场地单位），而视觉在
     // "墙经过角色"时会丢帧或漂移 —— 那正是最需要它的时刻。改成积分维持后，
     // 丢帧只影响校正，不影响位置。
     if (args.virt) {
         st.vp.gate = args.virt_gate;
         st.vp.alpha = args.virt_alpha;
+        st.wq.static_world = (args.virt_wall_motion != "integrate");
+        st.wq.require_motion = !st.wq.static_world;
+        st.wq.cap = std::max(1, args.virt_wall_cap);
         if (!st.vp.locked) {
             if (player_ok) st.vp.observe_init(player[0], player[1]);
             st.vp.try_lock();
@@ -1247,9 +1268,12 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
             if (gl < 0.0) gl = 0.0;
             if (gr > args.field_w) gr = args.field_w;
             if (gr - gl < 1.0) continue;    // 整个缺口在场外 → 这扇门不可用
-            // 虚拟真值：记下这一帧"选中那扇门"的场地量（y / 缺口两端）
-            if (&d == pick) {
-                st.wq_last_y = by; st.wq_last_gl = gl; st.wq_last_gr = gr; st.wq_last_seen = true;
+            // 虚拟真值：**每一扇门都喂**（不是只喂选中的那扇）—— v2 全幅可见，
+            // 4 道墙开局就都在画面里；趁角色还在出生点（识别稳定）一次冻完，
+            // 后面"角色过缺口识别乱"就完全进不了真值。
+            if (args.virt && st.vp.locked && player_ok) {
+                st.wq.update_relative(t_now, true, player[0], player[1],
+                                      st.vp.x, st.vp.y, by, gl, gr);
             }
             auto push_seg = [&](double a, double b) {
                 gap_avoid::Rect r;
@@ -1269,14 +1293,28 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
             if (gl > 1.0) push_seg(0.0, gl);
             if (args.field_w - gr > 1.0) push_seg(gr, args.field_w);
         }
+        // ---- 视觉几何 → 虚拟真值坐标系（**相对**，不是绝对）------------------
+        // 视觉给的是"和角色同一帧"的绝对量；跟随视口/标定原点会让它整体漂移。
+        // 用"墙 − 角色"的相对量 + 虚拟真值的角色位姿重新摆一遍，公共平移项整体
+        // 抵消；剩下的才是识别本身的相对误差（用户口径：视觉只做对照）。
+        if (args.virt && st.vp.locked && player_ok) {
+            const double dx = st.vp.x - player[0];
+            const double dy = st.vp.y - player[1];
+            for (auto& r : rects) { r.x += dx; r.y += dy; }
+        }
         // ---- 虚拟真值：墙队列（视觉只负责"发现新墙 + 初始化"）----------------
-        // 冻结之后**视觉不再刷新这一面墙**：它只按自己测到的 vy 匀速走。
-        // 这样墙走到画面底部/贴住角色时，位置不会跟着每次重测去跳。
+        // 冻结之后**视觉不再刷新这一面墙**：v2 的墙在世界系静止，冻结后不积分
+        // （表观运动来自跟随视口）。这样墙贴住角色/短暂丢失时，位置不会跟着跳。
+        // 观测已经在上面"每一扇门"的循环里喂过了（不是只喂选中的那扇）。
         if (args.virt) {
-            st.wq.update(t_now, st.wq_last_seen, st.wq_last_y, st.wq_last_gl, st.wq_last_gr);
             st.wq.advance(t_now);
             st.wq.purge(args.field_h);
-            st.wq_last_seen = false;
+            if (st.wq.frozen_count() >= st.wq.cap) {
+                // v2：4 道墙全冻结 = VT 已经完整，视觉矩形**一律不要**。
+                // 这一步之后决策只吃冻结墙：角色过缺口时识别乱产生的错块/偏移
+                // 不会再有机会混进来（视觉只剩"对照"）。
+                rects.clear();
+            }
             if (st.wq.frozen_count() > 0) {
                 // ⚠ **不能直接 clear()**：那样会把"前方还没冻结的新墙"一起清掉，
                 // 决策就只剩身后那面已冻结的墙 —— 而它不在前方，于是 select_threat_wall
@@ -1448,7 +1486,43 @@ gap_avoid::Vec2 decide(GeometryFrame f, const Args& args, DecisionState& st,
         last_cmd = cmd;
         have_cmd = true;
     }
-    //: P1 用：本帧最终发出的**单位方向**（没有速度模长的概念，只有方向）
+
+    // ---- M1（默认）：**VT → 代价场**；视觉不再进决策 ---------------------
+    // 墙 = VT 里已冻结的墙（相对观测 + 冻结），角色 = VT 积分位置。
+    // 视觉只在初始化/发现新墙时写过 VT；这里不再读视觉的绝对坐标。
+    if (args.decision == "m1" && st.vp.locked && st.wq.frozen_count() > 0) {
+        std::vector<field_m1::Rect> mrects;
+        mrects.reserve(st.wq.slots.size() * 2);
+        for (const auto& sl : st.wq.slots) {
+            if (!sl.frozen) continue;
+            const double hh = 4.0;              // v2 墙半厚
+            if (sl.gap_l > 1.0) {
+                mrects.push_back(field_m1::Rect{0.5 * sl.gap_l, sl.y,
+                                                0.5 * sl.gap_l, hh});
+            }
+            if (args.field_w - sl.gap_r > 1.0) {
+                const double w = args.field_w - sl.gap_r;
+                mrects.push_back(field_m1::Rect{sl.gap_r + 0.5 * w, sl.y,
+                                                0.5 * w, hh});
+            }
+        }
+        if (!mrects.empty()) {
+            field_m1::Config mc;
+            mc.field_w = args.field_w;
+            mc.field_h = args.field_h;
+            mc.goal_x = args.goal_x;
+            mc.goal_y = args.goal_y;
+            st.m1.configure(mc);
+            st.m1.build(mrects, 0.0, args.field_h);
+            const int act = st.m1.step(st.vp.x, st.vp.y);
+            double ux = 0.0, uy = 0.0;
+            field_m1::Field::direction(act, &ux, &uy);
+            cmd = gap_avoid::Vec2{ux, uy};
+            st.last_tier = "M1";
+            ++st.n_m1;
+        }
+    }
+    //: P1 用：本帧最终发出的**单位方向**（没有速度模量的概念，只有方向）
     {
         const double n = std::hypot(cmd.x, cmd.y);
         st.last_cmd = (n > 1e-9) ? gap_avoid::Vec2{cmd.x / n, cmd.y / n}
@@ -1907,9 +1981,10 @@ int main(int argc, char** argv) {
             //   实测它在 268 帧上只有 45.9% 有效，且有效时 scale_x 恒为 1.187 ——
             //   它量的是显示器边框（黑边→屏幕的亮度台阶），不是场地；纵向尺度更是
             //   "按 squash 反推 + 场地居中"假设出来的，从来没被量过。
-            //   所以这里只保留它的数值作为**兜底参考**，有效性一律由四标记单应 +
-            //   可信性判定（geometry.hpp）给出：没有标记 → 没有几何 → INVALID → stay。
-            sg_ext.ok = false;
+            //   所以默认只保留它的数值作为**兜底参考**，有效性由四标记单应判定。
+            //   `--extent-fallback` 是**旧处理路径**：保留 `field_extent` 的有效性
+            //   （用户口径：以前的视觉在同样相机角度下能识别墙；这正是那条路）。
+            if (!args.extent_fallback) sg_ext.ok = false;
             // 尺寸窗口与可通过性都由**契约 + 本帧比例尺**算出来，不是像素常数
             if (sg_ext.ok && sg_ext.scale_x > 0.0) {
                 const double dia_px = 2.0 * args.player_radius / sg_ext.scale_x;
@@ -2038,6 +2113,13 @@ int main(int argc, char** argv) {
                 geometry::Geometry geo;
                 bool geo_ready = false;
                 static rectify::Homography s_frame_homo;
+                //: 场地宽高比 = (field_w/field_h) / 纵向 squash。
+                //: 640×480 相机 → 640×360 流水线：squash=0.75 → 1.778；
+                //: 1280×720 相机（16:9，不 squash）：squash=1.0 → 1.333。
+                //: 以前这里写死 1.778，所以 720p 宽视角会被判 `bad_aspect_frame`。
+                geometry::Params gp;
+                gp.aspect_nominal = (args.field_w / args.field_h) /
+                                    std::max(1e-6, args.image_squash);
                 if (args.geom != "markers") {
                     const auto fr = frame_geom::find(rgb.data(), pw, ph);
                     if (fr.ok) {
@@ -2045,15 +2127,48 @@ int main(int argc, char** argv) {
                             frame_geom::homography(fr, args.field_w, args.field_h);
                         if (fh.ok) {
                             geo = frame_geom::as_geometry(fr, args.field_w, args.field_h,
-                                                          geometry::Params{}, &fh);
+                                                          gp, &fh);
                             if (geo.valid) { s_frame_homo = fh; geo_ready = true; }
                         }
                     }
                 }
                 if (!geo_ready && args.geom != "frame" && s_homo.ok) {
                     sg_h = s_homo;
-                    geo = geometry::judge(sg_h, ms, pw, ph, args.field_w, args.field_h);
+                    geo = geometry::judge(sg_h, ms, pw, ph, args.field_w, args.field_h, gp);
                     geo_ready = true;
+                }
+                //: `--extent-fallback` 的**旧处理路径**：四标记/白框的可信性判定
+                //: （宽高比/尺寸）在斜拍相机上会拒，但 `field_extent` 的亮度台阶
+                //: 仍能给出场地的轴对齐 bbox（实测这张 720p 帧 x=60..506 y=54..305）。
+                //: 用 bbox 四角 ↔ 场地四角建一个**仿射**单应，让后面的墙/角色检测
+                //: 有坐标可用 —— 这就是用户说的"以前的视觉在这种相机角度下能识别墙"。
+                if (args.extent_fallback && sg_ext.ok) {
+                    const std::array<std::array<double, 2>, 4> img = {{
+                        {{static_cast<double>(sg_ext.x0), static_cast<double>(sg_ext.y1)}},
+                        {{static_cast<double>(sg_ext.x1), static_cast<double>(sg_ext.y1)}},
+                        {{static_cast<double>(sg_ext.x1), static_cast<double>(sg_ext.y0)}},
+                        {{static_cast<double>(sg_ext.x0), static_cast<double>(sg_ext.y0)}},
+                    }};
+                    const std::array<std::array<double, 2>, 4> world = {{
+                        {{0.0, 0.0}}, {{args.field_w, 0.0}},
+                        {{args.field_w, args.field_h}}, {{0.0, args.field_h}},
+                    }};
+                    const rectify::Homography h = rectify::solve(img, world);
+                    if (h.ok) {
+                        sg_h = h;
+                        geo = geometry::Geometry{};
+                        geo.src = geometry::Source::Markers;   // 保留 sg_h，别再被白框覆盖
+                        geo.homo = h;
+                        geo.bbox[0] = sg_ext.x0; geo.bbox[1] = sg_ext.x1;
+                        geo.bbox[2] = sg_ext.y0; geo.bbox[3] = sg_ext.y1;
+                        geo.scale_x = sg_ext.scale_x;
+                        geo.scale_y = sg_ext.scale_y;
+                        geo.aspect = (sg_ext.height_px > 0.0)
+                                         ? sg_ext.width_px / sg_ext.height_px : 0.0;
+                        geo.valid = true;
+                        geo.why = "extent_affine";
+                        geo_ready = true;
+                    }
                 }
                 if (!geo_ready) {
                     sg_geo_why = "no_geometry";
@@ -2073,7 +2188,8 @@ int main(int argc, char** argv) {
                     if (geo.valid && sg_geo_age_ms > 600.0) {
                         sg_geo_why = "geo_stale";
                     }
-                    if (geo.valid && sg_geo_age_ms <= 600.0) {
+                    if ((args.extent_fallback && sg_ext.ok) ||
+                        (geo.valid && sg_geo_age_ms <= 600.0)) {
                         sg_ext.ok = true;
                         sg_ext.x0 = geo.bbox[0]; sg_ext.x1 = geo.bbox[1];
                         sg_ext.y0 = geo.bbox[2]; sg_ext.y1 = geo.bbox[3];
@@ -2097,7 +2213,7 @@ int main(int argc, char** argv) {
                         // 几何这一帧无效时**沿用上一次有效的 bbox**：否则"刚出现墙"
                         // 的那几帧没有裁剪，绿/红框就跑到平台外的黑区去了（实测现象）。
                         static band_gap::Extent s_clip{};
-                        if (sg_h.ok && sg_ext.ok) s_clip = sg_ext;
+                        if (sg_ext.ok) s_clip = sg_ext;
                         wall_gap::Params wp;
                         if (s_clip.ok) {
                             const int inset = 4;
@@ -2672,6 +2788,10 @@ int main(int argc, char** argv) {
                     have_pf = true;
                 }
                 double gap_units = 0, wall_y_units = 0;
+                //: 视觉 vs 虚拟真值的角色残差（**只记日志，不反馈**）。这是判断
+                //: "渲染漂移（公共平移）还是识别漂移（跳变）"的直接证据。
+                const double vp_res = (have_pf && st.vp.locked)
+                    ? std::hypot(player_fx - st.vp.x, player_fy - st.vp.y) : -1.0;
                 // ⚠ 必须用**决策实际选中的那扇门**，不能用 `front()`。
                 //   `sg_doors` 是按 y0 升序排的，front 是**画面最上面**那道墙（也就是
                 //   场地里**最远**的那道），而决策选的是"角色前方最近"的那道。
@@ -2710,7 +2830,9 @@ int main(int argc, char** argv) {
                     "\"scale\":[%.4f,%.4f],\"player_valid\":%s,\"player_src\":\"%s\","
                     "\"player_xy\":[%.1f,%.1f],"
                     "\"player_px\":[%d,%d],\"player_field\":[%.1f,%.1f],"
-                    "\"player_field_valid\":%s,\"player_unc\":%.1f,\"gap_units\":%.1f,\"wall_y_units\":%.1f,\"tier\":\"%s\",\"walls\":[",
+                    "\"player_field_valid\":%s,\"player_unc\":%.1f,\"gap_units\":%.1f,\"wall_y_units\":%.1f,"
+                    "\"vt_locked\":%s,\"vt_xy\":[%.1f,%.1f],\"player_residual\":%.1f,"
+                    "\"vt_reinit\":%d,\"vt_walls\":%d,\"tier\":\"%s\",\"walls\":[",
                     i, static_cast<unsigned long long>(frame.header.stamp_ns),
                     static_cast<unsigned long long>(unix_ns / 1000000ull), host_t,
                     host_t_got, lat_age_ms,
@@ -2719,7 +2841,9 @@ int main(int argc, char** argv) {
                     sg_ext.scale_x, sg_ext.scale_y,
                     sg_player.found ? "true" : "false", player_src, sg_player.x, sg_player.y,
                     sg_player.w, sg_player.h, player_fx, player_fy,
-                    have_pf ? "true" : "false", sg_player_unc, gap_units, wall_y_units, st.last_tier);
+                    have_pf ? "true" : "false", sg_player_unc, gap_units, wall_y_units,
+                    st.vp.locked ? "true" : "false", st.vp.x, st.vp.y, vp_res,
+                    st.vp.n_reinit, st.wq.frozen_count(), st.last_tier);
                 for (size_t wi = 0; wi < sg_doors.size(); ++wi) {
                     const band_gap::Door& d = sg_doors[wi];
                     std::fprintf(diag_f,
@@ -2727,6 +2851,17 @@ int main(int argc, char** argv) {
                                  "\"gap_cx\":%d,\"gap_w\":%d,\"snr\":%.1f}",
                                  wi ? "," : "", d.y0, d.y1, d.x0, d.x1, d.cx, d.width,
                                  static_cast<double>(d.snr));
+                }
+                std::fprintf(diag_f, "],\"vt_walls\":[");
+                {
+                    bool first = true;
+                    for (const auto& sl : st.wq.slots) {
+                        if (!sl.frozen) continue;
+                        std::fprintf(diag_f,
+                                     "%s{\"y\":%.1f,\"gl\":%.1f,\"gr\":%.1f,\"vy\":%.1f}",
+                                     first ? "" : ",", sl.y, sl.gap_l, sl.gap_r, sl.vy);
+                        first = false;
+                    }
                 }
                 std::fprintf(diag_f,
                     "],\"selected_wall\":%d,\"gap_center\":%d,"

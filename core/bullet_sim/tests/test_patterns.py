@@ -91,7 +91,21 @@ def test_decorative_generators_are_gone(legacy):
 
 
 def test_layout_vocabulary_is_only_realistic_shapes():
-    assert set(LAYOUTS) == {"block", "wall_gap", "small", "cross", "corridor"}
+    # `wall_static` 是平台 v2 的静态墙（墙 + 固定缺口，不移动），仍是现实形态。
+    assert set(LAYOUTS) == {"block", "wall_gap", "small", "cross", "corridor",
+                            "wall_static"}
+
+
+def test_wall_static_is_classified_as_a_wall_with_gap():
+    """板子模式按"障碍类型"限一种；静态墙必须映射到 `wall_with_gap`。
+
+    少了这条映射，`board-control --scenario configs/static_wall_wide.json`
+    会数出 0 种障碍并直接报错（真值在环起不来）。
+    """
+    from bullet_sim.scenarios.builder import pattern_kind
+
+    p = PatternSpec(kind="obstacle", params={"layout": "wall_static"})
+    assert pattern_kind(p) == "wall_with_gap"
 
 
 # --------------------------------------------------------------------------

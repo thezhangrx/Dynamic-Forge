@@ -152,6 +152,11 @@ _LAYOUT_KINDS: dict[str, str] = {
     "small": "small_obstacles",
     "cross": "cross_traffic",
     "corridor": "corridor",
+    # 平台 v2 的静态墙**也是"墙 + 缺口"**（只是不移动），归到同一类。
+    # 以前漏了这一行：`board-control --scenario configs/static_wall_wide.json`
+    # 在 `kind_order()` 里数出 0 种障碍 → 直接报"只能有一种障碍类型"，
+    # 真值在环根本起不来。
+    "wall_static": "wall_with_gap",
 }
 
 

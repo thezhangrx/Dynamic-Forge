@@ -159,10 +159,15 @@ struct WallSlot {
 
 struct WallQueue {
     std::vector<WallSlot> slots;
-    int cap = 2;                     // 画面里最多同时两道墙
+    int cap = 4;                     // 平台 v2 全幅可见时最多 4 道墙
     int stable_n = 4;                // 攒够几帧冻结
     double similar = 40.0;           // 判定"同一面墙"的 y 距离（场地单位）
     int n_admitted = 0, n_released = 0;
+    //: **平台 v2**：墙在世界系静止（表观运动来自跟随视口）。冻结后**不再积分**；
+    //: `vy` 只作诊断量。旧移动墙平台（tag `platform-v1`）把它设成 false。
+    bool static_world = true;
+    //: 静止世界没有"墙速"可验，默认不做 vy∈[60,260] 的门。移动墙平台设 true。
+    bool require_motion = false;
 
     //: 喂一次视觉观测（`have` = 这一帧视觉是否给出了墙）。冻结的墙**不会被刷新**。
     void update(double t, bool have, double y, double gap_l, double gap_r) {
@@ -172,16 +177,15 @@ struct WallQueue {
             if (std::fabs(ref - y) <= similar) {
                 if (!s.frozen) {
                     s.buf.push_back({t, y, gap_l, gap_r});
-                    // 冻结前必须满足：① 攒够帧；② y 稳定（极差小）；③ **速度像墙**
-                    // （落在 vy_min..vy_max）。③ 是用户看到的"墙爬得慢、卡在队列里"的根：
-                    // `wall_y_units` 是"选中的那扇门"的 y，门一换就混进另一面墙，
-                    // 估出来的速度偏小，冻结后这面墙几乎不动、永远出不了场地。
+                    // 冻结前必须满足：① 攒够帧；② y 稳定（极差小）；
+                    // ③ （仅移动墙平台）速度像墙。静止世界不做 ③。
                     if (static_cast<int>(s.buf.size()) >= stable_n) {
                         const double ymax = s.buf.back()[1], ymin0 = s.buf.front()[1];
                         const double dtb = s.buf.back()[0] - s.buf.front()[0];
                         const double vy_est = (dtb > 0.05) ? (ymax - ymin0) / dtb : 0.0;
                         const bool stable = std::fabs(ymax - ymin0) <= 20.0;
-                        const bool plausible = (std::fabs(vy_est) >= vy_min &&
+                        const bool plausible = !require_motion ||
+                                               (std::fabs(vy_est) >= vy_min &&
                                                 std::fabs(vy_est) <= vy_max);
                         if (stable && plausible) freeze(s);
                         else if (static_cast<int>(s.buf.size()) > 16) freeze(s);  // 兜底
@@ -196,6 +200,19 @@ struct WallQueue {
         s.buf.push_back({t, y, gap_l, gap_r});
         slots.push_back(s);
         ++n_admitted;
+    }
+
+    //: **平台 v2 的口径**：视觉给的是"墙相对角色"的坐标（同帧相减），
+    //: 由虚拟真值的角色位姿把它放回场地系。这样跟随视口的平移整体抵消，
+    //: 视觉的**绝对**漂移不会进真值；剩下的只有相对误差（识别漂移）。
+    //: `px/py` = 本帧视觉角色；`rx/ry` = 虚拟真值角色；`y/gl/gr` = 视觉绝对墙几何。
+    void update_relative(double t, bool have,
+                         double px, double py, double rx, double ry,
+                         double y, double gl, double gr) {
+        update(t, have,
+               ry + (y - py),
+               rx + (gl - px),
+               rx + (gr - px));
     }
 
     //: 墙速合理区间（场地单位/**板秒**）。契约 128 单位/仿真秒 ≈ 156 单位/板秒。
@@ -213,9 +230,11 @@ struct WallQueue {
     }
 
     //: 冻结的墙按自己的 vy 匀速积分（视觉不再参与）。
+    //: **平台 v2 静止墙：`static_world=true` 时什么都不做** —— 位置冻结在第一次
+    //: 测到的地方，`vy` 只留作诊断（跟随视口会让"看到的墙"在动，别拿它积分）。
     void advance(double t) {
         for (auto& s : slots) {
-            if (s.frozen) {
+            if (s.frozen && !static_world) {
                 const double dt = std::max(0.0, std::min(0.5, t - s.t_last));
                 s.y += s.vy * dt;
             }

@@ -15,6 +15,65 @@ ssh -i data/fpga/board_ssh/board_key root@192.168.137.242 \
 
 ---
 
+## 平台 v2 闭环工具（2026-10-19 起，先看这一组）
+
+> 下面「AXI/位流」那部分是 10-15 的，仍然准，但**不包含** v2 的决策/闭环工具。
+
+| 工具 | 跑在哪 | 用途 |
+|---|---|---|
+| `field_decision_cli.cpp` | **板上** | M1 代价场决策器。读 `@STATE`，输出 `@MOVE`；`--echo` 额外回 `@ACK <seq> <act>` 用于端到端延迟；`--view-h H` 只按当前视口建势场 |
+| `field_loop.py` | 本机 | **真值在环**：仿真 `@STATE` → ssh → 板子 → `@MOVE` → 仿真。出到达/碰撞/间隙/切换/延迟，写 `m1_state/actions/board.log`；`--video-out` 顺带出势场+轨迹 mp4 |
+| `full_loop.py` | 本机 | **完整闭环**：跟随视口投屏 + 板子 M1 + 相机白框 VT 新墙暂停/恢复。出 `_follow.mp4` / `_field.mp4` / `_camera_vt.mp4` + `events.jsonl`（pause/resume）+ `full_loop.json`；需要板子相机 8099 与 WSLg |
+| `page_view.py` | 本机 | 把 8100 的 MJPEG 页面显示到 WSLg X11 窗口（默认 (320,60) 1280×960），给板子相机拍 |
+| `mjpeg_client.py` | 本机 | 最小 MJPEG 客户端（`cv2.VideoCapture(url)` 在 multipart 上会卡；这里按 JPEG SOI/EOI 拆帧） |
+| `bench_field_methods.py` | 本机 | M1 vs M4 本地基准（同场景多起点） |
+| `test_static_local.py` / `test_field_local.py` | 本机 | 本地 Python 上的纯转向 / 势场对照 |
+| `record_field_video.py` | 本机 | 用上面的 state/actions 出势场 + 轨迹视频；`--view-h H` 出跟随视口（640×H） |
+| `virt_truth_selftest.cpp` | 本机 | `core/board/virt_truth.hpp` 的 v2 自检（静态墙冻结 / 相对观测 / 零校正） |
+
+```bash
+# 真值在环（真板子；120 Hz 才够，30 Hz 过缺口会擦墙）
+Env/bin/python core/board/tools/field_loop.py --max-seconds 30 --state-hz 120
+
+# 同上，并录一段"势场 + 墙 + 轨迹 + 角色"的 mp4（20 fps；跑完用完整日志出片）
+Env/bin/python core/board/tools/field_loop.py --max-seconds 30 --state-hz 120 \
+    --record-hz 20 --video-out /tmp/m1_board_field.mp4
+
+# 视角跟随：40 道墙、640×240 视口；势场只用当前视口里的墙，目标点由 --goal 告知
+Env/bin/python core/board/tools/field_loop.py --scenario configs/static_wall_40.json \
+    --view-h 240 --max-seconds 60 --state-hz 120 --record-hz 20 \
+    --video-out /tmp/m1_follow_40.mp4
+
+# 完整闭环：跟随视口 + 板子 M1 + 相机白框 VT 新墙暂停/恢复
+#   需要：板子相机 8099 在推流、WSLg DISPLAY=:0、8100 空闲
+#   投屏页是**不带势场**的干净平台（实测势场会把白框 VT 的墙对比翻转成 0 道）；
+#   势场/代价场单独录进 _field.mp4。--send-all-walls 与 field_loop 的板子口径一致；
+#   去掉它就是"新墙先不发给板子、等视觉确认"的实验模式。
+Env/bin/python core/board/tools/full_loop.py --scenario configs/static_wall_wide.json \
+    --board ssh --speed 0.5 --max-seconds 30 --send-all-walls \
+    --state-hz 120 --render-hz 15 --field-hz 5 --vt-hz 3 \
+    --port 8100 --out-dir data/fpga/loop_logs --tag demo --keep-serving
+
+# 同一条链路、无相机自测（只过板子闭环，pause 数必为 0）
+Env/bin/python core/board/tools/full_loop.py --board local \
+    --local-bin /tmp/field_decision_cli_host --vt-source none --viewer none \
+    --send-all-walls --speed 2 --max-seconds 20 --port 8102 \
+    --out-dir /tmp/full_loop_test --no-keep-serving
+
+# 无板自测：先编一份本机二进制
+g++ -std=c++17 -O2 -o /tmp/field_decision_cli_host core/board/tools/field_decision_cli.cpp
+Env/bin/python core/board/tools/field_loop.py --board local \
+    --local-bin /tmp/field_decision_cli_host --max-seconds 30 --speed 4
+
+# 虚拟真值口径自检
+g++ -std=c++17 -O2 -I core/board -o /tmp/vt_selftest \
+    core/board/tools/virt_truth_selftest.cpp && /tmp/vt_selftest
+```
+
+口径见根目录 `虚拟真值约定.md`：**VT 是唯一控制真值；视觉只给相对观测和对照。**
+
+---
+
 ## ⚠ 先读这一条：哪些工具**会写** AXI
 
 | 工具 | 写寄存器？ | 在**旧**位流（含 AXI 写死锁）上 |

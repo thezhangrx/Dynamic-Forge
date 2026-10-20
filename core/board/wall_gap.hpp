@@ -60,6 +60,13 @@ struct Params {
     double min_span_frac = 0.25;
     //: 行带内"亮列占比"下限：真墙是一条连续亮条（实测 0.9~1.0），网格线 0.5 左右。
     double min_bright_frac = 0.72;
+    //: **VT/标注用**：没有缺口也保留这条行带（默认 false = 只保留"带缺口的墙"）。
+    //: 相机斜拍/墙被洗白时，部分墙的缺口判据会失败；但"同时看到多道墙"需要把它们
+    //: 都保留下来，VT 渲染/决策再按 gap 是否已知分别处理。
+    bool keep_no_gap = false;
+    //: **VT/标注用**：把所有满足"整行亮"的行带都当成墙输出（不要求 gap/跨度/亮列占比）。
+    //: 相机斜拍时部分墙的缺口判据失败，但"同时看到多道墙"需要保留全部行带。
+    bool all_bands = false;
 
     // ---- 颜色门（P2）------------------------------------------------------
     //: 墙像素的"暖度"下限：``r - b >= min_warmth``。**只加这一个门**，就够把
@@ -291,9 +298,12 @@ inline std::vector<Wall> find_walls(const uint8_t* rgb, int w, int h, const Para
                 x1 = x;
             }
         }
-        if (x0 < 0) continue;
+        if (x0 < 0) {
+            if (!p.all_bands) continue;
+            x0 = 0; x1 = w - 1;
+        }
         wl.x0 = x0; wl.x1 = x1;
-        if ((x1 - x0 + 1) < p.min_span_frac * w) continue;
+        if (!p.all_bands && (x1 - x0 + 1) < p.min_span_frac * w) continue;
 
         int n_bright_cols = 0;
         for (int x = x0; x <= x1; ++x) {
@@ -337,9 +347,13 @@ inline std::vector<Wall> find_walls(const uint8_t* rgb, int w, int h, const Para
         // 背景认成墙（绿框跑到平台外）。亮度对比也只有 ~10 个灰阶，靠不住。
         // 稳定的是几何：**横贯场地宽度 + 带内有缺口 + 厚度 5~20 行**。
         // 网格线连续（没缺口）、外框太薄、角色/标记太小 —— 都过不了这三条。
-        if (!wl.has_gap) continue;                      // 没有缺口 = 不是 wall_with_gap
-        if (wl.gap_w < p.min_gap_px || wl.gap_w > p.max_gap_px) continue;
-        if (wl.bright_frac < p.min_bright_frac) continue;
+        if (!p.all_bands) {
+            if (!wl.has_gap && !p.keep_no_gap) continue;  // 默认：没有缺口 = 不是 wall_with_gap
+            if (wl.gap_w < p.min_gap_px || wl.gap_w > p.max_gap_px) continue;
+            if (wl.bright_frac < p.min_bright_frac) continue;
+        } else if (!wl.has_gap) {
+            wl.x0 = 0; wl.x1 = w - 1;   // 没量到缺口：整条行带当墙
+        }
         out.push_back(wl);
     }
     return out;
