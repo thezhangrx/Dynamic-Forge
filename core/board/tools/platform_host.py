@@ -543,6 +543,7 @@ def main(argv: list[str] | None = None) -> int:
             if ry <= py + view_half + 1.0:
                 rows_seen[ry] = True
                 log.truth_rows.write({
+                    "t_wall": log.wall_t(),
                     "t_sim": round(t_sim, 3), "py": round(py, 1), "y": ry,
                     "gap_gl": row["gap_gl"], "gap_gr": row["gap_gr"],
                     "gap_side": row["gap_side"], "gap_center": row["gap_center"],
@@ -554,7 +555,8 @@ def main(argv: list[str] | None = None) -> int:
             last_truth_snap = t_sim
             near = [[round(cx, 1), round(cy, 1), round(hw, 1), round(hh, 1)]
                     for (cx, cy, hw, hh) in walls_of(env) if abs(cy - py) <= 400.0]
-            log.local_truth.write({"t_sim": round(t_sim, 3), "px": round(px, 1),
+            log.local_truth.write({"t_wall": log.wall_t(),
+                                   "t_sim": round(t_sim, 3), "px": round(px, 1),
                                    "py": round(py, 1), "walls": near})
 
         if now - last_pose_t >= 0.04:

@@ -342,6 +342,10 @@ def main(argv: list[str] | None = None) -> int:
                 state_f.flush()
             except (OSError, ValueError):
                 pass
+        if seq % 10 == 1:
+            #: @STATE 本身没有时间戳（格式是给决策进程吃的），这里每 10 条
+            #: 打一个锚点，事后可用 seq 线性插值出任意一条 @STATE 的时间。
+            ev("state_tick", seq=seq - 1, n_obs=len(obs))
         try:
             assert cli.stdin is not None
             cli.stdin.write(line)

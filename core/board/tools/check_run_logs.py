@@ -214,9 +214,22 @@ def main(argv: list[str] | None = None) -> int:
                 if e.get("ev") == "vt_tick" and e.get("vt_seq") is not None}
         lag = [float(e["t"]) - vt_t[int(e["vt_seq"])] for e in board_events
                if e.get("ev") == "add_wall" and int(e.get("vt_seq", -1)) in vt_t]
-        if lag:
-            print(f"  VT帧→入表 延迟 p50={1000 * statistics.median(lag):.0f}ms "
-                  f"max={1000 * max(lag):.0f}ms")
+    #: 跨机器时钟对齐：用 pose_seq 把"主机发出该位姿"和"板端带着该位姿干活"
+    #: 配起来，估计 board_t → host_t 的偏移（25 Hz 位姿 → 量化 ~40 ms）
+    host_pose = {int(r["seq"]): float(r["t_wall"]) for r in poses
+                 if r.get("seq") is not None}
+    board_pose: dict[int, float] = {}
+    for e in board_events:
+        if e.get("pose_seq") and int(e["pose_seq"]) > 0 and e.get("t") is not None:
+            board_pose.setdefault(int(e["pose_seq"]), float(e["t"]))
+    pairs = [(host_pose[seq_], bt) for seq_, bt in board_pose.items() if seq_ in host_pose]
+    clock_off = None
+    if len(pairs) >= 5:
+        diffs = sorted(h - b for h, b in pairs)
+        clock_off = statistics.median(diffs)
+        print(f"  时钟对齐：配对 {len(pairs)} 组，board_t→host_t 偏移 "
+              f"{clock_off:+.3f}s（p10 {diffs[len(diffs)//10]:+.3f} "
+              f"p90 {diffs[9*len(diffs)//10]:+.3f}）")
 
     # ---------------------------------------------------------------- 4
     print("\n[4] 视觉处理（板端 VT）")
@@ -295,6 +308,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---------------------------------------------------------------- 6
     print("\n[6] 真值对照（板端认的墙 vs 虚拟真值）")
+    ticks = [(int(e["seq"]), float(e["t"])) for e in board_events
+             if e.get("ev") == "state_tick" and e.get("seq") is not None]
+    state_t0 = None
+    if ticks:
+        ticks.sort()
+        state_t0 = ticks[0][1]
+        rate = (ticks[-1][0] - ticks[0][0]) / max(1e-6, ticks[-1][1] - ticks[0][1])
+        print(f"  @STATE 时间锚点 {len(ticks)} 个：seq {ticks[0][0]}→{ticks[-1][0]}，"
+              f"≈{rate:.0f} 条/s（板端时钟起点 t={state_t0:.2f}s）")
     bw = board_wall_rows(states)
     print(f"  板端 @STATE 里出现过 {len(bw)} 行道墙；虚拟真值 {len(vtruth)} 行")
     matched: list[dict] = []
