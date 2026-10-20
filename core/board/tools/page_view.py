@@ -94,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--hold", action=argparse.BooleanOptionalAction, default=True,
                     help="流断了以后保留最后一帧（默认开）")
+    ap.add_argument("--idle-exit", type=float, default=8.0,
+                    help="N 秒没新帧就自己退出（避免旧窗口一直盖在新页面上）")
     args = ap.parse_args(argv)
 
     os.environ["SDL_VIDEO_WINDOW_POS"] = f"{args.x},{args.y}"
@@ -153,6 +155,10 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"⚠ 15 s 没收到帧：{client.last_error}", file=sys.stderr)
                         waiting_since = now
                 pygame.display.flip()
+            if args.idle_exit > 0 and now - waiting_since > args.idle_exit:
+                print(f"⚠ {args.idle_exit:g} s 没新帧，退出（防止僵窗盖住新页面）",
+                      file=sys.stderr, flush=True)
+                return 0
             if now - last_raise >= 1.0:
                 #: 每秒顶一次，防止终端/编辑器跑上来盖住页面（盖住 = VT 读文字）
                 last_raise = now

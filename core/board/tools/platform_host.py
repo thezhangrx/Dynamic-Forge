@@ -37,6 +37,7 @@ from bullet_sim.render.pygame_view import PygameRenderer
 from bullet_sim.scenarios.spec import ScenarioSpec
 from bullet_sim.simulator.env import BulletHellEnv
 from field_loop import dist_rect, walls_of
+from run_log import RunLog, local_truth_rows, virtual_truth
 from full_loop import FrameServer, PagePublisher
 
 
@@ -142,6 +143,8 @@ class Link:
         self.act = 0
         self.moves = 0
         self.poses = 0
+        self.pose_seq = 0
+        self.move_log: list[tuple[float, int]] = []
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._srv.bind(("0.0.0.0", self.port))
@@ -182,6 +185,13 @@ class Link:
                     with self._lock:
                         self.act = a
                         self.moves += 1
+                        self.move_log.append((time.monotonic(), a))
+
+    def drain_moves(self) -> list[tuple[float, int]]:
+        with self._lock:
+            out = self.move_log
+            self.move_log = []
+        return out
 
     def send_pose(self, x: float, y: float, r: float) -> bool:
         with self._lock:
@@ -189,7 +199,10 @@ class Link:
         if conn is None:
             return False
         try:
-            conn.sendall(f"@POSE {x:.2f} {y:.2f} {r:.2f}\n".encode())
+            with self._lock:
+                self.pose_seq += 1
+                seq = self.pose_seq
+            conn.sendall(f"@POSE {seq} {x:.2f} {y:.2f} {r:.2f}\n".encode())
             self.poses += 1
             return True
         except OSError:
@@ -215,6 +228,8 @@ class SshLink:
         self.act = 0
         self.moves = 0
         self.poses = 0
+        self.pose_seq = 0
+        self.move_log: list[tuple[float, int]] = []
         self._stop = False
         cmd = ["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
                "-o", "ServerAliveInterval=5", target,
@@ -242,15 +257,25 @@ class SshLink:
                 with self._lock:
                     self.act = a
                     self.moves += 1
+                    self.move_log.append((time.monotonic(), a))
 
     def ready(self) -> bool:
         return self.proc.poll() is None
+
+    def drain_moves(self) -> list[tuple[float, int]]:
+        with self._lock:
+            out = self.move_log
+            self.move_log = []
+        return out
 
     def send_pose(self, x: float, y: float, r: float) -> bool:
         if self.proc.poll() is not None:
             return False
         try:
-            self.proc.stdin.write(f"@POSE {x:.2f} {y:.2f} {r:.2f}\n".encode())
+            with self._lock:
+                self.pose_seq += 1
+                seq = self.pose_seq
+            self.proc.stdin.write(f"@POSE {seq} {x:.2f} {y:.2f} {r:.2f}\n".encode())
             self.proc.stdin.flush()
             self.poses += 1
             return True
@@ -263,6 +288,34 @@ class SshLink:
             self.proc.stdin.close()
         except (OSError, ValueError):
             pass
+
+
+def fetch_board_files(target: str, key: str, run_dir: Path,
+                      python: str = "python3") -> dict[str, Any]:
+    """把板端证据拷进 run 目录：@STATE 流 / 板端事件 / VT 原始帧。"""
+    import subprocess
+    out: dict[str, Any] = {}
+    ssh = ["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
+           "-o", "ConnectTimeout=8", target]
+    jobs = {
+        "board_state.txt": "cat /tmp/board_state.txt",
+        "board_events.jsonl": "cat /tmp/board_events.jsonl",
+        "board_vt.jsonl": "tail -n 6000 /tmp/vt.jsonl",
+        "camera_last.jpg": "cat /tmp/cam.jpg 2>/dev/null",
+    }
+    for name, cmd in jobs.items():
+        dest = run_dir / name
+        try:
+            res = subprocess.run(ssh + [cmd], capture_output=True, timeout=60)
+            if res.returncode == 0 and res.stdout:
+                dest.write_bytes(res.stdout)
+                out[name] = {"bytes": len(res.stdout),
+                             "lines": res.stdout.count(b"\n")}
+            else:
+                out[name] = {"error": res.returncode}
+        except (OSError, subprocess.SubprocessError) as exc:
+            out[name] = {"error": repr(exc)}
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -309,6 +362,22 @@ def main(argv: list[str] | None = None) -> int:
     follow_mp4 = Path(str(stem) + "_follow.mp4")
     field_mp4 = Path(str(stem) + "_field.mp4")
 
+    run_dir = out / f"run_{ts}_{a.tag}"
+    vtruth = virtual_truth(spec)
+    log = RunLog(run_dir, {
+        "tag": a.tag,
+        "scenario": a.scenario,
+        "scenario_name": spec.name,
+        "field_w": field_w, "field_h": field_h, "dt": dt,
+        "goal": [goal[0], goal[1]], "goal_r": goal_r,
+        "spawn": [float(spec.player_x or 0.0), float(spec.player_y or 0.0)],
+        "player_radius": float(spec.player_radius),
+        "args": {k: v for k, v in vars(a).items()},
+        "videos": {"follow": str(follow_mp4), "field": str(field_mp4)},
+        "summary_path": str(stem) + ".json",
+        "virtual_truth": vtruth["rows"],
+    })
+
     def writer(path: Path, fps: float):
         return cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"),
                                float(fps), (640, 480))
@@ -336,6 +405,21 @@ def main(argv: list[str] | None = None) -> int:
 
     viewer = None
     if a.viewer:
+        #: 先清掉上一轮遗留的僵窗：它们会一直盖在新页面上，VT 读到的是旧画面
+        #: （而且新加的"每秒置顶"会让僵窗和新窗互相抢置顶）。
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\0", b" ").decode("utf-8", "ignore")
+            except OSError:
+                continue
+            if "page_view.py" in cmd:
+                try:
+                    os.kill(int(pid), 15)
+                except OSError:
+                    pass
         import subprocess
         venv = dict(os.environ)
         venv["DISPLAY"] = ":0"
@@ -350,6 +434,9 @@ def main(argv: list[str] | None = None) -> int:
              "--fps", f"{max(20.0, a.render_hz):g}"],
             env=venv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    board_files = {"state": str(run_dir / "board_state.txt"),
+                   "events": str(run_dir / "board_events.jsonl"),
+                   "vt": str(run_dir / "board_vt.jsonl")}
     fw = VideoWriterThread(follow_mp4, a.render_hz)
     vw_ = VideoWriterThread(field_mp4, a.field_hz)
     field_rec = (FieldRecorder(field_view, vw_, a.field_hz)
@@ -357,6 +444,18 @@ def main(argv: list[str] | None = None) -> int:
     render_t = 0.0
 
     if a.board_ssh:
+        #: 清场：上一轮残留的 board_agent 会继续写 /tmp/board_state.txt 和
+        #: /tmp/vt.jsonl（两次 open("w") 交错 → 文件里混着两轮的数据），
+        #: 证据日志就不可信了。用方括号模式避免 pkill 打到自己的命令行。
+        import subprocess as _sp
+        try:
+            _sp.run(["ssh", "-i", a.ssh_key, "-o", "StrictHostKeyChecking=no",
+                     "-o", "ConnectTimeout=8", a.board_ssh,
+                     'pkill -f "[b]oard_agent.py"; pkill -f "[f]ield_cli_board"; '
+                     'sleep 0.2; rm -f /tmp/board_state.txt /tmp/board_events.jsonl'],
+                    capture_output=True, timeout=20)
+        except (OSError, _sp.SubprocessError):
+            pass
         link = SshLink(a.board_ssh, a.ssh_key, a.board_agent,
                        python=a.board_python, extra=a.board_extra)
         t_wait = time.monotonic()
@@ -367,6 +466,8 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(0.05)
             time.sleep(0.02)
         print(f"  板子已发首批动作 moves={link.moves}", file=sys.stderr)
+        log.event("board_handshake", moves=link.moves, pose_seq=link.pose_seq,
+                  waited_s=round(time.monotonic() - t_wait, 2))
     else:
         link = Link(a.tcp)
     t0 = time.monotonic()
@@ -376,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
     last_page = 0.0
     last_field = 0.0
     last_pose_t = 0.0
+    last_page_render_t = t0
     reached = False
     collisions = 0
     min_clear: float | None = None
@@ -383,9 +485,20 @@ def main(argv: list[str] | None = None) -> int:
     if not a.board_ssh:
         print("  等板子连 TCP ...", file=sys.stderr)
     prof = {"it": 0, "step": 0.0, "page": 0.0, "field": 0.0, "t": time.monotonic()}
+    truth_rows = vtruth["rows"]
+    rows_seen: dict[float, bool] = {}
+    view_half = 240.0
+    last_truth_snap = 0.0
+    last_pose_seq = link.pose_seq
     while t_sim < a.max_seconds and not reached:
         now = time.monotonic()
         prof["it"] += 1
+
+        #: ① 板子信号（@MOVE）：带主机时间戳，和 @POSE 的 seq 一起就能算延迟
+        for (t_recv, act_recv) in link.drain_moves():
+            log.io("move_recv", act=int(act_recv), t_sim=round(t_sim, 3),
+                   age_ms=round(1000.0 * (now - t_recv), 2))
+
         with link._lock:
             act = link.act
         _t_st = time.monotonic()
@@ -395,18 +508,64 @@ def main(argv: list[str] | None = None) -> int:
         px, py = float(env.world.player[0]), float(env.world.player[1])
         r = float(env.world.player[4])
         #: 真值最小间隙（到最近墙面 - 角色半径），衡量"贴着墙走"的程度。
+        clear_now: float | None = None
+        nearest_row: float | None = None
+        nearest_wall: list[float] | None = None
         for (cx, cy, hw, hh) in walls_of(env):
             if (cx - goal[0]) ** 2 + (cy - goal[1]) ** 2 <= (goal_r * 2.5) ** 2:
                 continue          # 终点块不是墙，别把"进终点"算成穿墙
             d = dist_rect(px, py, cx, cy, hw, hh) - float(spec.player_radius)
+            if clear_now is None or d < clear_now:
+                clear_now = float(d)
+                nearest_wall = [round(cx, 1), round(cy, 1), round(hw, 1), round(hh, 1)]
+                nearest_row = round(float(cy), 1)
             if d < (min_clear if min_clear is not None else 1e9):
                 min_clear = float(d)
                 min_clear_at = [round(px, 1), round(py, 1), round(t_sim, 2)]
+                log.event("min_clearance", value=round(float(d), 2), x=round(px, 1),
+                          y=round(py, 1), t_sim=round(t_sim, 2),
+                          wall=nearest_wall)
         t_sim += dt
+
+        #: ② 角色轨迹：每步一行（够细才能回放"怎么动的"）
+        log.step(t_sim=round(t_sim, 4), px=round(px, 2), py=round(py, 2),
+                 r=round(r, 2), act=int(act),
+                 dist_goal=round(float(((px - goal[0]) ** 2
+                                        + (py - goal[1]) ** 2) ** 0.5), 2),
+                 clear=None if clear_now is None else round(clear_now, 2),
+                 row=nearest_row)
+
+        #: ③ 虚拟真值行：第一次进屏的那一刻记下来（对照板端什么时候才知道）
+        for row in truth_rows:
+            ry = float(row["y"])
+            if rows_seen.get(ry):
+                continue
+            if ry <= py + view_half + 1.0:
+                rows_seen[ry] = True
+                log.truth_rows.write({
+                    "t_sim": round(t_sim, 3), "py": round(py, 1), "y": ry,
+                    "gap_gl": row["gap_gl"], "gap_gr": row["gap_gr"],
+                    "gap_side": row["gap_side"], "gap_center": row["gap_center"],
+                    "gap_width": row["gap_width"],
+                })
+
+        #: ④ 本地真值快照（2 Hz）：角色 ±400 内的墙矩形，便于事后复现"当时场上有哪些墙"
+        if t_sim - last_truth_snap >= 0.5:
+            last_truth_snap = t_sim
+            near = [[round(cx, 1), round(cy, 1), round(hw, 1), round(hh, 1)]
+                    for (cx, cy, hw, hh) in walls_of(env) if abs(cy - py) <= 400.0]
+            log.local_truth.write({"t_sim": round(t_sim, 3), "px": round(px, 1),
+                                   "py": round(py, 1), "walls": near})
+
         if now - last_pose_t >= 0.04:
             #: 姿态 25 Hz 就够（板端 VT 才 2 Hz），发太快 ssh 通道会把主循环拖慢。
             last_pose_t = now
-            link.send_pose(px, py, r)
+            ok = link.send_pose(px, py, r)
+            if link.pose_seq != last_pose_seq:
+                last_pose_seq = link.pose_seq
+                log.io("pose_sent", seq=int(link.pose_seq), x=round(px, 2),
+                       y=round(py, 2), r=round(r, 2), ok=bool(ok),
+                       t_sim=round(t_sim, 3))
         if a.render_hz > 0 and now >= next_page:
             #: 固定节拍推进（不是 now+period）：迭代按 60 步/s 走，now 抖动会让
             #: "两拍"变成"三拍"，30 fps 直接掉到 23。
@@ -422,11 +581,18 @@ def main(argv: list[str] | None = None) -> int:
             if fr is not None:
                 publisher.submit(fr)
                 fw.write(fr)
+                log.frame("page", t_sim=round(t_sim, 3), ms=round(_pg_ms, 2),
+                          px=round(px, 1), py=round(py, 1),
+                          gap_ms=round(1000.0 * (now - last_page_render_t), 2))
+                last_page_render_t = now
         if field_rec is not None and now >= next_field:
             next_field = now + 1.0 / max(0.1, a.field_hz)
             _ft = time.monotonic()
             field_rec.submit(env.world)
-            prof["field"] += 1000.0 * (time.monotonic() - _ft)
+            _fd_ms = 1000.0 * (time.monotonic() - _ft)
+            prof["field"] += _fd_ms
+            log.frame("field", t_sim=round(t_sim, 3), ms=round(_fd_ms, 2),
+                      queued=field_rec.q.qsize(), dropped=field_rec.dropped)
         if (px - goal[0]) ** 2 + (py - goal[1]) ** 2 <= goal_r ** 2:
             reached = True
         prof["step"] += _st_ms
@@ -461,10 +627,18 @@ def main(argv: list[str] | None = None) -> int:
         "render_ms": round(1000.0 * render_t / max(1, fw.written + vw_.written), 2),
         "peer": link.peer,
         "videos": {"follow": str(follow_mp4), "field": str(field_mp4)},
+        "run_dir": str(run_dir),
+        "logs": log.counts(),
     }
+    if a.board_ssh:
+        summary["board_files"] = fetch_board_files(a.board_ssh, a.ssh_key, run_dir)
     (Path(str(stem) + ".json")).write_text(json.dumps(summary, ensure_ascii=False,
                                                       indent=2) + "\n")
+    (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False,
+                                                     indent=2) + "\n")
+    log.close()
     print(json.dumps(summary, ensure_ascii=False, indent=2), file=sys.stderr)
+    print(f"  证据日志 {run_dir}", file=sys.stderr)
 
     time.sleep(a.hold)
     publisher.stop()

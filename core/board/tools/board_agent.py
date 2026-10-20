@@ -98,6 +98,8 @@ class HostLink:
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock.connect((host, int(port)))
         self.pose = (320.0, 60.0, 10.0)
+        self.pose_seq = 0
+        self.pose_t = time.monotonic()
         self._buf = b""
         self._lock = threading.Lock()
         threading.Thread(target=self._read, daemon=True).start()
@@ -117,15 +119,25 @@ class HostLink:
                 if not t.startswith("@POSE"):
                     continue
                 try:
-                    _, x, y, r = t.split()
+                    parts = t.split()
+                    if len(parts) >= 5:
+                        seq, x, y, r = parts[1], parts[2], parts[3], parts[4]
+                    else:
+                        seq, x, y, r = 0, parts[1], parts[2], parts[3]
                     with self._lock:
                         self.pose = (float(x), float(y), float(r))
-                except ValueError:
+                        self.pose_seq = int(seq)
+                        self.pose_t = time.monotonic()
+                except (ValueError, IndexError):
                     continue
 
     def get_pose(self) -> tuple[float, float, float]:
         with self._lock:
             return self.pose
+
+    def get_pose_meta(self) -> tuple[int, float]:
+        with self._lock:
+            return int(self.pose_seq), float(self.pose_t)
 
     def send_move(self, act: int) -> None:
         try:
@@ -139,6 +151,8 @@ class StdioLink:
 
     def __init__(self) -> None:
         self.pose = (320.0, 60.0, 10.0)
+        self.pose_seq = 0
+        self.pose_t = time.monotonic()
         self._lock = threading.Lock()
         threading.Thread(target=self._read, daemon=True).start()
 
@@ -148,15 +162,25 @@ class StdioLink:
             if not t.startswith("@POSE"):
                 continue
             try:
-                _, x, y, r = t.split()
+                parts = t.split()
+                if len(parts) >= 5:
+                    seq, x, y, r = parts[1], parts[2], parts[3], parts[4]
+                else:
+                    seq, x, y, r = 0, parts[1], parts[2], parts[3]
                 with self._lock:
                     self.pose = (float(x), float(y), float(r))
-            except ValueError:
+                    self.pose_seq = int(seq)
+                    self.pose_t = time.monotonic()
+            except (ValueError, IndexError):
                 continue
 
     def get_pose(self) -> tuple[float, float, float]:
         with self._lock:
             return self.pose
+
+    def get_pose_meta(self) -> tuple[int, float]:
+        with self._lock:
+            return int(self.pose_seq), float(self.pose_t)
 
     def send_move(self, act: int) -> None:
         try:
@@ -225,6 +249,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gap-margin", type=float, default=10.0)
     ap.add_argument("--state-file", default="/tmp/board_state.txt",
                     help="把发给决策的 @STATE 逐行落盘（事后核查墙覆盖率）")
+    ap.add_argument("--player-tol", type=float, default=30.0,
+                    help="VT 角色 x 与主机 px 偏差超过这个值 → 判为几何坏帧（整帧作废）")
     ap.add_argument("--warmup", type=float, default=2.5,
                     help="开局预热：前 N 秒不收墙（白框四角还在收敛）")
     ap.add_argument("--settle", type=float, default=0.9,
@@ -233,9 +259,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="从 jsonl 末尾开始读（换场景重跑）")
     ap.add_argument("--stdio", action="store_true",
                     help="走 stdin/stdout（主机用 ssh 起本进程时）")
+    ap.add_argument("--events-file", default="/tmp/board_events.jsonl",
+                    help="板端结构化事件（JSONL）：VT 帧/pause/add_wall/fix/nudge/move")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
 
+    t_boot = time.monotonic()
     half = a.view_h * 0.5
     kill_stale_clis()
     vt = VtTail(a.vt_jsonl, from_end=a.from_end)
@@ -246,6 +275,27 @@ def main(argv: list[str] | None = None) -> int:
          "--inflate", f"{a.inflate:g}"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1)
+
+    ev_f = None
+    if a.events_file:
+        try:
+            ev_f = open(a.events_file, "w", buffering=1)
+        except OSError:
+            ev_f = None
+
+    def ev(name: str, **kw) -> None:
+        """板端结构化事件：带板端单调时间 + 当时用的 pose_seq（跨机器对齐用）。"""
+        if ev_f is None:
+            return
+        pseq, _pt = link.get_pose_meta()
+        px_, py_, _pr = link.get_pose()
+        rec = {"ev": name, "t": round(time.monotonic() - t_boot, 4),
+               "pose_seq": pseq, "px": round(px_, 1), "py": round(py_, 1)}
+        rec.update(kw)
+        try:
+            ev_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except (OSError, TypeError, ValueError):
+            pass
 
     state_f = None
     if a.state_file:
@@ -311,9 +361,12 @@ def main(argv: list[str] | None = None) -> int:
                 act = int(t.split()[1])
             except (IndexError, ValueError):
                 continue
+            changed = act != last_act
             last_act = act
             if not paused and time.monotonic() >= nudge_until:
                 link.send_move(act)
+                if changed:
+                    ev("move_sent", act=int(act), src="cli")
 
     threading.Thread(target=reader, daemon=True).start()
     print(f"  board agent: vt={a.vt_jsonl} host={a.host}:{a.port} "
@@ -325,6 +378,10 @@ def main(argv: list[str] | None = None) -> int:
     pause_t0 = time.monotonic()
     t_start = time.monotonic()
     link.send_move(0)
+    ev("agent_start", field_w=a.field_w, field_h=a.field_h, view_h=a.view_h,
+       inflate=a.inflate, y_bias=a.y_bias, y_scale=a.y_scale,
+       gap_margin=a.gap_margin, settle=a.settle, warmup=a.warmup,
+       goal=list(a.goal))
     last_status = 0.0
     extras: list[tuple[float, float, float]] = []
     while True:
@@ -341,6 +398,7 @@ def main(argv: list[str] | None = None) -> int:
             pause_t0 = now_m
             last_prog_t = now_m
             link.send_move(0)
+            ev("stuck", t_sim=None)
             if a.verbose:
                 print(f"  stuck at y={py:.1f} → refit", file=sys.stderr, flush=True)
         if extras_t and time.monotonic() - extras_t > 1.5:
@@ -352,6 +410,17 @@ def main(argv: list[str] | None = None) -> int:
             walls = [w for w in s.get("walls", [])
                      if 60.0 <= float(w["y"]) <= 480.0]
             extras = []
+            #: 几何自检：页面把角色画在它的场地 x 上（视口中线固定 320），所以
+            #: VT 量到的角色 x 应该 ≈ 主机 px。偏了就说明白框/四边形检测坏了，
+            #: 这一帧的缺口 x 一律不可信 —— 整帧丢掉，别让它污染 known。
+            pv = s.get("player")
+            if pv is not None and a.player_tol > 0:
+                dx_p = float(pv[0]) - px
+                if abs(dx_p) > a.player_tol:
+                    ev("geom_reject", dx=round(dx_p, 1), vt_seq=int(s["seq"]),
+                       player=[round(float(pv[0]), 1), round(float(pv[1]), 1)],
+                       px=round(px, 1), n_vt=len(walls))
+                    walls = []
             now_m = time.monotonic()
             #: 暂停时姿态是停住的，VT 帧（0.5 s 延迟）用的就是当前 py；再叠一层
             #: "用帧内角色 y 反推拍照位姿"反而会把视口被夹住的情况算错，所以直接
@@ -376,6 +445,12 @@ def main(argv: list[str] | None = None) -> int:
                                 for g in cooldown_gaps)):
                     continue
                 extras.append((gy, gl, gr))
+            _pv = s.get("player") or [None, None]
+            ev("vt_tick", vt_seq=int(s["seq"]), frame=s.get("frame"),
+               geom=int(s.get("frame_geom") or 0), n_vt=len(s.get("walls", [])),
+               n_used=len(extras), player=s.get("player"),
+               player_dx=None if _pv[0] is None else round(float(_pv[0]) - px, 1),
+               cand=[[round(e[0], 1), round(e[1], 1), round(e[2], 1)] for e in extras[:6]])
             raw = list(extras)
             #: 已经进 known 的墙不再是"新墙"，否则恢复运动后立刻又被同一批触发暂停。
             extras = [e for e in raw
@@ -387,6 +462,9 @@ def main(argv: list[str] | None = None) -> int:
                 pause_t0 = extras_t
                 pause_seen = []
                 link.send_move(0)          # 立刻停住，等确认
+                ev("pause", cands=[[round(e[0], 1), round(e[1], 1), round(e[2], 1)]
+                                   for e in extras[:6]],
+                   vt_seq=int(s["seq"]))
                 if a.verbose:
                     print(f"  pause: {[round(e[0], 1) for e in extras]}",
                           file=sys.stderr, flush=True)
@@ -415,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
                             d["gl"], d["gr"] = round(gl, 1), round(gr, 1)
                             fixed += 1
                     if fixed:
+                        ev("fix_gap", n=int(fixed))
                         if a.verbose:
                             print(f"  fix gap: {fixed} 条墙按近距离重测",
                                   file=sys.stderr, flush=True)
@@ -429,6 +508,8 @@ def main(argv: list[str] | None = None) -> int:
                                 center = 0.5 * (float(d["gl"]) + float(d["gr"]))
                                 nudge_act = 2 if px < center else 1
                                 nudge_until = time.monotonic() + 0.9
+                                ev("nudge", act=int(nudge_act),
+                                   center=round(center, 1), px=round(px, 1))
                                 if a.verbose:
                                     print(f"  nudge act={nudge_act} → center {center:.0f}",
                                           file=sys.stderr, flush=True)
@@ -448,6 +529,11 @@ def main(argv: list[str] | None = None) -> int:
                         known_detail.append({"y": round(gy, 1), "gl": round(gl, 1),
                                              "gr": round(gr, 1),
                                              "source": "board_vt"})
+                        ev("add_wall", y=round(gy, 1), gl=round(gl, 1),
+                           gr=round(gr, 1), gap_w=round(gr - gl, 1),
+                           ahead=round(gy - py, 1), vt_seq=int(s["seq"]),
+                           vt_frame=s.get("frame"), waited=round(waited, 2),
+                           n_agree=len(accept))
                         if a.verbose:
                             print(f"  + wall y={gy:.1f} gap {gl:.0f}-{gr:.0f}",
                                   file=sys.stderr, flush=True)
@@ -468,6 +554,8 @@ def main(argv: list[str] | None = None) -> int:
                         pause_seen = []
                         last_prog_py, last_prog_t = py, time.monotonic()
                         link.send_move(last_act)
+                        ev("resume", kind="accepted", n_known=len(known),
+                           next_act=int(last_act))
         #: 暂停超时要在主循环里判：VT 断流时（没有新帧）也要能恢复。
         if (paused and time.monotonic() - pause_t0 > 4.0
                 and time.monotonic() - t_start >= a.warmup):
@@ -475,6 +563,7 @@ def main(argv: list[str] | None = None) -> int:
             prev_extras = []
             last_prog_py, last_prog_t = py, time.monotonic()
             link.send_move(last_act)
+            ev("resume", kind="timeout", n_known=len(known), next_act=int(last_act))
             if a.verbose:
                 print("  resume (timeout)", file=sys.stderr, flush=True)
         if time.monotonic() < nudge_until:
