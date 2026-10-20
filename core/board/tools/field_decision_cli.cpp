@@ -48,6 +48,7 @@ int main(int argc, char** argv) {
   double ema = 0.5;                  // 方向平滑（板端默认更跟手）
   int hyst = 1;                      // 新方向连续几帧才换
   int reflex = 1;                    // 1 = 贴墙时改用"最安全方向"
+  double inflate = 13.0;             // 规划膨胀半径（角色 10 + 余量）
   const char* trace_path = nullptr;  // 逐帧决策轨迹（离线诊断用）
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
@@ -65,6 +66,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(a, "--hyst") == 0) hyst = static_cast<int>(next(hyst));
     else if (std::strcmp(a, "--reflex") == 0) reflex = static_cast<int>(next(reflex));
     else if (std::strcmp(a, "--trace") == 0 && i + 1 < argc) trace_path = argv[++i];
+    else if (std::strcmp(a, "--inflate") == 0) inflate = next(inflate);
   }
   if (field_w <= 0 || field_h <= 0) {
     std::fprintf(stderr, "field 尺寸必须 > 0\n");
@@ -78,6 +80,7 @@ int main(int argc, char** argv) {
   cfg.goal_x = goal_x;
   cfg.goal_y = goal_y;
   cfg.ema = ema;
+  cfg.inflate = inflate;
   cfg.hyst = hyst;
   field_m1::Field field;
   field.configure(cfg);

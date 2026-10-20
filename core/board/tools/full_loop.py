@@ -714,6 +714,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="1/0 开关板端安全反射")
     ap.add_argument("--board-trace", default=None,
                     help="板端逐帧决策轨迹文件（诊断用）")
+    ap.add_argument("--board-inflate", type=float, default=None,
+                    help="板端规划膨胀半径（默认 13；调大可防贴墙角切角）")
     ap.add_argument("--board-view-h", type=float, default=0.0,
                     help="板子 --view-h（0 = 全幅 = 场高）")
     ap.add_argument("--stall-s", type=float, default=5.0)
@@ -1129,6 +1131,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  切跟随视口（半高 {follow_half:g} 场地单位），等待初始墙 ...",
               file=sys.stderr)
         good_follow: list[dict] = []
+        last_valid: dict | None = None
         deadline = time.monotonic() + args.init_timeout
         while time.monotonic() < deadline:
             render_page()
@@ -1141,17 +1144,25 @@ def main(argv: list[str] | None = None) -> int:
                     ys = _wall_ys(s["walls"])
                     if all(20.0 <= y <= 460.0 for y in ys):
                         good_follow.append(s)
+                        last_valid = s
             if len(good_follow) >= 2 and _walls_close(
                     good_follow[-1]["walls"], good_follow[-2]["walls"], 8.0):
                 break
             time.sleep(0.02)
+        #: 有些场景（比如出生点上方只有 2 道墙 + 一条画框伪线）偶尔凑不出
+        #: "两帧完全一致"的样本；这时退化为**用最近一帧有效样本**，别直接放弃。
+        if len(good_follow) < 2 and last_valid is not None:
+            good_follow = [last_valid]
         init_follow_samples = len(good_follow)
-        if len(good_follow) >= 2:
-            base = good_follow[-2:]
+        if len(good_follow) >= 1:
+            base = good_follow[-2:] if len(good_follow) >= 2 else good_follow
             # 同一道墙在两个样本里的 y 先排序配对再取均值
             ys_a = _wall_ys(base[0]["walls"])
-            ys_b = _wall_ys(base[1]["walls"])
-            ys = [0.5 * (a + b) for a, b in zip(ys_a, ys_b)]
+            if len(base) >= 2:
+                ys_b = _wall_ys(base[1]["walls"])
+                ys = [0.5 * (a + b) for a, b in zip(ys_a, ys_b)]
+            else:
+                ys = list(ys_a)
             py_now = py
             #: 初始化也要按场地范围过滤：画框上下沿会被 VT 当成墙（y<0 或 >场高），
             #: 写进 known 会让后面的"新墙"判断和代价场一开始就错。
@@ -1191,6 +1202,14 @@ def main(argv: list[str] | None = None) -> int:
             server.close()
             if vt is not None:
                 vt.stop()
+            #: 初始化失败也要关掉查看器窗口，否则它会一直挂在屏幕同一个位置，
+            #: 下一次运行的新窗口被它盖住 → 相机拍到旧页面 → VT 永远初始化失败。
+            if viewer_proc is not None and viewer_proc.poll() is None:
+                try:
+                    viewer_proc.send_signal(2)
+                    viewer_proc.wait(timeout=3.0)
+                except Exception:                 # noqa: BLE001
+                    pass
             for w in (follow_writer, field_writer, camera_writer):
                 if w is not None:
                     w.release()

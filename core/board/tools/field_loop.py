@@ -93,7 +93,8 @@ def board_command(args, goal, field_w: float, field_h: float) -> list[str]:
     for opt, val in (("--ema", getattr(args, "board_ema", None)),
                      ("--hyst", getattr(args, "board_hyst", None)),
                      ("--reflex", getattr(args, "board_reflex", None)),
-                     ("--trace", getattr(args, "board_trace", None))):
+                     ("--trace", getattr(args, "board_trace", None)),
+                     ("--inflate", getattr(args, "board_inflate", None))):
         if val is not None:
             tail += [opt, f"{val:g}" if isinstance(val, float) else str(val)]
     if args.board == "local":
