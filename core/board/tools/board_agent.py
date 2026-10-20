@@ -277,6 +277,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  board agent: vt={a.vt_jsonl} host={a.host}:{a.port} "
           f"field={a.field_w:g}×{a.field_h:g}", file=sys.stderr, flush=True)
 
+    #: 开局先停住：板端 VT 要 0.5~1 s 才出第一帧，若一上来就按"无墙直线冲向
+    #: 终点"走，0.18 s 就会顶进第一道墙（实测 min_clearance=-10）。
+    paused = True
+    pause_t0 = time.monotonic()
+    link.send_move(0)
     last_status = 0.0
     extras: list[tuple[float, float, float]] = []
     while True:

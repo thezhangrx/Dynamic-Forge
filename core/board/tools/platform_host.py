@@ -379,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
     reached = False
     collisions = 0
     min_clear: float | None = None
+    min_clear_at: list | None = None
     if not a.board_ssh:
         print("  等板子连 TCP ...", file=sys.stderr)
     prof = {"it": 0, "step": 0.0, "page": 0.0, "field": 0.0, "t": time.monotonic()}
@@ -395,8 +396,12 @@ def main(argv: list[str] | None = None) -> int:
         r = float(env.world.player[4])
         #: 真值最小间隙（到最近墙面 - 角色半径），衡量"贴着墙走"的程度。
         for (cx, cy, hw, hh) in walls_of(env):
+            if (cx - goal[0]) ** 2 + (cy - goal[1]) ** 2 <= (goal_r * 2.5) ** 2:
+                continue          # 终点块不是墙，别把"进终点"算成穿墙
             d = dist_rect(px, py, cx, cy, hw, hh) - float(spec.player_radius)
-            min_clear = d if min_clear is None else min(min_clear, d)
+            if d < (min_clear if min_clear is not None else 1e9):
+                min_clear = float(d)
+                min_clear_at = [round(px, 1), round(py, 1), round(t_sim, 2)]
         t_sim += dt
         if now - last_pose_t >= 0.04:
             #: 姿态 25 Hz 就够（板端 VT 才 2 Hz），发太快 ssh 通道会把主循环拖慢。
@@ -448,6 +453,7 @@ def main(argv: list[str] | None = None) -> int:
         "final_pos": [round(px, 1), round(py, 1)],
         "collisions": collisions, "moves": link.moves, "poses": link.poses,
         "min_clearance": None if min_clear is None else round(float(min_clear), 2),
+        "min_clearance_at": min_clear_at,
         "page_fps": round(publisher.published / max(1e-6, time.monotonic() - t0), 2),
         "page_dropped": publisher.dropped,
         "rec_pages": fw.written, "rec_fields": vw_.written,
