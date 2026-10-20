@@ -132,78 +132,6 @@ class FieldRecorder:
         self._t.join(timeout=10.0)
 
 
-class VtFeeder:
-    """把主机渲染的页面帧按 320×240 rgb24 喂给板端 vt_board（走独立 ssh 管道）。
-
-    为什么需要：相机拍的是 PC 屏幕，屏幕上任何别的窗口（终端）盖住页面，
-    VT 就只能读到文字。这条通道让"板端 VT + 决策"仍跑真图像、真帧率，
-    只是图像来源是主机渲染帧而不是照片；物理相机那条路仍是最终验收口径。
-
-    **写管道必须走独立线程**：板端 vt_board 只有 ~1.4 Hz，管道很快写满，
-    主循环里直接 write 会永久阻塞（实测把主循环卡死 15 分钟，t_sim 不动）。
-    """
-
-    def __init__(self, target: str, key: str, python: str = "python3",
-                 hz: float = 2.0, extra: str = "") -> None:
-        self.hz = max(0.2, float(hz))
-        self.frames = 0
-        self.dropped = 0
-        self._stop = False
-        self.q: queue.Queue = queue.Queue(2)
-        cmd = ["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
-               "-o", "ServerAliveInterval=5", target,
-               "ffmpeg -hide_banner -loglevel error -f rawvideo -pix_fmt rgb24 "
-               "-s 320x240 -r %g -i - -f rawvideo -pix_fmt rgb24 - "
-               "| /root/tools/vt_board --w 320 --h 240 --frame-roi 0 0 320 240 "
-               "sh -c 'echo synthetic > /tmp/vt_source; exec ffmpeg -hide_banner "
-               "-loglevel error -f rawvideo -pix_fmt rgb24 -s 320x240 -r %g -i - "
-               "-f rawvideo -pix_fmt rgb24 - | /root/tools/vt_board --w 320 --h 240 "
-               "--frame-roi 0 0 320 240 --jsonl /tmp/vt.jsonl %s'"
-               % (self.hz, extra)]
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                     stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
-        threading.Thread(target=self._run, daemon=True).start()
-
-    def submit(self, frame_640) -> None:
-        if self._stop or self.proc.poll() is not None:
-            return
-        try:
-            small = cv2.resize(frame_640, (320, 240), interpolation=cv2.INTER_AREA)
-            self.q.put_nowait(small.tobytes())
-        except queue.Full:
-            self.dropped += 1
-        except cv2.error:
-            pass
-
-    def _run(self) -> None:
-        while True:
-            data = self.q.get()
-            if data is None:
-                return
-            try:
-                self.proc.stdin.write(data)
-                self.proc.stdin.flush()
-                self.frames += 1
-            except (OSError, ValueError):
-                return
-
-    def stop(self) -> None:
-        self._stop = True
-        try:
-            self.q.put_nowait(None)
-        except queue.Full:
-            pass
-        try:
-            self.proc.stdin.close()
-        except (OSError, ValueError):
-            pass
-        try:
-            self.proc.wait(timeout=3)
-        except Exception:                            # noqa: BLE001
-            pass
-
-
 class Link:
     """TCP 服务端：等板子连上来，收 @MOVE，发 @POSE。"""
 
@@ -370,7 +298,7 @@ class SshLink:
             pass
 
 
-    def start_camera_pipe(target: str, key: str) -> dict:
+    def start_camera_pipe(target: str, key: str, extra: str = "") -> dict:
         """在板子上拉起相机管线：ffmpeg 抓 /dev/video0 → vt_board（VT 在板端）。
 
         **板端决策的输入只能是这条链路**（用户硬规则）。同时写 /tmp/vt_source=camera，
@@ -380,16 +308,16 @@ class SshLink:
         cmd = (
             'pkill -f "[v]t_board"; pkill -f "[f]fmpeg"; sleep 0.3; '
             'rm -f /tmp/vt.jsonl /tmp/cam.jpg; '
-            'echo camera > /tmp/vt_source; '
             'nohup bash -c \'ffmpeg -hide_banner -loglevel error -f v4l2 '
             '-input_format mjpeg -video_size 640x480 -i /dev/video0 '
             '-filter_complex "fps=2,scale=320:240,split=2[a][b]" '
             '-map "[a]" -f rawvideo -pix_fmt rgb24 - '
             '-map "[b]" -update 1 -q:v 5 -y /tmp/cam.jpg '
             '| /root/tools/vt_board --w 320 --h 240 --frame-roi 0 0 320 240 '
-            '--jsonl /tmp/vt.jsonl\' >/tmp/campipe.log 2>&1 & '
+            '--quad-state /tmp/qb.txt --jsonl /tmp/vt.jsonl %s\' '
+            '>/tmp/campipe.log 2>&1 & '
             'sleep 4; pidof vt_board; wc -l < /tmp/vt.jsonl'
-        )
+        ).replace("%s", extra)
         try:
             res = subprocess.run(["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
                                   "-o", "ConnectTimeout=8", target, cmd],
@@ -400,6 +328,40 @@ class SshLink:
                     "vt_lines": out[-1] if out else ""}
         except (OSError, subprocess.SubprocessError) as exc:
             return {"ok": False, "error": repr(exc)}
+
+
+def quad_fingerprint(target: str, key: str) -> str:
+    """抓板端白框四角状态当"相机/窗口是否动过"的指纹。"""
+    import subprocess
+    try:
+        res = subprocess.run(["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
+                              "-o", "ConnectTimeout=8", target,
+                              "cat /tmp/qb.txt 2>/dev/null"],
+                             capture_output=True, timeout=15)
+        txt = (res.stdout or b"").decode("utf-8", "ignore")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    nums = []
+    for tok in txt.replace(",", " ").split():
+        try:
+            nums.append(round(float(tok), 1))
+        except ValueError:
+            continue
+    return ",".join(f"{v:.1f}" for v in nums)
+
+
+def quad_moved(old: str, new: str, tol: float = 6.0) -> bool:
+    """四角平均位移超过 tol 像素 → 认为相机/窗口动过。"""
+    if not old or not new:
+        return True
+    try:
+        a = [float(v) for v in old.split(",")]
+        b = [float(v) for v in new.split(",")]
+    except ValueError:
+        return True
+    if len(a) != len(b) or not a:
+        return True
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a) > tol
 
 
 def fetch_board_files(target: str, key: str, run_dir: Path,
@@ -480,34 +442,22 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ssh-key", default=str(ROOT / "data/fpga/board_ssh/board_key"))
     ap.add_argument("--board-agent", default="/root/tools/board_agent.py")
     ap.add_argument("--board-python", default="python3")
-    #: ⚠ 硬规则（用户 2026-10-20 明确要求）：板端决策的输入**只能是真实相机**，
-    #: 不允许用 PC 渲染帧。下面的 --vt-feed 因此被禁用，只保留给"纯算法单元测试"，
-    #: 且必须同时给 --i-know-this-is-not-the-camera，跑出来的记录也会被标成
-    #: decision_source="synthetic"，不能当成验收结果。
-    ap.add_argument("--vt-feed", action="store_true",
-                    help="[禁用] 用 PC 渲染帧喂板端 VT。仅限纯算法测试，需额外 "
-                         "--i-know-this-is-not-the-camera；验收一律用相机")
-    ap.add_argument("--vt-feed-hz", type=float, default=2.0)
-    ap.add_argument("--i-know-this-is-not-the-camera", dest="allow_synthetic",
-                    action="store_true",
-                    help="确认本次不是相机输入（只做算法测试，结果不算验收）")
+    #: 硬规则（用户要求）：板端决策的输入只能是真实相机。
+    #: 曾经存在过"PC 渲染帧 → 板端 VT"的通道（--vt-feed），已彻底删除。
     ap.add_argument("--vt-board-extra", default="",
                     help="附加给板端 vt_board 的参数，如 '--no-gap-recompute'")
     ap.add_argument("--board-extra", default="")
     ap.add_argument("--connect-timeout", type=float, default=90.0)
+    ap.add_argument("--calib", default=str(ROOT / "data/fpga/calib_y.json"),
+                    help="y 换算系数标定文件（自动生成，不手调）")
+    ap.add_argument("--calib-board", default="/tmp/calib_y.json",
+                    help="板端读取的标定文件路径")
+    ap.add_argument("--quad-tol", type=float, default=6.0,
+                    help="白框四角平均位移超过这个像素就认为相机/窗口动过，需要重标")
     ap.add_argument("--start-camera-pipe", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="开跑前在板子上拉起相机管线（唯一允许的决策输入来源）")
     a = ap.parse_args(argv)
-
-    if a.vt_feed and not a.allow_synthetic:
-        print("\n[拒绝执行] 板端决策输入必须是真实相机。\n"
-              "  PC 渲染帧 → 板端 VT 这条路仅供算法单测，需要显式加 "
-              "--i-know-this-is-not-the-camera，\n"
-              "  且那次结果不能作为验收依据（summary 会标 decision_source=synthetic）。\n"
-              "  相机路径：板子 ffmpeg 抓 /dev/video0 → vt_board → board_agent → @MOVE。\n",
-              file=sys.stderr)
-        return 2
 
     spec = ScenarioSpec.load(a.scenario)
     env = BulletHellEnv(spec, seed=spec.seed)
@@ -615,7 +565,6 @@ def main(argv: list[str] | None = None) -> int:
     board_files = {"state": str(run_dir / "board_state.txt"),
                    "events": str(run_dir / "board_events.jsonl"),
                    "vt": str(run_dir / "board_vt.jsonl")}
-    feeder = None
     fw = VideoWriterThread(follow_mp4, a.render_hz)
     vw_ = VideoWriterThread(field_mp4, a.field_hz)
     field_rec = (FieldRecorder(field_view, vw_, a.field_hz)
@@ -623,8 +572,22 @@ def main(argv: list[str] | None = None) -> int:
     render_t = 0.0
 
     import subprocess as _sp
-    if a.board_ssh and a.start_camera_pipe and not a.vt_feed:
-        _cam = start_camera_pipe(a.board_ssh, a.ssh_key)
+    calib_prev: dict = {}
+    calib_path = Path(a.calib)
+    if calib_path.exists():
+        try:
+            calib_prev = json.loads(calib_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            calib_prev = {}
+    quad_now = quad_fingerprint(a.board_ssh, a.ssh_key) if a.board_ssh else ""
+    need_calib = (not calib_prev) or quad_moved(calib_prev.get("quad") or "", quad_now,
+                                               a.quad_tol)
+    print(f"  标定: 已有={bool(calib_prev)} 相机指纹={quad_now!r} "
+          f"→ {'本轮跑完重新标定' if need_calib else '沿用现有系数（相机没动）'}",
+          file=sys.stderr)
+
+    if a.board_ssh and a.start_camera_pipe:
+        _cam = start_camera_pipe(a.board_ssh, a.ssh_key, extra=a.vt_board_extra)
         print(f"  相机管线: {_cam}", file=sys.stderr)
         if not _cam.get("ok"):
             print("  ⚠ 相机管线没起来：板端会没有图像，本轮不会产生有效决策",
@@ -656,15 +619,6 @@ def main(argv: list[str] | None = None) -> int:
                     capture_output=True, timeout=20)
         except (OSError, _sp.SubprocessError):
             pass
-        if a.vt_feed:
-            try:
-                _sp.run(["ssh", "-i", a.ssh_key, "-o", "StrictHostKeyChecking=no",
-                         "-o", "ConnectTimeout=8", a.board_ssh,
-                         'pkill -f "[v]t_board"; pkill -f "[f]fmpeg"; '
-                         'sleep 0.3; rm -f /tmp/vt.jsonl'],
-                        capture_output=True, timeout=20)
-            except (OSError, _sp.SubprocessError):
-                pass
         link = SshLink(a.board_ssh, a.ssh_key, a.board_agent,
                        python=a.board_python, extra=a.board_extra)
         t_wait = time.monotonic()
@@ -679,11 +633,6 @@ def main(argv: list[str] | None = None) -> int:
                   waited_s=round(time.monotonic() - t_wait, 2))
     else:
         link = Link(a.tcp)
-    if a.vt_feed and a.board_ssh:
-        feeder = VtFeeder(a.board_ssh, a.ssh_key, a.board_python, hz=a.vt_feed_hz,
-                          extra=a.vt_board_extra)
-        print(f"  VT 喂帧通道: 板端 vt_board ← 主机渲染帧 {a.vt_feed_hz:g} Hz",
-              file=sys.stderr)
     t0 = time.monotonic()
     next_page = t0
     next_field = t0
@@ -692,7 +641,6 @@ def main(argv: list[str] | None = None) -> int:
     last_field = 0.0
     last_pose_t = 0.0
     last_page_render_t = t0
-    next_vt_feed = t0
     reached = False
     collisions = 0
     min_clear: float | None = None
@@ -799,9 +747,6 @@ def main(argv: list[str] | None = None) -> int:
             if fr is not None:
                 publisher.submit(fr)
                 fw.write(fr)
-                if feeder is not None and now >= next_vt_feed:
-                    next_vt_feed = now + 1.0 / max(0.2, a.vt_feed_hz)
-                    feeder.submit(fr)
                 log.frame("page", t_sim=round(t_sim, 3), ms=round(_pg_ms, 2),
                           px=round(px, 1), py=round(py, 1),
                           gap_ms=round(1000.0 * (now - last_page_render_t), 2))
@@ -852,15 +797,59 @@ def main(argv: list[str] | None = None) -> int:
         "peer": link.peer,
         "videos": {"follow": str(follow_mp4), "field": str(field_mp4)},
         "abort_reason": abort_reason,
-        "decision_source": "synthetic(PC渲染帧)" if feeder is not None else "camera",
-        "vt_feed": None if feeder is None else {"frames": feeder.frames,
-                                                "dropped": feeder.dropped,
-                                                "hz": a.vt_feed_hz},
+        "decision_source": "camera",
         "run_dir": str(run_dir),
         "logs": log.counts(),
     }
     if a.board_ssh:
         summary["board_files"] = fetch_board_files(a.board_ssh, a.ssh_key, run_dir)
+    #: 自动标定（用户要求：不手调系数；相机/窗口一动就重标；标好后不再调用）
+    if need_calib:
+        _res = None
+        try:
+            import calib_y
+            _cfg = json.loads(Path(a.scenario).read_text(encoding="utf-8"))
+            _truth = [float(v) for v in (_cfg.get("meta", {}).get("walls_y") or [])]
+            _pairs = calib_y.collect_pairs(run_dir)
+            if not _truth:
+                print("  自动标定跳过：场景没有真值墙行", file=sys.stderr)
+            elif len(_pairs) < 30:
+                print(f"  自动标定跳过：样本不足（{len(_pairs)}）", file=sys.stderr)
+            else:
+                _res = calib_y.fit(_pairs, _truth, 240.0, tol=30.0, rounds=6)
+                _res.update({"quad": quad_now, "run": str(run_dir),
+                             "scenario": a.scenario})
+                if (_res.get("samples", 0) < 30
+                        or (_res.get("rmse") or 999.0) > 20.0):
+                    print(f"  自动标定质量不足（samples={_res.get('samples')} "
+                          f"rmse={_res.get('rmse')}）：保留旧系数", file=sys.stderr)
+                    summary["calib"] = {"rejected": True, **_res}
+                    _res = None
+        except (ImportError, OSError, ValueError) as exc:
+            print(f"  自动标定失败：{exc!r}", file=sys.stderr)
+
+        if _res is not None:
+            calib_path.parent.mkdir(parents=True, exist_ok=True)
+            calib_path.write_text(json.dumps(_res, ensure_ascii=False, indent=2) + "\n",
+                                  encoding="utf-8")
+            summary["calib"] = _res
+            if a.board_ssh:
+                try:
+                    import subprocess as _sp2
+                    _sp2.run(["ssh", "-i", a.ssh_key, "-o", "StrictHostKeyChecking=no",
+                              "-o", "ConnectTimeout=8", a.board_ssh,
+                              f"cat > {a.calib_board}"],
+                             input=(json.dumps(_res, ensure_ascii=False) + "\n").encode(),
+                             capture_output=True, timeout=20)
+                except (OSError, _sp2.SubprocessError):
+                    pass
+            print(f"  自动标定: scale={_res['scale']} bias={_res['bias']} "
+                  f"samples={_res['samples']} rmse={_res['rmse']}", file=sys.stderr)
+    else:
+        summary["calib"] = {"reused": True, "scale": calib_prev.get("scale"),
+                            "bias": calib_prev.get("bias"),
+                            "quad": calib_prev.get("quad")}
+
     (Path(str(stem) + ".json")).write_text(json.dumps(summary, ensure_ascii=False,
                                                       indent=2) + "\n")
     (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False,
@@ -874,8 +863,6 @@ def main(argv: list[str] | None = None) -> int:
     fw.close()
     vw_.close()
     link.stop()
-    if feeder is not None:
-        feeder.stop()
     if viewer is not None:
         try:
             viewer.send_signal(2)
