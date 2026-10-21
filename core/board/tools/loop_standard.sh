@@ -4,12 +4,12 @@
 #
 #   相机 → 板端 vt_sparse（12 fps）→ 板端决策 → @MOVE → 主机渲染
 #
-#   同一套参数重复两轮（std7 / std9），两轮都：
-#      到达=True   碰撞=0   最小间隙 +18.2 / +16.0
-#      学到 24/24 道墙   |Δy| 平均 2.7 / 3.1 px   VT 12.01 帧/s
-#      t_sim 64.8 s / 63.0 s（比旧的 sparse6 慢 22 s：多停车换安全）
-#      证据：data/fpga/loop_logs/run_20261021_074202_std7/
-#            data/fpga/loop_logs/run_20261021_074639_std9/
+#   2026-10-21 晚上的精度版（acc9）：VT 输入 640x480、墙行亚像素质心、锁曝光、
+#   8 帧中位数、按拍摄时刻配位姿、标定含横向偏差：
+#      到达=True  碰撞=0  最小间隙 +17.43  学到 23/24 道墙
+#      |Δy| 平均 1.4 px（max 2.3）   VT 12.0 帧/s
+#      证据：data/fpga/loop_logs/run_20261021_085727_acc9/
+#   上一版（std7/std9）：24/24、|Δy| 2.7/3.1、最小间隙 +18.2/+16.0
 #
 #   2026-10-20 的旧标准（sparse6）只学到 18/24、擦墙一次，已不再作标准。
 #
@@ -46,7 +46,7 @@ CALIB_LOCAL="data/fpga/calib_y.json"
 SCENARIO="configs/20_walls_alt_24_dy140.json"
 CHECK=0
 TAG="std"
-SECONDS_SIM=95
+SECONDS_SIM=220
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -112,5 +112,6 @@ exec "$PY" -u core/board/tools/platform_host.py \
     --board-extra "--from-end --verbose --consensus-frames 8 --tol-vy 16 --settle 1.0 --pause-timeout 3.5" \
     --connect-timeout 90 \
     --calib "$CALIB_LOCAL" --calib-board /tmp/calib_y.json --quad-tol 6 \
-    --viewer --viewer-pos 320,60 --viewer-size 1280x960 --viewer-margin 0 \
+    --viewer --viewer-fullscreen --viewer-pos 320,60 --viewer-size 1280x960 \
+    --viewer-margin 0 \
     --cam-vt-bin /root/tools/vt_sparse --cam-fps 12 --cam-w 640 --cam-h 480

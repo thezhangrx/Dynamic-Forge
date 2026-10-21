@@ -287,6 +287,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="开局预热：前 N 秒不收墙（白框四角还在收敛）")
     ap.add_argument("--consensus-frames", type=int, default=3,
                     help="同一道墙要几帧一致才入表（2 帧时偶发错行缺口会被收下）")
+    ap.add_argument("--x-bias", type=float, default=0.0,
+                    help="缺口横向固定偏移（像素，正=VT 比真值偏右）。"
+                         "标定文件里给了就用文件里的；这里只是回退默认值")
     ap.add_argument("--tol-vy", type=float, default=7.0,
                     help="多帧一致时允许的帧内墙行差（像素）。**这是噪声参数，不是场景参数**："
                          "实测静止条件下同一道墙的 vy 重复性 1σ≈8 px，卡在 7 会把一半"
@@ -323,6 +326,10 @@ def main(argv: list[str] | None = None) -> int:
             if "scale" in _c and "bias" in _c:
                 a.y_scale = float(_c["scale"])
                 a.y_bias = float(_c["bias"])
+                #: 横向固定偏差（页面四角单应挡不住桶形畸变，实测 +9.4 px）。
+                #: 和 scale/bias 一样是**标定产物**，不是手调常数：由 calib_y 用
+                #: 一组静止画面 + 真值算中位数得到，写进同一个 calib 文件。
+                a.x_bias = float(_c.get("x_bias", 0.0) or 0.0)
                 print(f"  calib_loaded: scale={a.y_scale} bias={a.y_bias} "
                       f"({calib_file})", file=sys.stderr, flush=True)
         except (OSError, ValueError):
@@ -515,7 +522,7 @@ def main(argv: list[str] | None = None) -> int:
     t_start = time.monotonic()
     link.send_move(0)
     ev("agent_start", field_w=a.field_w, field_h=a.field_h, view_h=a.view_h,
-       inflate=a.inflate, y_bias=a.y_bias, y_scale=a.y_scale,
+       inflate=a.inflate, y_bias=a.y_bias, y_scale=a.y_scale, x_bias=a.x_bias,
        gap_margin=a.gap_margin, settle=a.settle, warmup=a.warmup,
        goal=list(a.goal))
     geom_rej_n = 0
@@ -654,8 +661,8 @@ def main(argv: list[str] | None = None) -> int:
                        gr=round(float(w.get("gr", 640.0)), 1),
                        w=round(_raw_w, 1))
                     continue
-                gl = float(w.get("gl", 0.0)) + margin
-                gr = float(w.get("gr", 640.0)) - margin
+                gl = float(w.get("gl", 0.0)) - a.x_bias + margin
+                gr = float(w.get("gr", 640.0)) - a.x_bias - margin
                 if gr - gl < 60.0:
                     c = 0.5 * (gl + gr)
                     gl, gr = c - 35.0, c + 35.0

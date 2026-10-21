@@ -106,6 +106,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--w", type=int, default=1280)
     ap.add_argument("--h", type=int, default=960)
     ap.add_argument("--fps", type=float, default=30.0)
+    ap.add_argument("--fullscreen", action="store_true",
+                    help="全屏显示。WSLg(RAIL) 下全屏窗口通常会被抬成前台窗口，"
+                         "比固定位置的无边框窗口更不容易被别的窗口盖住 —— 相机看不到"
+                         "页面时先试这个")
+    ap.add_argument("--content", default="",
+                    help="全屏时页面内容画多大（如 1280x960），居中留黑边。"
+                         "这样窗口是全屏（WSLg 下不会被别的窗口压住），"
+                         "而页面仍落在相机调好的那块矩形上")
     ap.add_argument("--hold", action=argparse.BooleanOptionalAction, default=True,
                     help="流断了以后保留最后一帧（默认开）")
     ap.add_argument("--margin", type=int, default=24,
@@ -118,7 +126,10 @@ def main(argv: list[str] | None = None) -> int:
     pygame.display.init()
     pygame.font.init()
     try:
-        screen = pygame.display.set_mode((args.w, args.h), pygame.NOFRAME)
+        if args.fullscreen:
+            screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        else:
+            screen = pygame.display.set_mode((args.w, args.h), pygame.NOFRAME)
     except Exception as exc:                             # noqa: BLE001
         print(f"⚠ 开不了 X11 窗口（DISPLAY={os.environ.get('DISPLAY')}）：{exc!r}",
               file=sys.stderr)
@@ -129,6 +140,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"viewer window {args.w}x{args.h} at ({args.x},{args.y})  url={args.url}",
           flush=True)
 
+    sw, sh = screen.get_size()
+    if args.content:
+        cw, ch = (int(v) for v in args.content.lower().split("x"))
+    else:
+        cw, ch = args.w, min(args.h, sh)
+    off_x, off_y = (sw - cw) // 2, (sh - ch) // 2
     client = MjpegClient(args.url).start()
     last_seq = -1
     last_frame = None
@@ -155,12 +172,12 @@ def main(argv: list[str] | None = None) -> int:
                 if last_frame is not None:
                     rgb = cv2.cvtColor(last_frame, cv2.COLOR_BGR2RGB)
                     surf = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
-                    m = max(0, min(args.margin, min(args.w, args.h) // 4))
-                    inner = (args.w - 2 * m, args.h - 2 * m)
+                    m = max(0, min(args.margin, min(cw, ch) // 4))
+                    inner = (cw - 2 * m, ch - 2 * m)
                     if surf.get_size() != inner:
                         surf = pygame.transform.smoothscale(surf, inner)
                     screen.fill((0, 0, 0))
-                    screen.blit(surf, (m, m))
+                    screen.blit(surf, (off_x + m, off_y + m))
                 elif not args.hold:
                     screen.fill((0, 0, 0))
                 else:

@@ -477,6 +477,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out-dir", default=str(ROOT / "data/fpga/loop_logs"))
     ap.add_argument("--tag", default="board_vt")
     ap.add_argument("--viewer", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--viewer-fullscreen", action="store_true",
+                    help="查看器全屏（WSLg 下比固定位置更稳，见 page_view.py 注释）")
     ap.add_argument("--viewer-pos", default="320,60")
     ap.add_argument("--viewer-size", default="1280x960")
     ap.add_argument("--hold", type=float, default=2.0)
@@ -636,10 +638,30 @@ def main(argv: list[str] | None = None) -> int:
         viewer = subprocess.Popen(
             [sys.executable, str(ROOT / "core/board/tools/page_view.py"),
              "--url", f"http://127.0.0.1:{a.port}/stream.mjpg",
+             *(["--fullscreen", "--content", f"{vw}x{vh}"]
+               if a.viewer_fullscreen else []),
              "--x", vx, "--y", vy, "--w", vw, "--h", vh,
              "--fps", f"{max(20.0, a.render_hz):g}",
-             "--margin", str(int(a.viewer_margin))],
-            env=venv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+             "--margin", str(int(a.viewer_margin)),
+             #: 查看器的 idle-exit 默认 8 s：而本轮开跑前要先过"相机闸门"（最多 25 s），
+             #: 这段时间页面还没开始 publish，查看器会 8 s 收不到帧就自己退出 ——
+             #: 于是相机永远看不到页面、闸门永远失败（acc6/acc7 就是这么连挂两次的）。
+             "--idle-exit", "180"],
+            env=venv, stdout=subprocess.DEVNULL,
+            stderr=open("/tmp/viewer.log", "wb"))
+        #: 查看器是相机取景的唯一窗口：它要是起来就死了（全屏/权限/URL 错），
+        #: 相机就只看得到桌面 —— 以前 stdout/stderr 全丢进 DEVNULL，什么都看不到。
+        time.sleep(2.0)
+        if viewer.poll() is not None:
+            try:
+                tail = Path("/tmp/viewer.log").read_text(errors="ignore")[-400:]
+            except OSError:
+                tail = ""
+            print(f"  ⚠ 查看器进程已退出 rc={viewer.returncode}：{tail}",
+                  file=sys.stderr)
+        else:
+            print(f"  ✓ 查看器已起 pid={viewer.pid}"
+                  f"{'（全屏）' if a.viewer_fullscreen else ''}", file=sys.stderr)
 
     board_files = {"state": str(run_dir / "board_state.txt"),
                    "events": str(run_dir / "board_events.jsonl"),
@@ -736,10 +758,21 @@ def main(argv: list[str] | None = None) -> int:
         #: 判据：最近 30 帧里至少 5 帧同时有"带缺口的墙"和"角色"，否则拒跑。
         _ssh_gate = ["ssh", "-i", a.ssh_key, "-o", "StrictHostKeyChecking=no",
                      "-o", "ConnectTimeout=8", a.board_ssh]
+        #: **闸门期间必须持续 publish 页面**：查看器连的是本进程的 page 服务，
+        #: 而主循环（真正渲染并 submit 的那段）在闸门之后 — 不先喂帧，查看器就是
+        #: 一块黑屏，相机拍黑屏，闸门永远失败（acc6/acc7/acc8 连挂三次就是这个）。
         ok_seen = 0
         detail = ""
         t_gate = time.monotonic()
+        _last_pub = 0.0
         while time.monotonic() - t_gate < 25.0:
+            _now = time.monotonic()
+            if _now - _last_pub >= 0.05:
+                _last_pub = _now
+                try:
+                    publisher.submit(page.render(env.world))
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 res = _sp.run(
                     _ssh_gate + ["tail -n 40 /tmp/vt.jsonl"],

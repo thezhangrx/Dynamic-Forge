@@ -63,7 +63,13 @@ def collect_pairs(run_dir: Path) -> list[tuple[float, float, int]]:
     frame_py: dict[int, float] = {}
     for e in ev:
         if e.get("ev") == "vt_tick" and e.get("frame") is not None:
-            frame_py[int(e["frame"])] = float(e.get("py", 0.0))
+            #: **必须用"拍摄时刻的 py"**（py_used，由帧时间戳插值得到），
+            #: 而不是读帧那一刻的 py —— 两者相差一个管道延迟（~0.3~0.5 s），
+            #: 用错的那个会让拟合系数系统性地偏，表现为所有墙的 Δy 同号同量。
+            _pu = e.get("py_used")
+            if _pu is None:          # 老日志没记 py_used，退回读帧时刻的 py
+                _pu = e.get("py", 0.0)
+            frame_py[int(e["frame"])] = float(_pu)
     vt = read_jsonl(run_dir / "board_vt.jsonl")
     pairs: list[tuple[float, float, int]] = []
     for rec in vt:
@@ -76,6 +82,39 @@ def collect_pairs(run_dir: Path) -> list[tuple[float, float, int]]:
             if 1.0 < vy < 479.0:
                 pairs.append((vy, py, fr))
     return pairs
+
+
+def fit_x_bias(vt_rows: list[dict], frame_py: dict[int, float], truth_gaps: list[tuple],
+               truth_y: list[float], scale: float, bias: float,
+               half: float) -> tuple[float, int]:
+    """VT 缺口左右边界相对真值的**固定横向平移**（中位数）。
+
+    为什么需要：页面四角只给单应 8 个自由度，广角头的桶形畸变会让整幅画面
+    在中部整体偏几个像素（实测 +7~+11 px）。这不是随机误差，是系统性偏差：
+    在 y 上我们用 scale/bias 拟掉了，x 上一直没有对应的一项，于是板子总是
+    朝真实缺口中心右侧 7~11 px 走 —— 90~110 宽的缺口里，这吃掉约 1/3 余量。
+    这里同样**用真值标定一次**（和 y 的做法一致），把结果写进 calib 文件。
+    """
+    import statistics
+    dxs: list[float] = []
+    for rec in vt_rows:
+        py = frame_py.get(int(rec.get("frame", -1)))
+        if py is None:
+            continue
+        for w in rec.get("walls") or []:
+            world = (py - half) + scale * float(w.get("y", 0.0)) + bias
+            ty = min(truth_y, key=lambda v: abs(v - world))
+            if abs(ty - world) > 40.0:
+                continue
+            # 找该真值行对应的缺口
+            g = [gg for gg in truth_gaps if abs(gg[0] - ty) < 1.0]
+            if not g:
+                continue
+            _, tgl, tgr = g[0]
+            dxs.append(0.5 * ((float(w["gl"]) - tgl) + (float(w["gr"]) - tgr)))
+    if len(dxs) < 10:
+        return 0.0, len(dxs)
+    return float(statistics.median(dxs)), len(dxs)
 
 
 def fit(pairs: list[tuple[float, float, int]], truth_y: list[float], half: float,
@@ -142,7 +181,29 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     res = fit(pairs, truth_y, 0.5 * a.view_h, tol=a.tol)
-    res.update({"run": str(a.run_dir), "scenario": a.scenario,
+
+    #: 同一批样本顺带拟合横向固定偏差（页面四角单应挡不住桶形畸变）
+    meta = cfg.get("meta", {})
+    truth_gaps = [(float(y), float(g) - float(w) / 2.0, float(g) + float(w) / 2.0)
+                  for y, g, w in zip(meta.get("walls_y") or [],
+                                     meta.get("gaps_x") or [],
+                                     meta.get("gap_widths") or [])]
+    vt_rows = read_jsonl(Path(a.run_dir) / "board_vt.jsonl")
+    ev = read_jsonl(Path(a.run_dir) / "board_events.jsonl")
+    frame_py = {}
+    for e in ev:
+        if e.get("ev") == "vt_tick" and e.get("frame") is not None:
+            _pu = e.get("py_used")
+            if _pu is None:
+                _pu = e.get("py", 0.0)
+            frame_py[int(e["frame"])] = float(_pu)
+    x_bias, x_n = (0.0, 0)
+    if truth_gaps:
+        x_bias, x_n = fit_x_bias(vt_rows, frame_py, truth_gaps, truth_y,
+                                 float(res["scale"]), float(res["bias"]),
+                                 0.5 * a.view_h)
+    res.update({"x_bias": round(x_bias, 2), "x_samples": x_n,
+                "run": str(a.run_dir), "scenario": a.scenario,
                 "quad": a.quad or None, "pairs": len(pairs)})
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text(json.dumps(res, ensure_ascii=False, indent=2) + "\n",
