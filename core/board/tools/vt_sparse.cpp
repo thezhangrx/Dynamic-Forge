@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <time.h>
 #include <unistd.h>
 
 #include "field_frame.hpp"
@@ -65,6 +66,16 @@ inline void sample_bilinear(const uint8_t* img, int w, int h, double x, double y
 }
 
 }  // namespace
+
+//: 板端单调时钟（秒）。板端 board_agent 用 Python 的 time.monotonic()，在 Linux 上
+//: 就是同一个 CLOCK_MONOTONIC —— 有了这个时间戳，agent 就能把"这一帧是什么时候
+//: 拍的"和它收到的 @POSE 历史对上，**不用再猜**帧有多旧（跟随视口里角色恒在
+//: 页面正中，靠角色位置是判断不出新鲜度的，这一层以前一直是在猜）。
+static double mono_now() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+}
 
 int main(int argc, char** argv) {
     int w = 640, h = 360;
@@ -120,6 +131,7 @@ int main(int argc, char** argv) {
             got += static_cast<size_t>(r);
         }
         ++frame;
+        const double t_cap = mono_now();   // 这一帧"读进来"的时刻（给 agent 配对位姿）
 
         // ---- ROI 裁剪 ---------------------------------------------------
         const uint8_t* base = src.data();
@@ -173,9 +185,9 @@ int main(int argc, char** argv) {
         const auto inv = rectify::invert(H);
         if (!fq.ok || !H.ok || !inv.ok) {
             if (jf) {
-                std::fprintf(jf, "{\"frame\":%ld,\"frame_geom\":0,\"quad_ext\":%d,"
-                                 "\"walls\":[],\"player\":null,\"n\":0}\n",
-                             frame, quad_ext ? 1 : 0);
+                std::fprintf(jf, "{\"frame\":%ld,\"t\":%.6f,\"frame_geom\":0,"
+                                 "\"quad_ext\":%d,\"walls\":[],\"player\":null,\"n\":0}\n",
+                             frame, t_cap, quad_ext ? 1 : 0);
                 std::fflush(jf);
             }
             continue;
@@ -211,11 +223,19 @@ int main(int argc, char** argv) {
         }
         if (wall_thr > 0) thr = static_cast<int>(wall_thr);
 
+        //: 每行"亮度超出阈值多少"的累加，作为墙行质心的权重。
+        //: 只用硬阈值数亮列（row_bright）时，带子的上下沿会随阈值抖动 2~8 行；
+        //: 用连续权重做质心，行的定位就变成亚像素、且对阈值不敏感。
+        std::vector<double> row_ev(FH, 0.0);
         for (int r = 0; r < FH; ++r) {
             int n = 0;
-            for (int i = 0; i < cols; ++i)
-                if (lat[static_cast<size_t>(r) * cols + i] >= thr) ++n;
+            double ev = 0.0;
+            for (int i = 0; i < cols; ++i) {
+                const int L = lat[static_cast<size_t>(r) * cols + i];
+                if (L >= thr) { ++n; ev += static_cast<double>(L - thr); }
+            }
             row_bright[r] = n;
+            row_ev[r] = ev;
         }
 
         // ---- 墙行：亮列占比高；成带后取带中心 ---------------------------
@@ -231,9 +251,20 @@ int main(int argc, char** argv) {
         std::vector<WallOut> walls;
         for (const auto& b : bands) {
             if (b[1] - b[0] + 1 < 4) continue;            // 单像素/白框线多半是网格线
-            const int rc = (b[0] + b[1]) / 2;
+            //: 亚像素质心：带子 [b0-2, b1+2] 内按 row_ev 加权（连续、抗阈值抖动）
+            double wsum = 0.0, wrow = 0.0;
+            for (int r = std::max(0, b[0] - 2); r <= std::min(FH - 1, b[1] + 2); ++r) {
+                const double e = row_ev[static_cast<size_t>(r)];
+                if (e <= 0.0) continue;
+                wsum += e;
+                wrow += e * static_cast<double>(r);
+            }
+            const double rc_frac = (wsum > 1e-9)
+                    ? (wrow / wsum)
+                    : 0.5 * (b[0] + b[1]);
+            const int rc = static_cast<int>(std::lround(rc_frac));
             if (rc < 10 || rc > FH - 11) continue;        // 页面白框本身不是墙
-            const double py_page = FH - (rc + 0.5);
+            const double py_page = FH - (rc_frac + 0.5);
             std::vector<int> row(static_cast<size_t>(FW), 0);
             for (int x = 0; x < FW; ++x) {
                 const auto q = inv.apply(x + 0.5, py_page);
@@ -267,7 +298,7 @@ int main(int argc, char** argv) {
                 shoulder = (lb >= 6 && rb >= 6);
             }
             WallOut o;
-            o.y = FH - (rc + 0.5);
+            o.y = py_page;
             //: 缺口宽度必须落在场景真值范围内（90~110，正射后按页面 px 略有伸缩）；
             //: 整行全黑（best_len≈620）= 这一行根本没墙，不能当缺口报出去。
             if (shoulder && best_len >= 45 && best_len <= 200 && best_s > 4
@@ -395,8 +426,9 @@ int main(int argc, char** argv) {
             //: 或压根不是墙）以前会被写成 gl=0/gr=640，下游一律按"贴边"丢掉，
             //: 反而在报告里制造大量"缺口贴边帧"。宁可少报一行，也不要报假缺口。
             int emitted = 0;
-            std::fprintf(jf, "{\"frame\":%ld,\"frame_geom\":1,\"quad_ext\":%d,\"walls\":[",
-                         frame, quad_ext ? 1 : 0);
+            std::fprintf(jf, "{\"frame\":%ld,\"t\":%.6f,\"frame_geom\":1,"
+                             "\"quad_ext\":%d,\"walls\":[",
+                         frame, t_cap, quad_ext ? 1 : 0);
             for (const auto& o : walls) {
                 if (!o.gap) continue;
                 std::fprintf(jf, "%s{\"y\":%.1f,\"gl\":%.1f,\"gr\":%.1f}",

@@ -287,6 +287,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="开局预热：前 N 秒不收墙（白框四角还在收敛）")
     ap.add_argument("--consensus-frames", type=int, default=3,
                     help="同一道墙要几帧一致才入表（2 帧时偶发错行缺口会被收下）")
+    ap.add_argument("--tol-vy", type=float, default=7.0,
+                    help="多帧一致时允许的帧内墙行差（像素）。**这是噪声参数，不是场景参数**："
+                         "实测静止条件下同一道墙的 vy 重复性 1σ≈8 px，卡在 7 会把一半"
+                         "好帧剔掉、留下有偏的样本；准度优先时放宽到 15~20 再多帧取中位数")
+    ap.add_argument("--max-stale", type=float, default=8.0,
+                    help="测量用的帧，帧内角色与预期位置最多差这么多像素。"
+                         "超过的帧只用来触发暂停、不进测量（宁可多等几帧，"
+                         "也不要用旧位姿映射墙的 y —— 时间不重要，安全最重要）")
     ap.add_argument("--collect-moving", action="store_true",
                     help="发现新墙时**不停车**，边走边收（需要 VT ≥8 fps）。"
                          "原来每道墙都停一次：12 fps 下墙在可见带里只待 ~7 s，"
@@ -375,6 +383,29 @@ def main(argv: list[str] | None = None) -> int:
     pause_seen: list[tuple[float, float, float]] = []
     last_prog_py = -1e9
     last_prog_t = time.monotonic()
+    #: @POSE 历史（单调时钟 → py）。vt_sparse 每帧带 `t`（板端 CLOCK_MONOTONIC，
+    #: 与 Python time.monotonic() 同一时钟），据此能把"这一帧拍的时候平台在哪"
+    #: 精确取出来，不再靠"角色在帧里的位置"猜新鲜度 —— 跟随视口里角色恒在页面
+    #: 正中，那个信号**根本不含新旧信息**，以前那套 dy_p 修正全是噪音。
+    pose_hist: list[tuple[float, float]] = []
+
+    def py_at(t: float) -> float | None:
+        """t 时刻的 py（线性插值；超出历史范围返回 None）。"""
+        if not pose_hist:
+            return None
+        if t <= pose_hist[0][0] or t >= pose_hist[-1][0]:
+            return None
+        lo, hi = 0, len(pose_hist) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if pose_hist[mid][0] <= t:
+                lo = mid
+            else:
+                hi = mid
+        (t0_, y0_), (t1_, y1_) = pose_hist[lo], pose_hist[hi]
+        if t1_ - t0_ < 1e-9:
+            return y1_
+        return y0_ + (y1_ - y0_) * (t - t0_) / (t1_ - t0_)
     paused = False
     collecting = False        #: 边走边收：与 paused 共用 pause_seen/pause_t0，
                               #: 区别是**不发 move(0)**、不压住 @MOVE
@@ -495,6 +526,9 @@ def main(argv: list[str] | None = None) -> int:
         s = vt.latest()
         px, py, pr = link.get_pose()
         now_m = time.monotonic()
+        pose_hist.append((now_m, py))
+        if len(pose_hist) > 600:      # ≈5 s @110 Hz
+            del pose_hist[:-600]
         if py > last_prog_py + 2.0:
             last_prog_py = py
             last_prog_t = now_m
@@ -523,22 +557,39 @@ def main(argv: list[str] | None = None) -> int:
             #: 这一帧的缺口 x 一律不可信 —— 整帧丢掉，别让它污染 known。
             pv = s.get("player")
             dx_p = None if pv is None else float(pv[0]) - px
-            #: 竖直方向的"帧新鲜度"：页面按当前 py 画角色，所以角色在帧里的 vy
-            #: 必然是 (py-lo)/scale。实测偏差 >15 就说明这一帧还是"角色更靠下时"
-            #: 拍的 —— 用当前 py 去映射它，墙的 y 会整体偏大 70~140（实测 +69）。
-            #: 页面**不做夹取**：它总是把 py 画在视口正中间（实测静止时角色
-            #: vy 恒为 ~240，即使 py=40 在场地底端）。所以"预期的 vy"就是
-            #: half/scale 这个常数；之前按 clamp 算成 (py-lo)/scale，在起点给出
-            #: vy_expect≈41 → 误判成"旧帧"并把 py 修正掉 200，墙的 y 全带 200 错。
-            vy_expect = (half - a.y_bias) / max(1e-6, a.y_scale)
+            #: 竖直方向的"帧新鲜度"：页面**不做夹取**，它永远把角色画在可见带
+            #: 正中，所以角色在**页面坐标**里的 vy 恒等于 half（实测 240±1，
+            #: 与 py 无关、与标定系数无关）。
+            #:
+            #: 这里以前写的是 `(half - y_bias) / y_scale` —— 把"页面坐标"和
+            #: "世界坐标"混在一起了：标定一变（自动标定后 scale 0.976/bias −5.4），
+            #: vy_expect 就变成 251，于是**每一帧都被判成旧帧**（dy≈−10.8），
+            #: |dy|>8 的测量闸门把所有帧全丢掉（acc1：stale_skip 1229 次、
+            #: add_wall 只有 4 道、覆盖率 4/24）。期望值就是 half，不要掺标定。
+            vy_expect = half
             dy_p = None if pv is None else float(pv[1]) - vy_expect
             #: 帧新鲜度门：VT 帧比当前位姿旧 ~0.5 s，角色一秒走 200 单位，
             #: 所以"帧里的角色 x"和主机 px 差多少，就等于这一帧旧了多少。
             #: 暂停后 settle 秒内的帧一律不用；settle 之后只收 |dx|≤12 的新鲜帧。
             #: 这样入表的 y/缺口都来自"停稳那几帧"，不会再出现整行错位。
+            #: **首选：按帧时间戳配对位姿**（vt_sparse 起每帧带 "t"）。这是
+            #: "这一帧拍的时候平台在哪"的真答案；角色位置法在跟随视口里恒 240，
+            #: 判不出新旧，纯噪音（acc1 就是被它把所有帧判成旧帧的）。
+            t_fr = s.get("t")
+            stale_ok = None      # None = 没有时间戳，退回角色法
+            lag_ms = None
             py_cap = py
             contemporaneous = True
-            if pv is not None and dy_p is not None:
+            if t_fr is not None:
+                _py_at = py_at(float(t_fr))
+                if _py_at is not None:
+                    py_cap = float(_py_at)
+                    lag_ms = round((now_m - float(t_fr)) * 1000.0, 1)
+                    contemporaneous = True
+                    stale_ok = True
+                else:
+                    stale_ok = False     # 超出历史：映射不了，丢掉这帧的墙
+            if stale_ok is None and pv is not None and dy_p is not None:
                 #: 帧里的角色比"当前 py 应有的位置"偏下多少，就说明这一帧是
                 #: 角色还低那么多的时候拍的 → 用 py_cap 去映射，y 就不会偏。
                 #: 丢帧会让墙学不到（实测只学到 4 道、整轮卡死），修正更好。
@@ -559,6 +610,19 @@ def main(argv: list[str] | None = None) -> int:
                     ev("stale_corrected", dy=round(dy_p, 1),
                        vt_seq=int(s["seq"]), py=round(py, 1),
                        py_cap=round(py_cap, 1))
+            #: **测量只用"同期"的帧**：contemporaneous 以前算了却没用来闸门，
+            #: 于是旧帧（角色已经移动了 30~100 单位）也会被 py_cap 修正后拿去
+            #: 映射墙 y，残差 p95 到 ~+19。用户要求"障碍识别准"，那就宁可多停
+            #: 一会儿等新帧，也不用旧帧凑数。
+            if stale_ok is False:
+                ev("stale_skip", why="no_pose_at_t", vt_seq=int(s["seq"]),
+                   t=float(t_fr) if t_fr is not None else None, py=round(py, 1))
+                walls = []
+            if (stale_ok is None and pv is not None and not contemporaneous
+                    and abs(dy_p) > max(5.0, a.max_stale)):
+                ev("stale_skip", dy=round(dy_p, 1), vt_seq=int(s["seq"]),
+                   py=round(py, 1))
+                walls = []
             if pv is not None and paused and time.monotonic() - pause_t0 < a.settle:
                 ev("settle_skip", dx=round(dx_p, 1), vt_seq=int(s["seq"]))
                 walls = []
@@ -611,7 +675,8 @@ def main(argv: list[str] | None = None) -> int:
                geom=int(s.get("frame_geom") or 0), n_vt=len(s.get("walls", [])),
                n_used=len(extras), player=s.get("player"),
                player_dx=None if _pv[0] is None else round(float(_pv[0]) - px, 1),
-               cand=[[round(e[0], 1), round(e[1], 1), round(e[2], 1)] for e in extras[:6]])
+               cand=[[round(e[0], 1), round(e[1], 1), round(e[2], 1)] for e in extras[:6]],
+               lag_ms=lag_ms, py_used=round(py_cap, 1))
             raw = list(extras)
             #: 已经进 known 的墙不再是"新墙"，否则恢复运动后立刻又被同一批触发暂停。
             #: 触发"停车测量"前先按**缺口身份**过滤：同一个缺口窗口（±25 px）我们
@@ -658,7 +723,8 @@ def main(argv: list[str] | None = None) -> int:
                 #: 板端 VT 2 Hz，单帧缺口偶尔整体偏几十像素：同一道墙要在 ≥2 帧里
                 #: 一致（y±25、缺口±15）才算数；等不到就退化成超时整批收下。
                 warmed = (time.monotonic() - t_start) >= a.warmup
-                agree = consensus(pause_seen, need=max(2, a.consensus_frames))
+                agree = consensus(pause_seen, need=max(2, a.consensus_frames),
+                                  tol_vy=a.tol_vy)
                 accept = agree if (warmed and waited >= 0.9 and agree) else []
                 if force_fix:
                     fixed = 0

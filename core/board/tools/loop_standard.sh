@@ -94,7 +94,9 @@ echo "== 5. 开跑（标准参数）=="
 # 参数对照（改任何一条都要重跑并留 run log 作证据，见 AGENTS.md R4）：
 #   场景     20 道墙、dy=140、seed 固定
 #   速度     0.5×（1 s 仿真 = 2 s 墙钟）
-#   相机     ffmpeg 640x480 → fps=12 → 320x240 → 板端 vt_sparse
+#   相机     ffmpeg 640x480 → fps=12 → **640x480**（不再降到 320：页面 1:1，
+#            墙从 3 px 高变 6 px 高，行定位抖动砍半）+ 锁曝光/白平衡
+#   共识     8 帧取中位数，tol-vy 16（实测静止重复性 1σ≈8，卡 7 会剔掉一半好帧）
 #   标定     data/fpga/calib_y.json（scale 0.9632 / bias 5.266）
 #   决策     板端 field_cli_board（Dijkstra），障碍只来自已学到的墙
 #   暂停     settle 0.65 s / 单次暂停上限 1.5 s
@@ -107,8 +109,8 @@ exec "$PY" -u core/board/tools/platform_host.py \
     --fiducial-side 28 --fiducial-anchor band --frame-px 2 --field-every 5 \
     --board-ssh "$BOARD" --ssh-key "$KEY" \
     --board-agent /root/tools/board_agent.py --board-python python3 \
-    --board-extra "--from-end --verbose --consensus-frames 2 --settle 0.65 --pause-timeout 1.5" \
+    --board-extra "--from-end --verbose --consensus-frames 8 --tol-vy 16 --settle 1.0 --pause-timeout 3.5" \
     --connect-timeout 90 \
     --calib "$CALIB_LOCAL" --calib-board /tmp/calib_y.json --quad-tol 6 \
     --viewer --viewer-pos 320,60 --viewer-size 1280x960 --viewer-margin 0 \
-    --cam-vt-bin /root/tools/vt_sparse --cam-fps 12
+    --cam-vt-bin /root/tools/vt_sparse --cam-fps 12 --cam-w 640 --cam-h 480

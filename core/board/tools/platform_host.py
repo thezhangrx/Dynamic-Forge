@@ -300,7 +300,7 @@ class SshLink:
 
 def start_camera_pipe(target: str, key: str, extra: str = "",
                       vt_bin: str = "/root/tools/vt_board",
-                      fps: float = 2.0) -> dict:
+                      fps: float = 2.0, cam_w: int = 320, cam_h: int = 240) -> dict:
     """在板子上拉起相机管线：ffmpeg 抓 /dev/video0 → vt_board（VT 在板端）。
 
     **板端决策的输入只能是这条链路**（用户硬规则）。同时写 /tmp/vt_source=camera，
@@ -312,15 +312,18 @@ def start_camera_pipe(target: str, key: str, extra: str = "",
         #: 这条命令是**通过 ssh 传过去的一整行**，remote bash 自己的 cmdline 里就
         #: 含有 "/root/tools/vt_sparse" 和 "ffmpeg"，用 -f 会把自己杀掉 ——
         #: 表现就是"管线没起来，而且一点输出都没有"（排查过一次，记在这里）。
-        'pkill -x vt_board; pkill -x vt_sparse; pkill -x ffmpeg; sleep 0.3; '
+        #: 预览服务（mjpeg_server.py）会一直占着 /dev/video0，必须一起停，
+        #: 否则管线起来只能拿到 "Device or resource busy"（实测 acc1 就这么空跑）。
+        'pkill -f "[m]jpeg_server.py"; pkill -x vt_board; pkill -x vt_sparse; '
+        'pkill -x ffmpeg; sleep 0.3; '
         'rm -f /tmp/vt.jsonl /tmp/cam.jpg; '
         'nohup bash -c \'ffmpeg -hide_banner -loglevel error '
         '-fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 '
         '-f v4l2 -input_format mjpeg -video_size 640x480 -i /dev/video0 '
-        f'-filter_complex "fps={fps:g},scale=320:240,split=2[a][b]" '
+        f'-filter_complex "fps={fps:g},scale={cam_w}:{cam_h},split=2[a][b]" '
         '-map "[a]" -f rawvideo -pix_fmt rgb24 - '
         '-map "[b]" -update 1 -q:v 5 -y /tmp/cam.jpg '
-        f'| {vt_bin} --w 320 --h 240 --frame-roi 0 0 320 240 '
+        f'| {vt_bin} --w {cam_w} --h {cam_h} --frame-roi 0 0 {cam_w} {cam_h} '
         '--quad-file /tmp/quad.json --quad-state /tmp/qb.txt '
         '--jsonl /tmp/vt.jsonl %s >/dev/null\' '
         '>/tmp/campipe.log 2>&1 & '
@@ -523,6 +526,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="板端 VT 可执行文件（A/B：vt_board 稠密 / vt_sparse 稀疏）")
     ap.add_argument("--cam-fps", type=float, default=2.0,
                     help="相机降采样后的 VT 帧率（决策新鲜度上限）")
+    ap.add_argument("--cam-w", type=int, default=320,
+                    help="VT 输入宽度。**精度与它强相关**：页面是 640 宽，"
+                         "喂 320 等于每个页面像素只剩 0.41 个输入像素，墙只有 3 px 高，"
+                         "行定位抖动 ±8；喂 640 抖动减半、缺口边界更稳（实测）")
+    ap.add_argument("--cam-h", type=int, default=240, help="VT 输入高度")
     a = ap.parse_args(argv)
 
     spec = ScenarioSpec.load(a.scenario)
@@ -659,7 +667,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if a.board_ssh and a.start_camera_pipe:
         _cam = start_camera_pipe(a.board_ssh, a.ssh_key, extra=a.vt_board_extra,
-                                 vt_bin=a.cam_vt_bin, fps=a.cam_fps)
+                                 vt_bin=a.cam_vt_bin, fps=a.cam_fps,
+                                 cam_w=a.cam_w, cam_h=a.cam_h)
         print(f"  相机管线: {_cam}", file=sys.stderr)
         if not _cam.get("ok"):
             print("  ⚠ 相机管线没起来：板端会没有图像，本轮不会产生有效决策",
@@ -719,6 +728,61 @@ def main(argv: list[str] | None = None) -> int:
     min_clear: float | None = None
     min_clear_at: list | None = None
     abort_reason = None
+    if a.board_ssh:
+        #: **开跑前闸门：板端 VT 到底看清页面没有？**
+        #: 残留在最前面的终端窗口会让相机拍一串文字：VT 会报出一堆"没有缺口"的行、
+        #: 角色恒 null，而主机这边照样把板子盲开的动作执行到底 —— 结果就是一次
+        #: 假"到达"（acc3：21.5 s 冲到终点、min_clearance −10、add_wall 0）。
+        #: 判据：最近 30 帧里至少 5 帧同时有"带缺口的墙"和"角色"，否则拒跑。
+        _ssh_gate = ["ssh", "-i", a.ssh_key, "-o", "StrictHostKeyChecking=no",
+                     "-o", "ConnectTimeout=8", a.board_ssh]
+        ok_seen = 0
+        detail = ""
+        t_gate = time.monotonic()
+        while time.monotonic() - t_gate < 25.0:
+            try:
+                res = _sp.run(
+                    _ssh_gate + ["tail -n 40 /tmp/vt.jsonl"],
+                    capture_output=True, timeout=15)
+                lines = [ln for ln in (res.stdout or b"").decode("utf-8", "ignore").splitlines()
+                         if ln.strip().startswith("{")]
+            except (OSError, _sp.SubprocessError):
+                lines = []
+            ok_seen = 0
+            for ln in lines[-30:]:
+                try:
+                    rec = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("walls") and rec.get("player"):
+                    ok_seen += 1
+            if ok_seen >= 5:
+                break
+            detail = f"最近 {len(lines)} 帧里只有 {ok_seen} 帧同时有墙+角色"
+            time.sleep(1.0)
+        if ok_seen < 5:
+            print(f"\n  ✗ 拒跑：相机没看到平台页面（{detail}）。", file=sys.stderr)
+            print("    常见原因：平台窗口被终端/浏览器盖住、窗口跑到屏幕外、"
+                  "或预览服务还占着 /dev/video0。", file=sys.stderr)
+            print("    先确认 http://192.168.137.242:8099/ 里能看到页面再重跑。",
+                  file=sys.stderr)
+            abort_early = "camera_not_seeing_page"
+        else:
+            abort_early = None
+            print(f"  ✓ 相机闸门通过：最近 30 帧里 {ok_seen} 帧同时有墙+角色",
+                  file=sys.stderr)
+    else:
+        abort_early = None
+
+    if abort_early is not None:
+        _sum = {"tag": a.tag, "aborted": abort_early, "decision_source": "camera",
+                "reached": False, "collisions": 0,
+                "note": "开跑前闸门拦下：相机看不到页面，本轮不产生任何决策结论"}
+        Path(run_dir / "summary.json").write_text(
+            json.dumps(_sum, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"  已写 {run_dir / 'summary.json'}", file=sys.stderr)
+        return 3
+
     if not a.board_ssh:
         print("  等板子连 TCP ...", file=sys.stderr)
     prof = {"it": 0, "step": 0.0, "page": 0.0, "field": 0.0, "t": time.monotonic()}
