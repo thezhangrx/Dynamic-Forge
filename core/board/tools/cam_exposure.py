@@ -18,8 +18,21 @@
     Env/bin/python core/board/tools/cam_exposure.py --apply    # 顺便锁到相机上
     Env/bin/python core/board/tools/cam_exposure.py --settle-only   # 只恢复自动曝光
 
-结果写 `data/fpga/cam_exposure.json`；`loop_standard.sh` / `start_cam.sh` 会优先用它
-（`CAM_CTRL_LOCK=1 EXPOSURE_ABS=<值>`）。
+实测结论（2026-10-21，页面在屏时逐档测量）：
+
+    曝光   10     20     35     60    100    200
+    中位  197    218    242    254    255    255
+    p10   156    174    195    222    250    255
+
+也就是说**手动曝光的最小档(10) 都比自动曝光收敛值亮 5 倍以上**（自动时中位≈85）。
+这台相机靠手动锁曝光得不到"暗场地"，因此本项目的结论是：
+**保持自动曝光（exposure_auto=3），不要去锁**；亮度变化交给 VT 的结构化判据
+（墙是画面里最亮的那一簇、缺口比两侧暗），不要用绝对阈值。
+
+本工具仍然保留，用于：
+  * 判断"画面是不是过曝/全白"（中位 > 250 且墙占比 > 90% → 不可用）
+  * 换相机/换屏幕后重新量一次响应曲线
+结果写 `data/fpga/cam_exposure.json`（仅供参考，闭环不依赖它）。
 """
 from __future__ import annotations
 
@@ -43,12 +56,20 @@ def ssh(cmd: str, timeout: float = 40.0) -> bytes:
 
 
 def set_exposure(value: int | None) -> None:
+    """设置曝光。**必须先清 exposure_auto_priority**，否则手动值被驱动忽略。
+
+    实测：这个 UVC 头默认 `exposure_auto_priority=1`，此时无论把
+    exposure_absolute 设成 8 还是 90，出来的画面一模一样（都跟自动曝光收敛值
+    相同）——我第一次搜索就是被这个坑成"所有候选都一样亮"的。
+    """
     if value is None:
-        ssh("v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto=3 2>/dev/null; "
+        ssh("v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto_priority=0 2>/dev/null; "
+            "v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto=3 2>/dev/null; "
             "v4l2-ctl -d /dev/video0 --set-ctrl=white_balance_temperature_auto=1 2>/dev/null; "
             "echo ok")
         return
-    ssh(f"v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto=1 "
+    ssh("v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto_priority=0 2>/dev/null; "
+        f"v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto=1 "
         f"--set-ctrl=exposure_absolute={value} 2>/dev/null; echo ok")
 
 
@@ -88,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="自动挑相机曝光（让暗场地/亮墙对比最大）")
     ap.add_argument("--apply", action="store_true", help="把选中值锁到相机上")
     ap.add_argument("--settle-only", action="store_true", help="只恢复自动曝光")
-    ap.add_argument("--candidates", default="8,15,25,40,60,90",
+    ap.add_argument("--candidates", default="10,20,35,60,100,200",
                     help="候选曝光值（逗号分隔，粗搜即可）")
     a = ap.parse_args(argv)
 

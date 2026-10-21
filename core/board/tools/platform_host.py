@@ -360,6 +360,23 @@ def start_camera_pipe(target: str, key: str, extra: str = "",
         return {"ok": False, "error": repr(exc)}
 
 
+def stop_camera_pipe(target: str, key: str) -> None:
+    """跑完把板端相机管线停掉。
+
+    为什么要有：管线是 nohup 起来的，platform_host 退出后它还活着、一直占着
+    /dev/video0 —— 下一次"标定/抓帧/预览"就会拿到 "Device or resource busy"
+    （实测：一个残留 ffmpeg 让曝光测量连续 3 次失败，排查了半天）。
+    """
+    import subprocess
+    try:
+        subprocess.run(["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
+                        "-o", "ConnectTimeout=8", target,
+                        "pkill -x vt_sparse; pkill -x vt_board; pkill -x ffmpeg; echo ok"],
+                       capture_output=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def quad_fingerprint(target: str, key: str) -> str:
     """抓板端白框四角状态当"相机/窗口是否动过"的指纹。"""
     import subprocess
@@ -1094,6 +1111,8 @@ def main(argv: list[str] | None = None) -> int:
                                                      indent=2) + "\n")
     log.close()
     print(json.dumps(summary, ensure_ascii=False, indent=2), file=sys.stderr)
+    if a.board_ssh:
+        stop_camera_pipe(a.board_ssh, a.ssh_key)
     print(f"  证据日志 {run_dir}", file=sys.stderr)
 
     time.sleep(a.hold)
