@@ -285,6 +285,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gap-margin", type=float, default=10.0)
     ap.add_argument("--state-file", default="/tmp/board_state.txt",
                     help="把发给决策的 @STATE 逐行落盘（事后核查墙覆盖率）")
+    ap.add_argument("--player-radius", type=float, default=10.0,
+                    help="角色半径（场地单位）；用于自动推 inflate 与余量判据")
     ap.add_argument("--player-tol", type=float, default=30.0,
                     help="VT 角色 x 与主机 px 偏差超过这个值 → 判为几何坏帧（整帧作废）")
     ap.add_argument("--warmup", type=float, default=2.5,
@@ -338,6 +340,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="板端结构化事件（JSONL）：VT 帧/pause/add_wall/fix/nudge/move")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
+    if a.inflate <= 0.0:
+        #: 自动：留 4 px 余量即可；再大就可能把"自己能过"的缺口判成过不去
+        a.inflate = float(a.player_radius) + 4.0
     #: 横向偏差的默认值归一（标定文件里没有就退回常数项/0）
     if a.x_bias_a is None:
         a.x_bias_a = float(a.x_bias)
@@ -518,6 +523,12 @@ def main(argv: list[str] | None = None) -> int:
         for d in known_detail:
             y = float(d["y"])
             gl = float(d["gl"]); gr = float(d["gr"])
+            #: **已经穿过去的墙不再当障碍发**：它的膨胀体（inflate）会盖住角色
+            #: 当前位置，导致"角色在障碍里"→ 没有可行路径 → 规划器永远回 0。
+            #: 实测 final2：卡在 y=554.5 时 @STATE 里还带着 371/423.5/533.3 三道
+            #: 身后的墙，inflate 26 把它们各自膨胀成几十像素厚，直接把角色包住。
+            if y < py - 2.0 * pr:
+                continue
             if gl > 4.0:
                 obs.append(f"{gl * 0.5:.1f} {y:.1f} {gl * 0.5:.1f} 4.0 0.0")
             if gr < 636.0:
@@ -651,41 +662,32 @@ def main(argv: list[str] | None = None) -> int:
             #: （实测 s1e：t=2.42 在 wall@360 上 -10）。这条互锁不看真值、不看
             #: 场景参数，只用板端自己的观测：只要前方有未测明的墙，就发 0 等测。
             _ngy = s.get("no_gap_y") or []
-            #: **绝不许朝"没量过缺口的墙"前进**（互锁，不依赖任何阈值）。
-            #: 之前那一版有两个错：
-            #:   ① 把 no_gap_y 的**页面坐标**直接和**世界 py** 比大小 —— 量纲不对，
-            #:      互锁形同虚设；实测 s2b 第一道墙 wall@80 被盲穿（余量 −10）。
-            #:   ② 用"可刹停距离"做阈值 —— v≈0 时永远不触发，开局正好最危险。
-            #: 现在的规则不需要阈值：把"已知墙"和"看见但没量出缺口的墙"都换算成
-            #: 世界 y，取**最近的一道在前方的墙**；只要最近那道是"没量过的"，就停。
+            #: **前方任何"看得见但还没入表"的墙 → 不许前进**（互锁，无阈值）。
+            #: 判据只用板端自己的观测：把本帧"有缺口的墙"和"看得见但量不出缺口的行"
+            #: 都换算成世界 y，凡是"在后方 10 单位以上、且已知表里没有另一道 y 相近的墙"
+            #: 的，都算"未记录"，一律停住等它被测出来。
+            #: 之前的版本只检查 no_gap_y，漏掉了"VT 能测到、但 agent 还没接受"的墙 ——
+            #: 实测 fix4 就是这样在 t=0.67 s 盲穿了第一道墙（y=82，−10）。
             def _w(vy: float) -> float:
                 return vt_world_y(vy, py, half, a.y_scale, a.y_bias, a.field_h, a.y_qc)
 
-            _nearest_known = min((k for k in known if k > py + 10.0), default=None)
-            _nearest_unknown = None
+            _vis: list[float] = []
+            for _wall in (s.get("walls") or []):
+                try:
+                    _vis.append(_w(float(_wall.get("y", 0.0))))
+                except (TypeError, ValueError):
+                    pass
             for _y in _ngy:
                 try:
-                    _wy = _w(float(_y))
+                    _vis.append(_w(float(_y)))
                 except (TypeError, ValueError):
-                    continue
-                if _wy > py + 10.0 and (_nearest_unknown is None or _wy < _nearest_unknown):
-                    _nearest_unknown = _wy
-            #: **开局也不许盲走**：在学到"前方某道墙的缺口"之前一律不动。
-            #: 实测 fix1/full1：开局还在测量，CLI 的第一条动作就发出去了，
-            #: 0.23 s 就穿过第一道墙（y=76.6，min_clearance −10，审计判 blind）。
-            if _nearest_known is None or (_nearest_unknown is not None
-                                          and _nearest_unknown < _nearest_known - 5.0):
-                if not lock_state["unknown_ahead"]:
-                    lock_state["block_t0"] = time.monotonic()
-                lock_state["unknown_ahead"] = 1
-                #: `_nearest_unknown` 可能是 None（"还没有任何已知墙"这条分支），
-                #: 直接 round() 会让 agent 一启动就崩（实测 fix2/诊轮：0 事件、
-                #: 平台不动）。这里必须防 None。
-                lock_state["blocked_at"] = (None if _nearest_unknown is None
-                                            else round(_nearest_unknown, 1))
-            else:
-                lock_state["unknown_ahead"] = 0
-                lock_state["blocked_at"] = None
+                    pass
+            _unrecorded = [v for v in _vis
+                           if v > py + 10.0
+                           and not any(abs(v - k) <= row_tol() for k in known)]
+            lock_state["unknown_ahead"] = 1 if _unrecorded else 0
+            lock_state["blocked_at"] = (round(min(_unrecorded), 1)
+                                        if _unrecorded else None)
             pv = s.get("player")
             dx_p = None if pv is None else float(pv[0]) - px
             #: 竖直方向的"帧新鲜度"：页面**不做夹取**，它永远把角色画在可见带
