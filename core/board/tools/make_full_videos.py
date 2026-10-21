@@ -3,7 +3,7 @@
 
 产出（写到 <run_dir>/videos/）：
   1. camera_vt.mp4   **[真实相机 | 板端视觉 VT]** 左右并排 + 暂停横幅
-     左：板端 /dev/video0 实拍（/tmp/cam_rec.mp4，从管线启动录到结束）
+     左：板端 /dev/video0 实拍（/tmp/cam_rec.mkv，从管线启动录到结束）
      右：板端 VT 自己输出的墙/缺口/角色（board_vt.jsonl，不含任何真值）
      横幅：该时刻主机动作=0（板端在停/暂停测量）时显示
   2. field.mp4       **用虚拟真值渲染势场**（record_field_video.py 的同一套算法，
@@ -107,10 +107,10 @@ def main(argv: list[str] | None = None) -> int:
     # ---------- 1. 相机录像 ----------
     cam_path = out / "camera_raw.mp4"
     got = subprocess.run(["scp", "-q", "-o", "StrictHostKeyChecking=no",
-                          "-i", KEY, f"{BOARD}:/tmp/cam_rec.mp4", str(cam_path)],
+                          "-i", KEY, f"{BOARD}:/tmp/cam_rec.mkv", str(cam_path)],
                          capture_output=True)
     if got.returncode != 0 or not cam_path.exists():
-        print("⚠ 板端没有 /tmp/cam_rec.mp4（本轮没开 --cam-record）", file=sys.stderr)
+        print("⚠ 板端没有 /tmp/cam_rec.mkv（本轮没开 --cam-record）", file=sys.stderr)
         cam_path = None
 
     # ---------- 2. camera_vt：左相机 / 右 VT ----------

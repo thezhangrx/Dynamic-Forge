@@ -252,6 +252,15 @@ int main(int argc, char** argv) {
         std::vector<double> no_gap_y;   //: 有墙但量不出缺口的行（下游据此"不许前进"）
         for (const auto& b : bands) {
             if (b[1] - b[0] + 1 < 4) continue;            // 单像素/白框线多半是网格线
+            //: **太高的"亮行带"不是墙，是屏幕反光/灯斑**（2026-10-21 实测）：
+            //: 页面上的墙是 6 px 厚，经相机辉光后在 640×480 里是 19~26 行高；
+            //: 而屏幕上的反光带是 60+ 行高的大块亮区。不丢它的话，反光带会被
+            //: 当成一道墙，而且它在**页面坐标里是固定的**（反光贴在屏幕上），
+            //: 于是随平台前进不断被记成"正前方 50~150 单位处的新墙"：
+            //: r4/r5 的 842/861/876、r10 的 3356.9（真墙 3300，偏 +57，把终点
+            //: 挡在墙后 → 规划器永远回 0）都是这么来的。墙上限取 34 行，
+            //: 真墙 26 行留了余量，反光 60+ 行必丢。
+            if (b[1] - b[0] + 1 > 34) continue;
             //: 亚像素质心：带子 [b0-2, b1+2] 内按 row_ev 加权（连续、抗阈值抖动）
             double wsum = 0.0, wrow = 0.0;
             for (int r = std::max(0, b[0] - 2); r <= std::min(FH - 1, b[1] + 2); ++r) {
@@ -312,115 +321,109 @@ int main(int argc, char** argv) {
             if (!o.gap) no_gap_y.push_back(o.y);
         }
 
-        // ---- 角色：二维稀疏网格找"孤立白点" ----------------------------
-        //: 1 维行剖面找角色不稳：白点只有 ~20px，24 列的采样步长 27px，常常
-        //: 落在两列之间；行端/白框附近又会被误判。这里改成两步：
-        //:   ① 在 (GX × GY) 的粗网格上采样亮度+中性度（墙是暖白 |g-b|≈40，
-        //:      角色是纯白 |g-b|≤25，中性度就能把两者分开）；
-        //:   ② 去掉墙带内的行、去掉页面白框边缘，做连通域，取"尺寸像点"的那块。
-        const int GX = 53, GY = 60;                 // 步长 12 × 8 px
-        const int band_tol_rows = 10;
-        std::vector<int> band_rc;
-        for (const auto& b : bands)
-            if (b[1] - b[0] + 1 >= 4) band_rc.push_back((b[0] + b[1]) / 2);
-        std::vector<uint8_t> gmask(static_cast<size_t>(GX) * GY, 0);
-        std::vector<int> gx(static_cast<size_t>(GX) * GY, 0);
-        std::vector<int> gy(static_cast<size_t>(GX) * GY, 0);
-        const int pthr = std::max(thr, 165);
-        for (int j = 0; j < GY; ++j) {
-            const int rr_ = 8 + j * (FH - 16) / (GY - 1);
-            if (rr_ < 10 || rr_ > FH - 11) continue;  // 页面白框
-            bool near_band = false;
-            for (int rc : band_rc)
-                if (std::abs(rr_ - rc) <= band_tol_rows) { near_band = true; break; }
-            if (near_band) continue;
-            const double py_page = FH - (rr_ + 0.5);
-            for (int i = 0; i < GX; ++i) {
-                const int cc = 8 + i * (FW - 16) / (GX - 1);
-                const auto q = inv.apply(cc + 0.5, py_page);
-                int r_, g_, b_;
-                sample_bilinear(base, bw, bh, q[0], q[1], &r_, &g_, &b_);
-                if (luma(r_, g_, b_) < pthr) continue;
-                if (std::abs(r_ - g_) > 30 || std::abs(g_ - b_) > 32) continue;
-                const size_t idx = static_cast<size_t>(j) * GX + i;
-                gmask[idx] = 1;
-                gx[idx] = cc;
-                gy[idx] = rr_;
-            }
-        }
+        // ---- 角色：圆盘-环带匹配滤波（不依赖绝对亮度）--------------------
+        //: 以前的判据是"绝对亮度 ≥ max(Otsu,165)"。曝光/环境光一变（这台相机的
+        //: AE 会收敛到"场地中位数 150+"的状态），整个场地都过阈值，白点被并进
+        //: 一大块连通域里 → 角色恒为 null（实测 r2：30/40 帧有墙、有角色 0 帧，
+        //: 闸门直接拒跑）。白点的**结构**特征跟亮度无关：一个 ~20px 的圆盘，
+        //: 四周一圈是暗场地。所以用"圆盘均值 − 环带均值"的匹配滤波来量：
+        //:   * 墙是长条，端点虽然也有响应，但只有白点的 1/2（实测 36 vs 68）；
+        //:   * 角色恒在页面正中（跟随视口），搜索窗只需要 ±96 px。
+        //: 判据是**对比度**（disc−ring > 25 灰度），不是绝对亮度 —— 面板亮、
+        //: 场地被 AE 抬到 150 时照样能量出来。
         bool pfound = false;
         double px = 0, py = 0;
         {
-            std::vector<int> seen(static_cast<size_t>(GX) * GY, 0);
-            int best_n = 0, best_cx = 0, best_cy = 0;
-            for (int j0 = 0; j0 < GY; ++j0) {
-                for (int i0 = 0; i0 < GX; ++i0) {
-                    const size_t s0 = static_cast<size_t>(j0) * GX + i0;
-                    if (!gmask[s0] || seen[s0]) continue;
-                    //: BFS（4 邻域）取一块连通域
-                    std::vector<size_t> q_{s0};
-                    seen[s0] = 1;
-                    int n = 0, x0 = 1 << 30, x1 = -1, y0 = 1 << 30, y1 = -1;
-                    long sx = 0, sy = 0;
-                    for (size_t k = 0; k < q_.size(); ++k) {
-                        const size_t cur = q_[k];
-                        const int ci = static_cast<int>(cur % GX);
-                        const int cj = static_cast<int>(cur / GX);
-                        ++n;
-                        sx += gx[cur]; sy += gy[cur];
-                        x0 = std::min(x0, gx[cur]); x1 = std::max(x1, gx[cur]);
-                        y0 = std::min(y0, gy[cur]); y1 = std::max(y1, gy[cur]);
-                        const int di[4] = {1, -1, 0, 0}, dj[4] = {0, 0, 1, -1};
-                        for (int kd = 0; kd < 4; ++kd) {
-                            const int ni = ci + di[kd], nj = cj + dj[kd];
-                            if (ni < 0 || ni >= GX || nj < 0 || nj >= GY) continue;
-                            const size_t nx = static_cast<size_t>(nj) * GX + ni;
-                            if (!gmask[nx] || seen[nx]) continue;
-                            seen[nx] = 1;
-                            q_.push_back(nx);
-                        }
-                    }
-                    //: 角色的粗网格 bbox ≈ 20~24 px 宽、20 px 高（允许 8..64）
-                    const int wpx = x1 - x0 + 12, hpx = y1 - y0 + 8;
-                    if (wpx < 8 || wpx > 64 || hpx < 8 || hpx > 64) continue;
-                    if (n > best_n) { best_n = n; best_cx = static_cast<int>(sx / n);
-                                      best_cy = static_cast<int>(sy / n); }
+            constexpr double R_D = 9.0;        // 白点半径（页面 px）
+            constexpr double R0 = 15.0, R1 = 22.0;   // 环带 = 场地
+            constexpr double MIN_RESP = 25.0;  // 对比度门槛（灰度）
+            struct Off { double x, y; };
+            std::vector<Off> disc, ring;
+            for (int dy = -22; dy <= 22; dy += 2) {
+                for (int dx = -22; dx <= 22; dx += 2) {
+                    const double r = std::sqrt(static_cast<double>(dx * dx + dy * dy));
+                    if (r <= R_D) disc.push_back({static_cast<double>(dx), static_cast<double>(dy)});
+                    else if (r >= R0 && r <= R1) ring.push_back({static_cast<double>(dx), static_cast<double>(dy)});
                 }
             }
-            //: **角色必须在页面正中附近**：本闭环的跟随视口把角色画在视口正中，
-            //: 所以页面坐标里角色恒为 (320,240)。实测不加这道闸时，角色检测会被
-            //: 墙段/白框拐角骗走，报出 px 偏 ±300 的点，下游用它算"帧有多旧"
-            //: 就会把墙 y 映射偏 200 单位 → 多帧再也不会一致 → 一道墙都学不到。
-            const bool centered = (best_n >= 1) && !player_free;
-            if (centered) {
-                if (std::abs(best_cx - FW / 2) > 110 || std::abs(best_cy - FH / 2) > 110) {
-                    if (dbg_player) std::fprintf(stderr, "player_reject center=%d,%d\n",
-                                                 best_cx, best_cy);
-                    best_n = 0;
-                }
-            }
-            if (best_n >= 1) {
-                //: 用中心那一行全宽扫一遍，取 8~48 px 亮段中点 = 白点中心（精确到 1 px）
-                const double py_page = FH - (best_cy + 0.5);
-                int st = -1, best_w2 = 0, best_c2 = -1;
-                for (int x = 0; x < FW; ++x) {
-                    const auto q = inv.apply(x + 0.5, py_page);
+            auto resp = [&](double cx, double cy) -> double {
+                double sd = 0.0, sr = 0.0;
+                for (const auto& o : disc) {
                     int r_, g_, b_;
-                    sample_bilinear(base, bw, bh, q[0], q[1], &r_, &g_, &b_);
-                    const bool bright = luma(r_, g_, b_) >= pthr &&
-                                        std::abs(r_ - g_) <= 30 && std::abs(g_ - b_) <= 32;
-                    if (bright && st < 0) st = x;
-                    if ((!bright) && st >= 0) {
-                        const int wd = x - st;
-                        if (wd >= 8 && wd <= 48 && wd > best_w2) { best_w2 = wd; best_c2 = (st + x) / 2; }
-                        st = -1;
-                    }
+                    sample_bilinear(base, bw, bh, cx + o.x, cy + o.y, &r_, &g_, &b_);
+                    sd += luma(r_, g_, b_);
                 }
-                pfound = true;
-                px = (best_c2 >= 0) ? best_c2 : best_cx;
-                py = py_page;
+                for (const auto& o : ring) {
+                    int r_, g_, b_;
+                    sample_bilinear(base, bw, bh, cx + o.x, cy + o.y, &r_, &g_, &b_);
+                    sr += luma(r_, g_, b_);
+                }
+                return sd / static_cast<double>(disc.size())
+                     - sr / static_cast<double>(ring.size());
+            };
+            const auto c_img = inv.apply(FW * 0.5, FH * 0.5);
+            const double WIN = 96.0;
+            double best = -1e9, bx = c_img[0], by = c_img[1];
+            //: 粗扫 4 px，再在最优附近细扫 1 px
+            for (double oy = -WIN; oy <= WIN; oy += 4.0) {
+                for (double ox = -WIN; ox <= WIN; ox += 4.0) {
+                    const double v = resp(c_img[0] + ox, c_img[1] + oy);
+                    if (v > best) { best = v; bx = c_img[0] + ox; by = c_img[1] + oy; }
+                }
             }
+            const double fx = bx, fy = by;
+            for (double oy = -4.0; oy <= 4.0; oy += 1.0) {
+                for (double ox = -4.0; ox <= 4.0; ox += 1.0) {
+                    const double v = resp(fx + ox, fy + oy);
+                    if (v > best) { best = v; bx = fx + ox; by = fy + oy; }
+                }
+            }
+            //: 形状复核：墙的**端点**也是一个亮团，端点响应实测 36（白点 68）。
+            //: 白点 ~20px 见方；墙段只有 6~10 px 高、几十~上百 px 长。所以量一下
+            //: 亮团的宽高（阈值取圆盘与环带均值的中点），宽高都得像"点"才认。
+            bool shape_ok = false;
+            if (best >= MIN_RESP) {
+                int r_, g_, b_;
+                double sd = 0.0, sr = 0.0;
+                for (const auto& o : disc) {
+                    sample_bilinear(base, bw, bh, bx + o.x, by + o.y, &r_, &g_, &b_);
+                    sd += luma(r_, g_, b_);
+                }
+                for (const auto& o : ring) {
+                    sample_bilinear(base, bw, bh, bx + o.x, by + o.y, &r_, &g_, &b_);
+                    sr += luma(r_, g_, b_);
+                }
+                const double dm = sd / static_cast<double>(disc.size());
+                const double rm = sr / static_cast<double>(ring.size());
+                const double lvl = 0.5 * (dm + rm);
+                auto bright = [&](double x, double y) -> bool {
+                    int a_, c_, d_;
+                    sample_bilinear(base, bw, bh, x, y, &a_, &c_, &d_);
+                    return luma(a_, c_, d_) >= lvl;
+                };
+                int wl = 0, wr = 0, wu = 0, wd = 0;
+                while (wl < 30 && bright(bx - wl - 1, by)) ++wl;
+                while (wr < 30 && bright(bx + wr + 1, by)) ++wr;
+                while (wu < 30 && bright(bx, by - wu - 1)) ++wu;
+                while (wd < 30 && bright(bx, by + wd + 1)) ++wd;
+                const int wpx = wl + wr + 1, hpx = wu + wd + 1;
+                const double ar = static_cast<double>(wpx) / static_cast<double>(hpx);
+                shape_ok = (wpx >= 12 && wpx <= 44 && hpx >= 12 && hpx <= 44
+                            && ar >= 0.5 && ar <= 2.0);
+                if (dbg_player)
+                    std::fprintf(stderr, "player_shape w=%d h=%d lvl=%.0f\n", wpx, hpx, lvl);
+            }
+            if (shape_ok) {
+                const auto pg = H.apply(bx, by);   // 图像坐标 → 页面坐标
+                pfound = true;
+                px = pg[0];
+                py = pg[1];
+            }
+            if (dbg_player)
+                std::fprintf(stderr, "player_resp=%.1f at img(%.0f,%.0f)\n",
+                             best, bx, by);
         }
+
 
         // ---- 输出 -------------------------------------------------------
         if (jf) {

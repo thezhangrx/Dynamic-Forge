@@ -330,6 +330,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pause-timeout", type=float, default=4.0,
                     help="一次暂停最多等这么久；VT 越快这个值越该小（现在 6 fps"
                          "下 consensus 通常 <0.5 s 就够，4 s 会把整轮时间全吃掉）")
+    ap.add_argument("--vt-latency", type=float, default=0.6,
+                    help="画面链路延时（秒）：相机曝光+ffmpeg+页面推流+板端读取。"
+                         "实测 0.6 s（A/B 换画面测出来的），见 docs/闭环标准配置.md")
     ap.add_argument("--settle", type=float, default=0.9,
                     help="暂停后等多久再收候选帧（VT 有 ~0.5 s 延迟）")
     ap.add_argument("--from-end", action="store_true",
@@ -429,10 +432,16 @@ def main(argv: list[str] | None = None) -> int:
         最小值）。容差取行间距的 1/3 与 6σ_y 的较小者，保证既不会把两道墙
         合成一道，也不会把同一道墙的两次测量当成两道。
         """
+        #: 2026-10-21 实测：板端墙行的**单次测量误差**不是 1~2 px —— 亮屏/灯斑
+        #: 条件下同一道墙偶尔会被量到 27~29 px 之外（r8：528.2/665.7/947.4 三道
+        #: 都是"真墙 +28"）。原来 6σ_y（≈18）的容差把这种测量当成了**另一道新墙**，
+        #: 于是同一道物理墙在表里出现两次（r4 出现过五道），规划器判"走廊全堵"
+        #: 停住，审计也把它们判成"盲穿"。容差取 12σ_y（实测 ≈25~30），既能把
+        #: 同一道墙的两次测量并成一道，又远小于真墙间距（140）的 1/3。
         ys = sorted(known)
         gaps = [b - a for a, b in zip(ys, ys[1:]) if b - a > 8.0]
         spacing = min(gaps) if gaps else 140.0
-        return max(6.0, min(spacing / 3.0, 6.0 * sig_y))
+        return max(12.0, min(spacing / 3.0, 12.0 * sig_y))
     seq = 0
     last_act = 0
     last_vt_seq = -1
@@ -590,6 +599,14 @@ def main(argv: list[str] | None = None) -> int:
                 link.send_move(act)
                 if changed:
                     ev("move_sent", act=int(act), src="cli")
+            elif paused and time.monotonic() >= nudge_until:
+                #: **暂停期间持续压住**：只在暂停那一刻发一次 0 是不够的 ——
+                #: 决策进程还会继续吐 @MOVE，读者线程和主线程抢着发，最后一条
+                #: 常常是"继续走"，于是"停住测量"变成了"边走边测"。实测 r8：
+                #: 同一批里两道墙都偏 +26~28 单位（画面是 1.5 s 前的位置），
+                #: 墙表里就多出 528/665 这种"错一行"的墙，审计判成盲穿。
+                #: 每来一条决策就补一个 0，代价是几条 TCP 小包。
+                link.send_move(0)
 
     threading.Thread(target=reader, daemon=True).start()
     print(f"  board agent: vt={a.vt_jsonl} host={a.host}:{a.port} "
@@ -714,7 +731,13 @@ def main(argv: list[str] | None = None) -> int:
             py_cap = py
             contemporaneous = True
             if t_fr is not None:
-                _py_at = py_at(float(t_fr))
+                #: **画面链路延时补偿**：`s["t"]` 是板端"读到这一帧"的时刻，而帧里
+                #: 的画面是更早 0.6 s 拍的（相机曝光→ffmpeg→页面推流→查看器）。
+                #: 实测这段延时 ≈0.6 s：平台 58 单位/s，不补偿就是 **+29 单位/道墙**
+                #: 的系统误差 —— 同一道墙在 y=795 被记成 943.8（+19），r4/r5/r7 的
+                #: "走廊全堵→规划器停住"全是这么来的。静止时这段补偿是 0（位姿不变），
+                #: 所以它对"停稳再测"那条纪律没有任何副作用。
+                _py_at = py_at(float(t_fr) - float(a.vt_latency))
                 if _py_at is not None:
                     py_cap = float(_py_at)
                     lag_ms = round((now_m - float(t_fr)) * 1000.0, 1)

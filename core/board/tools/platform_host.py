@@ -308,9 +308,16 @@ def start_camera_pipe(target: str, key: str, extra: str = "",
     板端 agent 会校验这个标记，synthetic 输入会被直接拒绝。
     """
     import subprocess
-    split = "split=3[a][b][c]" if record else "split=2[a][b]"
-    extra_map = ('-map "[c]" -c:v mpeg4 -q:v 3 -r 15 '
-                 '-movflags +frag_keyframe+empty_moov -y /tmp/cam_rec.mp4 '
+    #: **录像绝不能塞进滤波图里**（2026-10-21 实测的根因）：
+    #: 以前是 `-filter_complex "...split=3[a][b][c]"` + `-map "[c]" -c:v mpeg4`，
+    #: 三路输出共用同一张图 —— mpeg4 软件编码一慢，整张图就被拖住，喂给 VT 的
+    #: 那些帧是**几秒前**拍的（实测帧里画面对应 py≈711，而位姿已经到 798，
+    #: 差 87 单位 ≈ 6.7 s）。板子于是照着过时的画面规划：同一道墙在不同 py 被
+    #: 记成 346/359/398/417/427 五道，规划器判"走廊全堵"直接停住（r4/r5 都卡死）。
+    #: 现在录像走**独立的输出流**：`-map 0:v -c:v copy`，Mjpeg 直接拷封装，
+    #: 不解码、不进滤波图、不占 CPU。容器用 matroska（mp4 里塞 mjpeg 不稳）。
+    split = "split=2[a][b]"
+    extra_map = ('-map 0:v -c:v copy -r 12 -f matroska -y /tmp/cam_rec.mkv '
                  if record else '')
     cmd = (
         #: 注意：这里必须用 `pkill -x`（按进程名精确匹配）而不是 `pkill -f`。
@@ -325,6 +332,15 @@ def start_camera_pipe(target: str, key: str, extra: str = "",
         #: 整幅画面过曝全白、40 帧里 0 帧能测出墙（这台相机 exposure_absolute
         #: 的有效范围跟场景亮度强相关，拍屏幕时自动值远低于 200）。
         #: 需要固定参数时显式打开 CAM_CTRL_LOCK=1，并自己确认画面亮度正常。
+        #: **gamma 固定 100**（2026-10-21 实测）：这台相机的自动曝光会收敛到
+        #: "整幅发灰"的状态（场地中位数 150~170，墙/场地对比被压平），VT 的行带
+        #: 检测就会配到灯斑/反光上（实测 r4：墙行残差 p90 +38 px、16% 超过 20 px，
+        #: 同一道墙被记成 346/359/398/417/427 五道，规划器直接死锁）。
+        #: gamma 是**固定的色调曲线**，不随曝光变：gamma=120 时场地中位 112，
+        #: gamma=100 时 56、gamma=90 时 28（墙始终饱和在 254）。取 100 → 场地暗、
+        #: 墙亮，而且自动曝光在亮/暗两个吸引子上都能用。
+        'if command -v v4l2-ctl >/dev/null 2>&1; then '
+        'v4l2-ctl -d /dev/video0 --set-ctrl=gamma="${CAM_GAMMA:-100}" 2>/dev/null || true; fi; '
         'if [ "${CAM_CTRL_LOCK:-0}" = "1" ] && command -v v4l2-ctl >/dev/null 2>&1; then '
         'v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto=1 '
         '--set-ctrl=exposure_absolute="${EXPOSURE_ABS:-50}" '
@@ -566,7 +582,7 @@ def main(argv: list[str] | None = None) -> int:
                          "行定位抖动 ±8；喂 640 抖动减半、缺口边界更稳（实测）")
     ap.add_argument("--cam-h", type=int, default=240, help="VT 输入高度")
     ap.add_argument("--cam-record", action="store_true",
-                    help="把板端相机原始画面录一份 /tmp/cam_rec.mp4（给'相机视觉录像'用）")
+                    help="把板端相机原始画面录一份 /tmp/cam_rec.mkv（给'相机视觉录像'用）")
     a = ap.parse_args(argv)
 
     spec = ScenarioSpec.load(a.scenario)
@@ -836,7 +852,12 @@ def main(argv: list[str] | None = None) -> int:
             if _now - _last_pub >= 0.05:
                 _last_pub = _now
                 try:
-                    publisher.submit(page.render(env.world))
+                    _pg_img = page.render(env.world)
+                    publisher.submit(_pg_img)
+                    #: 闸门期间留一张"主机自己画出来的页面"做对照：
+                    #: 相机看到的东西和它不一致时，一眼就知道是渲染还是相机的事。
+                    if _pg_img is not None and not (run_dir / "gate_page.png").exists():
+                        cv2.imwrite(str(run_dir / "gate_page.png"), _pg_img)
                 except Exception:  # noqa: BLE001
                     pass
             try:
@@ -848,23 +869,81 @@ def main(argv: list[str] | None = None) -> int:
             except (OSError, _sp.SubprocessError):
                 lines = []
             ok_seen = 0
+            n_wall = 0
+            n_ply = 0
+            _last = {}
+            #: **闸门还要"稳"**：只数"有墙有角色"的帧是不够的 —— 相机刚上电时
+            #: AE 还在收敛，前 1~2 s 会报出"一行亮带 + 一个宽缺口"这种假墙
+            #: （实测 r6 开局就把 y=164.5 当成墙收进表里，规划器再也理不顺）。
+            #: 判据改成：最近 24 帧里要有 ≥12 帧的行带**签名一致**（行坐标 ±8 px），
+            #: 并且这些帧里角色也看得到 —— 只有收敛后的画面才能连续一致。
+            sigs: dict[tuple, list] = {}
+            recent = []
+            for ln in lines[-24:]:
+                try:
+                    rec = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                rows = tuple(sorted(round(float(w.get("y", 0.0)) / 8.0) * 8
+                                    for w in (rec.get("walls") or [])))
+                recent.append((rows, rec))
+            stable = 0
+            stable_rows: tuple = ()
+            for rows, _r in recent:
+                if not rows:
+                    continue
+                cnt = sum(1 for r2, _ in recent
+                          if len(r2) == len(rows)
+                          and all(abs(a - b) <= 8 for a, b in zip(r2, rows)))
+                if cnt > stable:
+                    stable, stable_rows = cnt, rows
+            ok_stable = sum(1 for rows, rec in recent
+                            if rec.get("player") and rows == stable_rows)
             for ln in lines[-30:]:
                 try:
                     rec = json.loads(ln)
                 except json.JSONDecodeError:
                     continue
+                if rec.get("walls"):
+                    n_wall += 1
+                if rec.get("player"):
+                    n_ply += 1
                 if rec.get("walls") and rec.get("player"):
                     ok_seen += 1
-            if ok_seen >= 5:
+                _last = rec
+            #: 闸门单帧"证据"落盘：失败时不用再猜（相机到底拍到了什么）
+            if lines:
+                try:
+                    (run_dir / "gate_vt.jsonl").write_text(
+                        "\n".join(lines[-40:]) + "\n", encoding="utf-8")
+                except OSError:
+                    pass
+            if ok_seen >= 5 and stable >= 12 and ok_stable >= 8:
                 break
-            detail = f"最近 {len(lines)} 帧里只有 {ok_seen} 帧同时有墙+角色"
+            detail = (f"最近 {len(lines)} 帧里只有 {ok_seen} 帧同时有墙+角色"
+                      f"（稳定行带 {stable}/24 帧、其中带角色 {ok_stable} 帧）；"
+                      f"（有墙 {n_wall} 帧 / 有角色 {n_ply} 帧；"
+                      f"最后一帧 geom={_last.get('frame_geom')} "
+                      f"walls={len(_last.get('walls') or [])} "
+                      f"player={_last.get('player')} n={_last.get('n')}）")
+            print(f"    [闸门] {detail}", file=sys.stderr)
             time.sleep(1.0)
-        if ok_seen < 5:
+        if ok_seen < 5 or stable < 12 or ok_stable < 8:
             print(f"\n  ✗ 拒跑：相机没看到平台页面（{detail}）。", file=sys.stderr)
             print("    常见原因：平台窗口被终端/浏览器盖住、窗口跑到屏幕外、"
                   "或预览服务还占着 /dev/video0。", file=sys.stderr)
             print("    先确认 http://192.168.137.242:8099/ 里能看到页面再重跑。",
                   file=sys.stderr)
+            #: 把板端这次的相机录像拉回来，失败原因可以直接看图
+            try:
+                _sp.run(["scp", "-q", "-i", a.ssh_key,
+                         "-o", "StrictHostKeyChecking=no",
+                         f"{a.board_ssh}:/tmp/cam_rec.mkv",
+                         str(run_dir / "gate_cam.mkv")], timeout=60)
+                print(f"    相机录像已存 {run_dir / 'gate_cam.mkv'}",
+                      file=sys.stderr)
+            except (OSError, _sp.SubprocessError):
+                pass
             abort_early = "camera_not_seeing_page"
         else:
             abort_early = None
@@ -880,6 +959,17 @@ def main(argv: list[str] | None = None) -> int:
         Path(run_dir / "summary.json").write_text(
             json.dumps(_sum, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"  已写 {run_dir / 'summary.json'}", file=sys.stderr)
+        #: 闸门失败也要收尸：这条 return 在正常收尾之前，以前会留下 nohup 的
+        #: ffmpeg|vt_sparse 一直占着 /dev/video0，下一轮直接 Device busy。
+        if a.board_ssh:
+            stop_camera_pipe(a.board_ssh, a.ssh_key)
+        if viewer is not None:
+            try:
+                viewer.send_signal(2)
+                viewer.wait(timeout=3.0)
+            except Exception:                     # noqa: BLE001
+                pass
+        link.stop()
         return 3
 
     if not a.board_ssh:
