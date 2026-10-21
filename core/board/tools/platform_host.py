@@ -681,8 +681,11 @@ def main(argv: list[str] | None = None) -> int:
         except json.JSONDecodeError:
             calib_prev = {}
     quad_now = quad_fingerprint(a.board_ssh, a.ssh_key) if a.board_ssh else ""
-    need_calib = (not calib_prev) or quad_moved(calib_prev.get("quad") or "", quad_now,
-                                               a.quad_tol)
+    _quad_moved = (bool(calib_prev) and quad_moved(calib_prev.get("quad") or "",
+                                                   quad_now, a.quad_tol))
+    need_calib = (not calib_prev) or _quad_moved
+    #: 相机/窗口真的移动过（quad 指纹变了）→ 必须重标，不许被"旧系数更好"挡住
+    need_calib_reason = "quad_moved" if _quad_moved else ("" if calib_prev else "no_calib")
     print(f"  标定: 已有={bool(calib_prev)} 相机指纹={quad_now!r} "
           f"→ {'本轮跑完重新标定' if need_calib else '沿用现有系数（相机没动）'}",
           file=sys.stderr)
@@ -986,17 +989,45 @@ def main(argv: list[str] | None = None) -> int:
             elif len(_pairs) < 30:
                 print(f"  自动标定跳过：样本不足（{len(_pairs)}）", file=sys.stderr)
             else:
-                _res = calib_y.fit(_pairs, _truth, 240.0, tol=30.0, rounds=6)
-                _res.update({"quad": quad_now, "run": str(run_dir),
-                             "scenario": a.scenario})
-                if (_res.get("samples", 0) < 30
-                        or (_res.get("rmse") or 999.0) > 20.0):
+                #: **不许用更差的标定覆盖更好的**：静态 40 帧标定的 rmse 能到 0.1 px，
+                #: 而整轮数据（含贴边墙、远景墙）拟合出来常常 rmse 8~12 px。
+                #: 以前每轮结束都无条件覆盖 → 上一轮刚标好的系数被更差的顶掉，
+                #: 下一轮 |Δy| 从 1.4 跳到 8.8（s1b 实测）。这里加两道闸：
+                #:   ① 新拟合 rmse 必须 ≤ 旧系数在同一批样本上的 rmse（即"更解释数据"）
+                #:   ② 旧系数若明显更好，就保留旧的（除非 quad 指纹变了 → 必须重标）
+                #: **不再用整轮数据覆盖标定**。
+                #: 原因：整轮数据里混着贴边墙/远景墙（畸变最大处）和运动帧，
+                #: 拟合出来的 rmse 8~12 px；而"固定画面 40 帧 + 真值"的静态标定
+                #: 能做到 rmse 0.1 px。以前每轮结束都无条件覆盖 → 上一轮刚标好的
+                #: 系数被更差的顶掉，下一轮 |Δy| 从 1.4 跳到 8.8（s1b/s1c 实测）。
+                #: 现在只在**完全没有标定**时用整轮数据兜底（bootstrap），
+                #: 需要重标时只打标记，由静态标定流程（calib_static.sh）来做。
+                if calib_prev:
+                    print("  自动标定：已有静态标定，本轮数据不覆盖"
+                          + ("（quad 变了，需要重标：bash core/board/tools/calib_static.sh）"
+                             if need_calib_reason == "quad_moved" else ""),
+                          file=sys.stderr)
+                    summary["calib"] = {"reused": True, **{
+                        k: calib_prev.get(k) for k in ("scale", "bias", "x_bias", "rmse")}}
+                    if need_calib_reason == "quad_moved":
+                        summary["calib"]["needs_recalib"] = True
+                    _res = None
+                    _skip_fit = True
+                if not calib_prev:
+                    _res = calib_y.fit(_pairs, _truth, 240.0, tol=30.0, rounds=6)
+                    _res.update({"quad": quad_now, "run": str(run_dir),
+                                 "scenario": a.scenario})
+                if _res is not None and (_res.get("samples", 0) < 30
+                                         or (_res.get("rmse") or 999.0) > 20.0):
                     print(f"  自动标定质量不足（samples={_res.get('samples')} "
                           f"rmse={_res.get('rmse')}）：保留旧系数", file=sys.stderr)
                     summary["calib"] = {"rejected": True, **_res}
                     _res = None
-        except (ImportError, OSError, ValueError) as exc:
-            print(f"  自动标定失败：{exc!r}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            #: 标定这一段出任何错都不能连累"写 summary"：以前这里只捕
+            #: ImportError/OSError/ValueError，结果一个 AttributeError 就把整轮
+            #: 证据弄丢了（s1d：跑完了却没 summary.json）。
+            print(f"  自动标定失败（不影响本轮结论）：{exc!r}", file=sys.stderr)
 
         if _res is not None:
             calib_path.parent.mkdir(parents=True, exist_ok=True)

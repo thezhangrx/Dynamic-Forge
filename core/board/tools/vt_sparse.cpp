@@ -249,6 +249,7 @@ int main(int argc, char** argv) {
 
         // ---- 每道墙：全宽扫该行，找最长暗段当缺口 ----------------------
         std::vector<WallOut> walls;
+        std::vector<double> no_gap_y;   //: 有墙但量不出缺口的行（下游据此"不许前进"）
         for (const auto& b : bands) {
             if (b[1] - b[0] + 1 < 4) continue;            // 单像素/白框线多半是网格线
             //: 亚像素质心：带子 [b0-2, b1+2] 内按 row_ev 加权（连续、抗阈值抖动）
@@ -308,6 +309,7 @@ int main(int argc, char** argv) {
                 o.gr = best_s + best_len;
             }
             walls.push_back(o);
+            if (!o.gap) no_gap_y.push_back(o.y);
         }
 
         // ---- 角色：二维稀疏网格找"孤立白点" ----------------------------
@@ -435,11 +437,14 @@ int main(int argc, char** argv) {
                              emitted ? "," : "", o.y, o.gl, o.gr);
                 ++emitted;
             }
+            std::fprintf(jf, "],\"no_gap_y\":[");
+            for (size_t i = 0; i < no_gap_y.size(); ++i)
+                std::fprintf(jf, "%s%.1f", i ? "," : "", no_gap_y[i]);
             std::fprintf(jf, "],\"player\":");
             if (pfound) std::fprintf(jf, "[%.1f,%.1f]", px, py);
             else std::fprintf(jf, "null");
             std::fprintf(jf, ",\"n\":%d,\"no_gap\":%zu,\"fast\":1}\n",
-                         emitted, walls.size() - static_cast<size_t>(emitted));
+                         emitted, no_gap_y.size());
             std::fflush(jf);
         }
         if (!render_out.empty() || true) {

@@ -290,6 +290,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--x-bias", type=float, default=0.0,
                     help="缺口横向固定偏移（像素，正=VT 比真值偏右）。"
                          "标定文件里给了就用文件里的；这里只是回退默认值")
+    ap.add_argument("--react-s", type=float, default=0.5,
+                    help="从'相机看到'到'动作生效'的延迟上界（秒）。用于算可刹停距离"
+                         "= v*react_s*2；v 由位姿历史在线估计。这是实测的管道延迟，"
+                         "不是场景参数；换相机/降分辨率后应重新量一次")
     ap.add_argument("--tol-vy", type=float, default=7.0,
                     help="多帧一致时允许的帧内墙行差（像素）。**这是噪声参数，不是场景参数**："
                          "实测静止条件下同一道墙的 vy 重复性 1σ≈8 px，卡在 7 会把一半"
@@ -377,7 +381,24 @@ def main(argv: list[str] | None = None) -> int:
     #: 缺口窗口 -> 已入库的墙 y。同一道物理墙远/近两次测量会被映射成不同的 y
     #: （映射依赖 py，实测 215 → 345），按 y 去重就会重复入表、出现"同侧两道墙"。
     #: 缺口位置与 py 无关，用它当身份最稳。
-    known_by_gap: dict[tuple[int, int], float] = {}
+    #: **在线噪声估计**（不写死容差）：
+    #:   sig_y = 墙行 y 的重复性；sig_e = 缺口左右边界的重复性。
+    #: 由每次"多帧一致"里同一道墙的散度做 EWMA 得到。所有"同一道墙/缺口合理"
+    #: 的判据都用它们乘系数，而不是 ±25 / ±30 / ±45 这类凭经验写死的数。
+    sig_y = 4.0
+    sig_e = 3.0
+
+    def row_tol() -> float:
+        """同一道墙的 y 容差：由在线噪声与**已学到的行间距**共同决定。
+
+        两道真墙的 y 相差"行间距"（本场景 140，但这里不写死：取已知行间距的
+        最小值）。容差取行间距的 1/3 与 6σ_y 的较小者，保证既不会把两道墙
+        合成一道，也不会把同一道墙的两次测量当成两道。
+        """
+        ys = sorted(known)
+        gaps = [b - a for a, b in zip(ys, ys[1:]) if b - a > 8.0]
+        spacing = min(gaps) if gaps else 140.0
+        return max(6.0, min(spacing / 3.0, 6.0 * sig_y))
     seq = 0
     last_act = 0
     last_vt_seq = -1
@@ -492,6 +513,9 @@ def main(argv: list[str] | None = None) -> int:
         except (BrokenPipeError, OSError):
             pass
 
+    #: 读者线程与主循环共享的"安全互锁"状态（跨线程只能通过可变对象传递）
+    lock_state = {"unknown_ahead": 0}
+
     # 决策输出线程：@MOVE → 主机
     def reader() -> None:
         nonlocal last_act
@@ -506,6 +530,11 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             changed = act != last_act
             last_act = act
+            if lock_state["unknown_ahead"] > 0:
+                #: 前方有未测明的墙：无论 CLI 说什么都先停住（互锁，不依赖任何阈值）。
+                #: 注意这里必须 `continue`：用 `return` 会把整个 reader 线程退出。
+                link.send_move(0)
+                continue
             if not paused and time.monotonic() >= nudge_until:
                 link.send_move(act)
                 if changed:
@@ -562,6 +591,33 @@ def main(argv: list[str] | None = None) -> int:
             #: 几何自检：页面把角色画在它的场地 x 上（视口中线固定 320），所以
             #: VT 量到的角色 x 应该 ≈ 主机 px。偏了就说明白框/四边形检测坏了，
             #: 这一帧的缺口 x 一律不可信 —— 整帧丢掉，别让它污染 known。
+            #: **前方有"看得见但量不出缺口"的墙 → 不许前进**。
+            #: 只靠"learned 的墙"来判断安全是不够的：开局或换行时，VT 明明看到
+            #: 一条墙带却量不出缺口，板子却以为自己什么都不知道、于是直着开过去
+            #: （实测 s1e：t=2.42 在 wall@360 上 -10）。这条互锁不看真值、不看
+            #: 场景参数，只用板端自己的观测：只要前方有未测明的墙，就发 0 等测。
+            _ngy = s.get("no_gap_y") or []
+            #: **按"能不能刹住"来决定是否前进**，而不是"前方一有未知就停"。
+            #: 一有未知就停会把机器人钉死在原地（实测 s1f：30 s 只走了 22 单位），
+            #: 因为视口里总有些墙带量不出缺口（贴近画面上下沿的那道）。
+            #: 判据：未知墙距离 > 可刹停距离时允许前进。可刹停距离 = v * 反应时间，
+            #: v 用位姿历史在线估（不写死速度），反应时间取实测管道延迟上界。
+            _v = 0.0
+            if len(pose_hist) >= 4:
+                _t0, _y0 = pose_hist[-4]
+                _t1, _y1 = pose_hist[-1]
+                if _t1 - _t0 > 1e-6:
+                    _v = abs(_y1 - _y0) / (_t1 - _t0)
+            _stop_dist = _v * a.react_s * 2.0        # 2.0 = 给"测一次"留的倍数
+            _ua = 0
+            for _y in _ngy:
+                try:
+                    _d = float(_y) - py
+                except (TypeError, ValueError):
+                    continue
+                if _d > 20.0 and _d < _stop_dist:
+                    _ua += 1
+            lock_state["unknown_ahead"] = _ua
             pv = s.get("player")
             dx_p = None if pv is None else float(pv[0]) - px
             #: 竖直方向的"帧新鲜度"：页面**不做夹取**，它永远把角色画在可见带
@@ -695,7 +751,7 @@ def main(argv: list[str] | None = None) -> int:
             #: 的缺口窗口可能落在 ±25 内，把**真的新墙**也滤掉了，板子于是盲开撞墙。
             #: 这个预过滤已删除；减少停车只能从"暂停时长"想办法，不能牺牲候选。
             extras = [e for e in raw
-                      if not any(abs(e[0] - k) <= 55.0 for k in known)]
+                      if not any(abs(e[0] - k) <= row_tol() for k in known)]
             prev_extras = list(extras)
             extras_t = time.monotonic()
             if extras and not paused and not collecting:
@@ -800,43 +856,43 @@ def main(argv: list[str] | None = None) -> int:
                     _batch_gaps: list[tuple[float, float, float]] = []
                     for _acc in accept:
                         gy, gl, gr = _acc[0], _acc[1], _acc[2]
-                        if any(abs(gy - k) <= 55.0 for k in known):
+                        if any(abs(gy - k) <= row_tol() for k in known):
                             continue
-                        #: 同一个缺口窗口 = 同一道物理墙。远/近两次测量会被映射成
-                        #: 不同的 y（映射依赖 py，实测同一道墙 215 → 355），旧逻辑
-                        #: 就把它当成"新墙"再加一条，于是出现同侧两道墙、缺口相同。
-                        #: 这里按"缺口身份"去重：命中已知墙就更新它的 y（取更近一次的
-                        #: 测量），绝不重复入表。
-                        _key = (int(round(gl / 10.0)), int(round(gr / 10.0)))
-                        _same_y = known_by_gap.get(_key)
-                        _same = None
-                        if _same_y is not None:
-                            _same = {"y": _same_y}
-                        if _same is not None:
-                            _old_y = float(_same["y"])
-                            _new_ahead = abs(gy - py)
-                            _old_ahead = abs(_old_y - py)
-                            if _new_ahead + 20.0 < _old_ahead:
-                                known_by_gap[_key] = round(gy, 1)
-                                for _d in known_detail:
-                                    if abs(float(_d["y"]) - _old_y) <= 1e-6:
-                                        _d["y"] = round(gy, 1)
-                                        break
-                                for _i, _k in enumerate(known):
-                                    if abs(_k - _old_y) <= 1e-6:
-                                        known[_i] = round(gy, 1)
-                                        break
-                            ev("wall_same_gap", y=round(gy, 1), old_y=_old_y,
-                               gl=round(gl, 1), gr=round(gr, 1),
-                               updated=bool(_new_ahead + 20.0 < _old_ahead))
+                        #: **按"行身份"去重**（以前按"缺口身份"：gl/gr 相差 ≤25
+                        #: 且完全不看 y 就当成同一道墙）。后者会把真的新墙吃掉：
+                        #: 实测 acc9 里 wall@1480（gap 240.8–332.8）被 52 次判成
+                        #: 已学的 wall@1198 —— 两道墙差 282 单位却"因为缺口像"而
+                        #: 不许入表，于是板子盲穿过去（audit_crossings 判为 blind）。
+                        #: 现在同一道墙 = y 相差 ≤ row_tol()，缺口只做二次确认。
+                        _near = [d for d in known_detail
+                                 if abs(float(d["y"]) - gy) <= row_tol()]
+                        if _near:
+                            d = min(_near, key=lambda q: abs(float(q["y"]) - gy))
+                            _dc = abs(0.5 * (float(d["gl"]) + float(d["gr"]))
+                                      - 0.5 * (gl + gr))
+                            if (abs(float(d["gl"]) - gl) > 0.5
+                                    or abs(float(d["gr"]) - gr) > 0.5):
+                                #: 同一条墙的重测：只许"细化"，不许搬家
+                                if _dc > 4.0 * sig_e:
+                                    ev("reject_gap", why="same_row_far_gap",
+                                       y=round(gy, 1), gl=round(gl, 1),
+                                       gr=round(gr, 1), old_y=round(float(d["y"]), 1),
+                                       old_gl=round(float(d["gl"]), 1),
+                                       old_gr=round(float(d["gr"]), 1), dc=round(_dc, 1))
+                                    continue
+                                d["gl"], d["gr"] = round(gl, 1), round(gr, 1)
+                            ev("wall_same_row", y=round(gy, 1),
+                               old_y=round(float(d["y"]), 1), gl=round(gl, 1),
+                               gr=round(gr, 1), refined=bool(
+                                   abs(float(d["gl"]) - gl) > 0.5
+                                   or abs(float(d["gr"]) - gr) > 0.5))
                             continue
                         _why = gap_suspect(gy, gl, gr)
                         if not _why and gap_width_outlier(gl, gr):
                             _why = "width_outlier"
                         if not _why:
                             for (_by, _bgl, _bgr) in _batch_gaps:
-                                if abs(_bgl - gl) <= 20.0 and abs(_bgr - gr) <= 20.0 \
-                                        and abs(_by - gy) >= 100.0:
+                                if abs(_by - gy) <= row_tol():
                                     _why = "dup_batch"
                                     break
                         if _why:
@@ -845,7 +901,6 @@ def main(argv: list[str] | None = None) -> int:
                             continue
                         _batch_gaps.append((gy, gl, gr))
                         known.append(gy)
-                        known_by_gap[_key] = round(gy, 1)
                         known_detail.append({"y": round(gy, 1), "gl": round(gl, 1),
                                              "gr": round(gr, 1),
                                              "source": "board_vt"})
@@ -866,6 +921,19 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"  [dbg] seen={len(pause_seen)} agree={len(agree)} "
                               f"raw={[round(v[0], 1) for v in raw[:3]]}",
                               file=sys.stderr, flush=True)
+                    #: 用本次"同一道墙"的原始帧散度更新噪声估计（EWMA）
+                    if accept and len(pause_seen) >= 3:
+                        _gy0 = accept[0][0]
+                        _grp = [o for o in pause_seen
+                                if abs(o[0] - _gy0) <= row_tol()]
+                        if len(_grp) >= 3:
+                            import statistics as _st
+                            _sy = _st.pstdev([o[0] for o in _grp])
+                            _se = _st.pstdev([o[i] for o in _grp for i in (1, 2)])
+                            sig_y = 0.7 * sig_y + 0.3 * max(_sy, 0.3)
+                            sig_e = 0.7 * sig_e + 0.3 * max(_se, 0.3)
+                            ev("noise_est", sig_y=round(sig_y, 2), sig_e=round(sig_e, 2),
+                               n=len(_grp))
                     known.sort(key=lambda v: v)
                     remain = [e for e in extras
                               if not any(abs(e[0] - k) <= 30.0 for k in known)]
