@@ -276,6 +276,23 @@ class SshLink:
             self.move_log = []
         return out
 
+    def send_start(self) -> bool:
+        """告诉板端"主机现在开始跑了"：清空它闸门期间攒下的动作、重新压住平台。
+
+        为什么必须有：闸门校验要 20~40 s，这段时间板端的"停车测量"早超时恢复了，
+        它会持续按决策进程的动作发 @MOVE。主机一开跑就把**队列里那条旧动作**
+        执行掉 —— 实测 r15 在 t_sim=0.01 就执行了 act=2（往右），随后直着撞上
+        真值 y=80 的墙（x≈371 在缺口外，min_clearance −10）。
+        """
+        if self.proc.poll() is not None:
+            return False
+        try:
+            self.proc.stdin.write(b"@START\n")
+            self.proc.stdin.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+
     def send_pose(self, x: float, y: float, r: float) -> bool:
         if self.proc.poll() is not None:
             return False
@@ -971,6 +988,34 @@ def main(argv: list[str] | None = None) -> int:
                 pass
         link.stop()
         return 3
+
+    if a.board_ssh and hasattr(link, "send_start"):
+        #: 开跑握手：让板端重新压住平台、丢掉闸门期间攒下的旧动作，再等它 0.8 s。
+        #: 这 0.8 s 里平台必须是真的停住的（时间不重要，安全重要）。
+        try:
+            link.send_start()
+            t_hold = time.monotonic()
+            while time.monotonic() - t_hold < 0.8:
+                link.send_pose(*[float(v) for v in (env.world.player[0],
+                                                    env.world.player[1],
+                                                    env.world.player[4])])
+                time.sleep(0.02)
+            link.drain_moves()
+            with link._lock:
+                link.act = 0
+            _n_hold = 0
+            for _ in range(20):
+                link.send_pose(*[float(v) for v in (env.world.player[0],
+                                                    env.world.player[1],
+                                                    env.world.player[4])])
+                time.sleep(0.02)
+                if link.act != 0:
+                    _n_hold += 1
+            print(f"  开跑握手：@START 已发，板端 {_n_hold}/20 个动作非 0（应接近 0）",
+                  file=sys.stderr)
+            log.event("start_handshake", nonzero=_n_hold)
+        except Exception:                             # noqa: BLE001
+            pass
 
     if not a.board_ssh:
         print("  等板子连 TCP ...", file=sys.stderr)

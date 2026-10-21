@@ -158,12 +158,16 @@ class StdioLink:
         self.pose = (320.0, 60.0, 10.0)
         self.pose_seq = 0
         self.pose_t = time.monotonic()
+        self.start_req = False
         self._lock = threading.Lock()
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self) -> None:
         for line in sys.stdin:
             t = line.strip()
+            if t.startswith("@START"):
+                self.start_req = True       # 主机开跑：让主循环重新压住平台
+                continue
             if not t.startswith("@POSE"):
                 continue
             try:
@@ -271,7 +275,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--field-h", type=float, default=3420.0)
     ap.add_argument("--goal", type=float, nargs=2, default=(320.0, 3360.0))
     ap.add_argument("--view-h", type=float, default=480.0)
-    ap.add_argument("--inflate", type=float, default=26.0)
+    #: **膨胀半径默认由角色半径推**（半径 + 4）。以前默认 26：板端存进表里的缺口
+    #: 已经两侧各收过 margin（≈70 宽），再各膨胀 26 只剩 18 < 角色直径 20 ——
+    #: 规划器把这些缺口全判成"过不去"，于是回 0（卡死）或者贴着边挤过去
+    #: （实测 r8 min_clearance +1.72、r12/r13/r14 min_clearance −10：中心压进墙里）。
+    #: 这条"自动推"写在下面对 inflate<=0 的分支里，但默认值 26 让那个分支永远不生效。
+    ap.add_argument("--inflate", type=float, default=0.0)
     ap.add_argument("--pause-ahead", type=float, default=220.0)
     ap.add_argument("--y-bias", type=float, default=0.0,
                     help="同上的截距；外部四边形正确时为 0")
@@ -566,6 +575,40 @@ def main(argv: list[str] | None = None) -> int:
     #: 读者线程与主循环共享的"安全互锁"状态（跨线程只能通过可变对象传递）
     lock_state = {"unknown_ahead": 0, "block_t0": time.monotonic()}
 
+    #: 主机开跑前会发一条 `@START`：板端要把状态清干净、重新压住平台。
+    #: 为什么需要：闸门校验要跑 20~40 s，这段时间板端的"停车测量"早超时恢复了，
+    #: 主机一开跑就把**队列里那条旧动作**执行掉 —— 实测 r15 在 t_sim=0.01 就
+    #: 执行了 act=2（往右横移），随后直着撞上真值 y=80 的墙（x≈371 在缺口外）。
+    #: front_guard 会在 reader 线程里被调，可能早于主循环第一次取位姿 —— 先给
+    #: 一份"最保守"的默认值（位置未知时不许前向），避免 NameError 把读者线程打死。
+    px, py = 0.0, 0.0
+    pose_ready = False
+
+    def front_guard(act_: int) -> int:
+        """**自己认的缺口之外，不许往前开**（只许横移）。
+
+        为什么：规划器给的是"朝缺口中心走"，但缺口两侧各收了 margin、加上横向
+        标定偏差，实际 x 可能仍在自己认的缺口边缘以外；这时"前进"就是拿真值更宽
+        的缺口赌没撞（审计把这种叫"侥幸"：r12 就判了侥幸）。安全第一：不在缺口里
+        就只放行 ±x，先把 x 摆进缺口再走。
+        """
+        if act_ not in (3, 5, 6):        # 3=+y 5=左上 6=右上
+            return act_
+        if not pose_ready:
+            return 0                     # 位姿还没到：别动
+        ahead = [d for d in known_detail if float(d["y"]) > py]
+        if not ahead:
+            return act_                 # 还没学到墙：保持原动作（互锁会管）
+        d = min(ahead, key=lambda q: float(q["y"]) - py)
+        gl_, gr_ = float(d["gl"]), float(d["gr"])
+        if gl_ + 1.0 <= px <= gr_ - 1.0:
+            return act_
+        if act_ == 5:
+            return 1
+        if act_ == 6:
+            return 2
+        return 0
+
     # 决策输出线程：@MOVE → 主机
     def reader() -> None:
         nonlocal last_act
@@ -581,6 +624,15 @@ def main(argv: list[str] | None = None) -> int:
             changed = act != last_act
             last_act = act
             if lock_state["unknown_ahead"] > 0:
+                if paused or time.monotonic() < nudge_until:
+                    #: **暂停/开局一律不动**。以前这里不看 paused，直接放行
+                    #: "每 cycle 里 0.25 s 的 act" —— 开局决策进程给的第一个动作
+                    #: 是"朝终点斜着走"(6=+x+y)，于是平台在**还没学到第一道墙**的
+                    #: 时候就斜着冲出去：实测 r12/r13/r14 三轮**都在同一个点**
+                    #: （真值 y=80 的墙、x≈347，正是缺口右侧的墙面）把中心压进墙里
+                    #: （min_clearance −10.0）。这不是偶然，是开局的固定 bug。
+                    link.send_move(0)
+                    continue
                 #: 前方有未测明的墙：**先停住**（互锁，不依赖阈值）。
                 #: 但"一直停着"会死锁：有些墙在当前位置就是量不出缺口（贴画面上下沿、
                 #: 被反光/角色挡住），只有凑近才看得到 —— 实测 demo3/demo4 就卡在
@@ -591,12 +643,12 @@ def main(argv: list[str] | None = None) -> int:
                 _t0 = float(lock_state.get("block_t0") or _now)
                 _ph = (_now - _t0) % max(0.2, a.pulse_cycle)
                 if _ph < a.pulse_on:
-                    link.send_move(act)          # 短脉冲：接近一点点
+                    link.send_move(front_guard(act))   # 短脉冲：接近一点点
                 else:
                     link.send_move(0)            # 其余时间停住、让 VT 重新测
                 continue
             if not paused and time.monotonic() >= nudge_until:
-                link.send_move(act)
+                link.send_move(front_guard(act))
                 if changed:
                     ev("move_sent", act=int(act), src="cli")
             elif paused and time.monotonic() >= nudge_until:
@@ -628,7 +680,22 @@ def main(argv: list[str] | None = None) -> int:
     extras: list[tuple[float, float, float]] = []
     while True:
         s = vt.latest()
+        if getattr(link, "start_req", False):
+            link.start_req = False
+            paused = True
+            collecting = False
+            extras = []
+            prev_extras = []
+            pause_seen = []
+            pause_t0 = time.monotonic()
+            last_prog_py, last_prog_t = py, time.monotonic()
+            link.send_move(0)
+            ev("start_hold", py=round(py, 1), n_known=len(known))
+            if a.verbose:
+                print("  @START：重新压住平台，等第一道墙测清楚", file=sys.stderr,
+                      flush=True)
         px, py, pr = link.get_pose()
+        pose_ready = True
         now_m = time.monotonic()
         pose_hist.append((now_m, py))
         if len(pose_hist) > 600:      # ≈5 s @110 Hz
