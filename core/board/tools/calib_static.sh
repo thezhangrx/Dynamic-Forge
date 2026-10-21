@@ -63,7 +63,10 @@ QB=$($SSH 'cat /tmp/quad.json 2>/dev/null' 2>/dev/null | tr -d '\r')
 echo "  /tmp/quad.json = ${QB:-（空！）}"
 [ -z "$QB" ] && { echo "  ⚠ 没有 quad：先跑 push_quad.py（需要页面上有 ArUco）" >&2; exit 3; }
 
-echo "== 3. 抓 $FRAMES 帧 640x480 =="
+echo "== 3. 锁曝光/白平衡后抓 $FRAMES 帧 640x480 =="
+#: 与闭环管线用同一套相机参数，否则"标定时是自动曝光、跑的时候也是自动曝光"，
+#: 两边的亮度分布都对不上（实测没锁时 40 帧里只有 17 帧能测出墙）。
+#: 曝光保持自动（与闭环一致；固定曝光的坑见 platform_host.py 注释）; then         v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto=1                  --set-ctrl=exposure_absolute=200                  --set-ctrl=white_balance_temperature_auto=0                  --set-ctrl=white_balance_temperature=4000                  --set-ctrl=gain=4 2>/dev/null || true; fi' >/dev/null 2>&1
 $SSH "rm -f /tmp/calib.rgb; ffmpeg -hide_banner -loglevel error -f v4l2 \
       -input_format mjpeg -video_size 640x480 -i /dev/video0 \
       -frames:v $FRAMES -f rawvideo -pix_fmt rgb24 -y /tmp/calib.rgb 2>/dev/null;

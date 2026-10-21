@@ -316,6 +316,15 @@ def start_camera_pipe(target: str, key: str, extra: str = "",
         #: 否则管线起来只能拿到 "Device or resource busy"（实测 acc1 就这么空跑）。
         'pkill -f "[m]jpeg_server.py"; pkill -x vt_board; pkill -x vt_sparse; '
         'pkill -x ffmpeg; sleep 0.3; '
+        #: 相机曝光：**默认交给自动曝光**。曾经想"锁死更稳"，实测锁在 200 时
+        #: 整幅画面过曝全白、40 帧里 0 帧能测出墙（这台相机 exposure_absolute
+        #: 的有效范围跟场景亮度强相关，拍屏幕时自动值远低于 200）。
+        #: 需要固定参数时显式打开 CAM_CTRL_LOCK=1，并自己确认画面亮度正常。
+        'if [ "${CAM_CTRL_LOCK:-0}" = "1" ] && command -v v4l2-ctl >/dev/null 2>&1; then '
+        'v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto=1 '
+        '--set-ctrl=exposure_absolute="${EXPOSURE_ABS:-50}" '
+        '--set-ctrl=white_balance_temperature_auto=0 '
+        '--set-ctrl=white_balance_temperature="${WB_TEMP:-4000}" 2>/dev/null || true; fi; '
         'rm -f /tmp/vt.jsonl /tmp/cam.jpg; '
         'nohup bash -c \'ffmpeg -hide_banner -loglevel error '
         '-fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 '
@@ -598,9 +607,37 @@ def main(argv: list[str] | None = None) -> int:
                   field_bg=field_rgb, resizable=False)
     page = PygameRenderer(show_potential=False, **common)
     install_stop_signals()
-    field_view = PygameRenderer(show_potential=True,
-                                potential_every=max(1, int(a.field_every)),
-                                **common)
+    #: **热力图窗口会跟平台窗口抢同一块画面**：pygame 只有一个 display surface，
+    #: 两个 PygameRenderer 各自 render() 会让窗口内容在"平台页"和"亮热力图"之间
+    #: 交替 —— 相机拍到的就是交替的两种画面（实测静态 40 帧：前 10 帧平均亮度 89
+    #: 有墙，后 30 帧平均 170 没墙；这个现象把 s2c 卡死过一次）。
+    #: 所以拍摄（相机取景）用的运行**不创建热力图窗口**：--field-hz < 0.1 时直接用
+    #: 平台渲染器，热力图视频（field_mp4）自然也不录。
+    if a.field_hz >= 0.1:
+        field_view = PygameRenderer(show_potential=True,
+                                    potential_every=max(1, int(a.field_every)),
+                                    **common)
+    else:
+        field_view = page
+
+    #: **平台窗口必须压在热力图窗口上面**。两个 PygameRenderer 各开一扇窗，
+    #: 相机看到的是"最上面那扇"；热力图窗偶尔会盖到平台窗上 → 相机拍到亮热力图
+    #: → 墙检测全丢（实测静态 40 帧只后 30 帧全灭、亮度从 89 跳到 170）。
+    #: 这里显式把平台窗抬到最前，并在跑的过程中定期再抬一次。
+    try:
+        page._force_window_front()          # noqa: SLF001 - 同仓库内部方法
+    except Exception:                        # noqa: BLE001
+        pass
+
+    def _keep_page_on_top() -> None:
+        while True:
+            time.sleep(2.0)
+            try:
+                page._force_window_front()   # noqa: SLF001
+            except Exception:                # noqa: BLE001
+                return
+
+    threading.Thread(target=_keep_page_on_top, daemon=True).start()
 
     server = FrameServer(a.port)
     base = page.render(env.world)

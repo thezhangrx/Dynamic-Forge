@@ -86,17 +86,22 @@ def collect_pairs(run_dir: Path) -> list[tuple[float, float, int]]:
 
 def fit_x_bias(vt_rows: list[dict], frame_py: dict[int, float], truth_gaps: list[tuple],
                truth_y: list[float], scale: float, bias: float,
-               half: float) -> tuple[float, int]:
-    """VT 缺口左右边界相对真值的**固定横向平移**（中位数）。
+               half: float) -> tuple[float, float, int]:
+    """VT 缺口横向偏差 **随手电平台 y 线性变化**的两个系数。
 
-    为什么需要：页面四角只给单应 8 个自由度，广角头的桶形畸变会让整幅画面
-    在中部整体偏几个像素（实测 +7~+11 px）。这不是随机误差，是系统性偏差：
-    在 y 上我们用 scale/bias 拟掉了，x 上一直没有对应的一项，于是板子总是
-    朝真实缺口中心右侧 7~11 px 走 —— 90~110 宽的缺口里，这吃掉约 1/3 余量。
-    这里同样**用真值标定一次**（和 y 的做法一致），把结果写进 calib 文件。
+    为什么不是常数：页面四角只给单应 8 个自由度，广角头的桶形畸变让"同一列像素
+    在不同高度上横向偏移不同"。实测（40 帧静态）：wall@280 偏 +0.9 px，
+    wall@420 偏 +8.4 px —— 差 7.5 px，用单一常数最多只能折中。
+
+    模型：  x_corr(y) = x_a + x_b * (y - half)
+    用所有已配对的行做最小二乘（每行先取该行的中位数，避免贴边行权重过大）。
+    返回 (x_a, x_b, 样本行数)；行数 < 2 时 x_b = 0。
     """
     import statistics
-    dxs: list[float] = []
+    #: 自变量必须是**帧内页面坐标 vy**（畸变是"在画面里的位置"的函数），
+    #: 不能用绝对场地 y：用 y 拟合再代到 y≈3160 的墙上，会算出一个 126 px 的
+    #: 荒谬修正（实测 s2a：缺口整体被平移 −126，直接穿墙）。
+    per_row: dict[float, list[float]] = {}
     for rec in vt_rows:
         py = frame_py.get(int(rec.get("frame", -1)))
         if py is None:
@@ -104,17 +109,31 @@ def fit_x_bias(vt_rows: list[dict], frame_py: dict[int, float], truth_gaps: list
         for w in rec.get("walls") or []:
             world = (py - half) + scale * float(w.get("y", 0.0)) + bias
             ty = min(truth_y, key=lambda v: abs(v - world))
-            if abs(ty - world) > 40.0:
+            if abs(ty - world) > 30.0:
                 continue
-            # 找该真值行对应的缺口
             g = [gg for gg in truth_gaps if abs(gg[0] - ty) < 1.0]
             if not g:
                 continue
             _, tgl, tgr = g[0]
-            dxs.append(0.5 * ((float(w["gl"]) - tgl) + (float(w["gr"]) - tgr)))
-    if len(dxs) < 10:
-        return 0.0, len(dxs)
-    return float(statistics.median(dxs)), len(dxs)
+            dx = 0.5 * ((float(w["gl"]) - tgl) + (float(w["gr"]) - tgr))
+            per_row.setdefault(round(float(w.get("y", 0.0)) / 20.0) * 20.0,
+                               []).append(dx)
+    if len(per_row) < 1:
+        return 0.0, 0.0, 0
+    pts = [(vy, statistics.median(v)) for vy, v in per_row.items() if v]
+    if len(pts) == 1:
+        return float(pts[0][1]), 0.0, 1
+    n = float(len(pts))
+    sx = sum(y - half for y, _ in pts)
+    sy = sum(d for _, d in pts)
+    sxx = sum((y - half) ** 2 for y, _ in pts)
+    sxy = sum((y - half) * d for y, d in pts)
+    den = n * sxx - sx * sx
+    if abs(den) < 1e-9:
+        return float(sy / n), 0.0, len(pts)
+    xb = (n * sxy - sx * sy) / den
+    xa = (sy - xb * sx) / n
+    return float(xa), float(xb), len(pts)
 
 
 def fit(pairs: list[tuple[float, float, int]], truth_y: list[float], half: float,
@@ -197,12 +216,14 @@ def main(argv: list[str] | None = None) -> int:
             if _pu is None:
                 _pu = e.get("py", 0.0)
             frame_py[int(e["frame"])] = float(_pu)
-    x_bias, x_n = (0.0, 0)
+    x_a, x_b, x_n = (0.0, 0.0, 0)
     if truth_gaps:
-        x_bias, x_n = fit_x_bias(vt_rows, frame_py, truth_gaps, truth_y,
-                                 float(res["scale"]), float(res["bias"]),
-                                 0.5 * a.view_h)
-    res.update({"x_bias": round(x_bias, 2), "x_samples": x_n,
+        x_a, x_b, x_n = fit_x_bias(vt_rows, frame_py, truth_gaps, truth_y,
+                                   float(res["scale"]), float(res["bias"]),
+                                   0.5 * a.view_h)
+    res.update({"x_bias_a": round(x_a, 3), "x_bias_b": round(x_b, 5),
+                "x_bias": round(x_a, 2),   # 兼容旧字段：常数部分
+                "x_rows": x_n,
                 "run": str(a.run_dir), "scenario": a.scenario,
                 "quad": a.quad or None, "pairs": len(pairs)})
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)

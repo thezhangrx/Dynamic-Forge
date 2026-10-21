@@ -287,6 +287,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="开局预热：前 N 秒不收墙（白框四角还在收敛）")
     ap.add_argument("--consensus-frames", type=int, default=3,
                     help="同一道墙要几帧一致才入表（2 帧时偶发错行缺口会被收下）")
+    ap.add_argument("--x-bias-a", type=float, default=None,
+                    help="横向偏差常数项（标定文件优先）")
+    ap.add_argument("--x-bias-b", type=float, default=None,
+                    help="横向偏差随 y 的斜率（标定文件优先）")
     ap.add_argument("--x-bias", type=float, default=0.0,
                     help="缺口横向固定偏移（像素，正=VT 比真值偏右）。"
                          "标定文件里给了就用文件里的；这里只是回退默认值")
@@ -319,6 +323,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="板端结构化事件（JSONL）：VT 帧/pause/add_wall/fix/nudge/move")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
+    #: 横向偏差的默认值归一（标定文件里没有就退回常数项/0）
+    if a.x_bias_a is None:
+        a.x_bias_a = float(a.x_bias)
+    if a.x_bias_b is None:
+        a.x_bias_b = 0.0
 
     t_boot = time.monotonic()
     #: 自动标定的 y 换算系数：优先用标定文件（由 calib_y.py 自动解出），
@@ -334,6 +343,10 @@ def main(argv: list[str] | None = None) -> int:
                 #: 和 scale/bias 一样是**标定产物**，不是手调常数：由 calib_y 用
                 #: 一组静止画面 + 真值算中位数得到，写进同一个 calib 文件。
                 a.x_bias = float(_c.get("x_bias", 0.0) or 0.0)
+                #: 横向偏差**随 y 线性变化**的两个系数（x_corr = a + b*(y-240)）。
+                #: 单常数只能折中：实测同一画面 wall@280 偏 +0.9、wall@420 偏 +8.4。
+                a.x_bias_a = float(_c.get("x_bias_a", a.x_bias) or 0.0)
+                a.x_bias_b = float(_c.get("x_bias_b", 0.0) or 0.0)
                 print(f"  calib_loaded: scale={a.y_scale} bias={a.y_bias} "
                       f"({calib_file})", file=sys.stderr, flush=True)
         except (OSError, ValueError):
@@ -597,27 +610,32 @@ def main(argv: list[str] | None = None) -> int:
             #: （实测 s1e：t=2.42 在 wall@360 上 -10）。这条互锁不看真值、不看
             #: 场景参数，只用板端自己的观测：只要前方有未测明的墙，就发 0 等测。
             _ngy = s.get("no_gap_y") or []
-            #: **按"能不能刹住"来决定是否前进**，而不是"前方一有未知就停"。
-            #: 一有未知就停会把机器人钉死在原地（实测 s1f：30 s 只走了 22 单位），
-            #: 因为视口里总有些墙带量不出缺口（贴近画面上下沿的那道）。
-            #: 判据：未知墙距离 > 可刹停距离时允许前进。可刹停距离 = v * 反应时间，
-            #: v 用位姿历史在线估（不写死速度），反应时间取实测管道延迟上界。
-            _v = 0.0
-            if len(pose_hist) >= 4:
-                _t0, _y0 = pose_hist[-4]
-                _t1, _y1 = pose_hist[-1]
-                if _t1 - _t0 > 1e-6:
-                    _v = abs(_y1 - _y0) / (_t1 - _t0)
-            _stop_dist = _v * a.react_s * 2.0        # 2.0 = 给"测一次"留的倍数
-            _ua = 0
+            #: **绝不许朝"没量过缺口的墙"前进**（互锁，不依赖任何阈值）。
+            #: 之前那一版有两个错：
+            #:   ① 把 no_gap_y 的**页面坐标**直接和**世界 py** 比大小 —— 量纲不对，
+            #:      互锁形同虚设；实测 s2b 第一道墙 wall@80 被盲穿（余量 −10）。
+            #:   ② 用"可刹停距离"做阈值 —— v≈0 时永远不触发，开局正好最危险。
+            #: 现在的规则不需要阈值：把"已知墙"和"看见但没量出缺口的墙"都换算成
+            #: 世界 y，取**最近的一道在前方的墙**；只要最近那道是"没量过的"，就停。
+            def _w(vy: float) -> float:
+                return vt_world_y(vy, py, half, a.y_scale, a.y_bias, a.field_h)
+
+            _nearest_known = min((k for k in known if k > py + 10.0), default=None)
+            _nearest_unknown = None
             for _y in _ngy:
                 try:
-                    _d = float(_y) - py
+                    _wy = _w(float(_y))
                 except (TypeError, ValueError):
                     continue
-                if _d > 20.0 and _d < _stop_dist:
-                    _ua += 1
-            lock_state["unknown_ahead"] = _ua
+                if _wy > py + 10.0 and (_nearest_unknown is None or _wy < _nearest_unknown):
+                    _nearest_unknown = _wy
+            if _nearest_unknown is not None and (
+                    _nearest_known is None or _nearest_unknown < _nearest_known - 5.0):
+                lock_state["unknown_ahead"] = 1
+                lock_state["blocked_at"] = round(_nearest_unknown, 1)
+            else:
+                lock_state["unknown_ahead"] = 0
+                lock_state["blocked_at"] = None
             pv = s.get("player")
             dx_p = None if pv is None else float(pv[0]) - px
             #: 竖直方向的"帧新鲜度"：页面**不做夹取**，它永远把角色画在可见带
@@ -717,8 +735,12 @@ def main(argv: list[str] | None = None) -> int:
                        gr=round(float(w.get("gr", 640.0)), 1),
                        w=round(_raw_w, 1))
                     continue
-                gl = float(w.get("gl", 0.0)) - a.x_bias + margin
-                gr = float(w.get("gr", 640.0)) - a.x_bias - margin
+                #: 横向修正按**这道墙在帧内的页面 y** 取（畸变是"画面内位置"的函数；
+                #: 用绝对场地 y 会在远处墙上算出上百 px 的荒谬修正）
+                _vy_w = float(w.get("y", 0.0))
+                _xc = a.x_bias_a + a.x_bias_b * (_vy_w - a.view_h * 0.5)
+                gl = float(w.get("gl", 0.0)) - _xc + margin
+                gr = float(w.get("gr", 640.0)) - _xc - margin
                 if gr - gl < 60.0:
                     c = 0.5 * (gl + gr)
                     gl, gr = c - 35.0, c + 35.0
