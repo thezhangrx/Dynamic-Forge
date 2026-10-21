@@ -22,9 +22,12 @@ rm -f /tmp/vt.jsonl /tmp/cam.jpg
 #: **锁死相机曝光/白平衡**（第 3 项精度措施）。场景是固定屏幕 + 一个很亮的灯斑，
 #: 自动曝光会逐帧微调增益，墙的辉光厚度跟着变，墙行中心就漂 ±8 px。锁死之后
 #: 亮度只由场景决定。若现场光变了导致画面过暗/过亮，改 EXPOSURE_ABS 即可。
-if command -v v4l2-ctl >/dev/null 2>&1; then
+#: 曝光默认交给**自动**。曾试图锁死：这台相机拍屏幕时自动值远低于 200，
+#: 锁在 200 直接过曝全白、40 帧里 0 帧能测出墙（实测）。要固定就显式
+#: `CAM_CTRL_LOCK=1 EXPOSURE_ABS=<先自己确认亮度正常> sh start_cam.sh`。
+if [ "${CAM_CTRL_LOCK:-0}" = "1" ] && command -v v4l2-ctl >/dev/null 2>&1; then
     v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto=1 \
-             --set-ctrl=exposure_absolute="${EXPOSURE_ABS:-200}" \
+             --set-ctrl=exposure_absolute="${EXPOSURE_ABS:-50}" \
              --set-ctrl=white_balance_temperature_auto=0 \
              --set-ctrl=white_balance_temperature="${WB_TEMP:-4000}" \
              --set-ctrl=gain="${GAIN:-4}" 2>/dev/null || true
