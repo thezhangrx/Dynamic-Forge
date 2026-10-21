@@ -309,7 +309,8 @@ def start_camera_pipe(target: str, key: str, extra: str = "",
     """
     import subprocess
     split = "split=3[a][b][c]" if record else "split=2[a][b]"
-    extra_map = ('-map "[c]" -c:v mpeg4 -q:v 5 -r 15 -y /tmp/cam_rec.mp4 '
+    extra_map = ('-map "[c]" -c:v mpeg4 -q:v 3 -r 15 '
+                 '-movflags +frag_keyframe+empty_moov -y /tmp/cam_rec.mp4 '
                  if record else '')
     cmd = (
         #: 注意：这里必须用 `pkill -x`（按进程名精确匹配）而不是 `pkill -f`。

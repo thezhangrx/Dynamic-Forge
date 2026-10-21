@@ -500,11 +500,11 @@ def main(argv: list[str] | None = None) -> int:
         """
         if gl < 20.0 or gr > 620.0:
             return "edge"
-        for d in known_detail:
-            if abs(float(d["y"]) - gy) <= 250.0 \
-                    and abs(float(d["gl"]) - gl) <= 25.0 \
-                    and abs(float(d["gr"]) - gr) <= 25.0:
-                return "dup_known"
+        #: **不再用"缺口窗口相同"判重复**。墙的身份已经在上面按"行身份"
+        #: （y ± row_tol）判过了；再叠一层缺口身份会误杀真墙：实测 full1 里
+        #: 同一行的缺口边缘在帧间会跳 ±40 px（sig_e 被污染到 39.7），于是
+        #: 2598 次 `dup_known` 把绝大多数候选拒掉 —— 只学到 27 道（且含错行），
+        #: 板子世界模型残缺 → 17 次盲穿、卡在 y≈3158。
         return ""
 
     def emit_state(px: float, py: float, pr: float) -> None:
@@ -651,12 +651,19 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 if _wy > py + 10.0 and (_nearest_unknown is None or _wy < _nearest_unknown):
                     _nearest_unknown = _wy
-            if _nearest_unknown is not None and (
-                    _nearest_known is None or _nearest_unknown < _nearest_known - 5.0):
+            #: **开局也不许盲走**：在学到"前方某道墙的缺口"之前一律不动。
+            #: 实测 fix1/full1：开局还在测量，CLI 的第一条动作就发出去了，
+            #: 0.23 s 就穿过第一道墙（y=76.6，min_clearance −10，审计判 blind）。
+            if _nearest_known is None or (_nearest_unknown is not None
+                                          and _nearest_unknown < _nearest_known - 5.0):
                 if not lock_state["unknown_ahead"]:
                     lock_state["block_t0"] = time.monotonic()
                 lock_state["unknown_ahead"] = 1
-                lock_state["blocked_at"] = round(_nearest_unknown, 1)
+                #: `_nearest_unknown` 可能是 None（"还没有任何已知墙"这条分支），
+                #: 直接 round() 会让 agent 一启动就崩（实测 fix2/诊轮：0 事件、
+                #: 平台不动）。这里必须防 None。
+                lock_state["blocked_at"] = (None if _nearest_unknown is None
+                                            else round(_nearest_unknown, 1))
             else:
                 lock_state["unknown_ahead"] = 0
                 lock_state["blocked_at"] = None
@@ -977,8 +984,13 @@ def main(argv: list[str] | None = None) -> int:
                             import statistics as _st
                             _sy = _st.pstdev([o[0] for o in _grp])
                             _se = _st.pstdev([o[i] for o in _grp for i in (1, 2)])
-                            sig_y = 0.7 * sig_y + 0.3 * max(_sy, 0.3)
-                            sig_e = 0.7 * sig_e + 0.3 * max(_se, 0.3)
+                            #: 用**中位数**而不是均值做 EWMA，避免个别帧把噪声估计
+                            #: 顶到几十像素（once 被顶高，下面的"同墙重测"判据就会
+                            #: 变得过宽/过窄）。上限也夹一下：>15 px 说明这一组根本
+                            #: 不是同一道墙，不该拿来更新噪声。
+                            if _se <= 15.0:
+                                sig_e = 0.8 * sig_e + 0.2 * max(_se, 1.0)
+                            sig_y = 0.8 * sig_y + 0.2 * max(_sy, 0.3)
                             ev("noise_est", sig_y=round(sig_y, 2), sig_e=round(sig_e, 2),
                                n=len(_grp))
                     known.sort(key=lambda v: v)
@@ -1021,6 +1033,17 @@ def main(argv: list[str] | None = None) -> int:
         emit_state(px, py, pr)
         if time.monotonic() - last_status >= 2.0:
             last_status = time.monotonic()
+            #: **输入流体检**：VT 文件在长、但 seq 不长 = agent 的读取失效
+            #: （inode 被替换/offset 越界）。没有这条，就只能看到"怎么不学墙"，
+            #: 却不知道是视觉断了 —— 之前几轮就是在这个盲区里瞎改参数。
+            try:
+                _sz = Path(a.vt_jsonl).stat().st_size
+            except OSError:
+                _sz = -1
+            ev("vt_health", vt_size=_sz, vt_seq=int((s or {}).get("seq", -1)),
+               n_vt=len((s or {}).get("walls") or []), py=round(py, 1),
+               known=len(known), blocked=lock_state.get("unknown_ahead"),
+               paused=bool(paused), collecting=bool(collecting))
             print(f"  board: known={len(known)} paused={paused} "
                   f"vt_walls={len(s.get('walls', [])) if s else 0}", file=sys.stderr,
                   flush=True)
