@@ -300,6 +300,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--x-bias", type=float, default=0.0,
                     help="缺口横向固定偏移（像素，正=VT 比真值偏右）。"
                          "标定文件里给了就用文件里的；这里只是回退默认值")
+    ap.add_argument("--stuck-timeout", type=float, default=1.5,
+                    help="多少秒没前进判为'卡住'（触发重测/侧移）")
+    ap.add_argument("--stuck-rounds", type=int, default=3,
+                    help="连续这么多次'卡住→重测'仍无进展就放弃自救，把控制权交还规划器")
     ap.add_argument("--pulse-cycle", type=float, default=1.0,
                     help="被互锁挡住时的'凑近-重测'周期（秒）")
     ap.add_argument("--pulse-on", type=float, default=0.25,
@@ -433,6 +437,7 @@ def main(argv: list[str] | None = None) -> int:
     nudge_until = 0.0
     nudge_act = 0
     stuck_tries = 0
+    stuck_rounds = 0        #: 连续"卡住→重测"却没进展的轮数（>--stuck-rounds 就放弃自救）
     pause_seen: list[tuple[float, float, float]] = []
     last_prog_py = -1e9
     last_prog_t = time.monotonic()
@@ -603,14 +608,28 @@ def main(argv: list[str] | None = None) -> int:
         if py > last_prog_py + 2.0:
             last_prog_py = py
             last_prog_t = now_m
-        elif not paused and now_m - last_prog_t > 1.5:
+            stuck_rounds = 0        #: 真的前进了，自救计数清零
+        elif not paused and now_m - last_prog_t > a.stuck_timeout:
             #: 位置 1.5 s 没前进：多半是贴着墙沿推不过去，停下来按近距离重新测缺口。
             paused = True
             force_fix = True
             pause_t0 = now_m
             last_prog_t = now_m
             link.send_move(0)
-            ev("stuck", t_sim=None)
+            stuck_rounds += 1
+            #: **死循环保护**：'卡住→重测'如果连续 a.stuck_rounds 次都没换来进展，
+            #: 就不能再自救了 —— 实测 final1 卡在 y=565.8 时这套逻辑跑了 60 s：
+            #: 每 1.5 s 判一次 stuck → nudge 左/右来回 → py 一毫米没动。
+            #: 到这里改为"不再 nudge，把控制权交还规划器"并记事件。
+            if stuck_rounds > a.stuck_rounds:
+                nudge_until = 0.0
+                force_fix = False
+                ev("stuck_giveup", rounds=int(stuck_rounds), py=round(py, 1),
+                   nudge_until=0.0)
+                if a.verbose:
+                    print(f"  stuck ×{stuck_rounds} 放弃自救 y={py:.1f}", file=sys.stderr)
+            ev("stuck", t_sim=None, rounds=int(stuck_rounds), giveup=bool(
+                stuck_rounds > a.stuck_rounds))
             if a.verbose:
                 print(f"  stuck at y={py:.1f} → refit", file=sys.stderr, flush=True)
         if extras_t and time.monotonic() - extras_t > 1.5:
