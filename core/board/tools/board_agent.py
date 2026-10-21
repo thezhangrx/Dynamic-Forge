@@ -28,7 +28,7 @@ WALL_THICK = 8.0
 
 
 def vt_world_y(vy: float, py: float, half: float, y_scale: float, y_bias: float,
-               field_h: float = 3420.0) -> float:
+               field_h: float = 3420.0, q_c: float = 0.0) -> float:
     """VT 帧内 y → 场地 y。
 
     标定方法（对照画面里缺口已知的两道墙）：起点 py=40、真值 y=220 的墙 VT 报
@@ -40,7 +40,11 @@ def vt_world_y(vy: float, py: float, half: float, y_scale: float, y_bias: float,
     1.0286 倍（所以 scale≈1/1.0286）。**不要**再按 clamp 后的可见带算：那会把
     起点附近的墙整体错一行，而且缺口会配到隔壁那道墙上（实测左右侧各错 180）。
     """
-    return (float(py) - float(half)) + y_scale * float(vy) + y_bias
+    #: q_c ≠ 0 时用**二次**模型（吸收广角畸变带来的"同一像素行在不同高度对应不同
+    #: 场地 y"）。实测线性模型整轮残差 9.2 px(max 40)、二次 1.2 px；线性残差会让
+    #: 板子的世界模型里出现"错位的墙"，规划器以为走廊堵死就直接停住不动。
+    return ((float(py) - float(half)) + y_scale * float(vy) + y_bias
+            + q_c * float(vy) * float(vy))
 
 
 class VtTail:
@@ -287,6 +291,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="开局预热：前 N 秒不收墙（白框四角还在收敛）")
     ap.add_argument("--consensus-frames", type=int, default=3,
                     help="同一道墙要几帧一致才入表（2 帧时偶发错行缺口会被收下）")
+    ap.add_argument("--y-qc", type=float, default=0.0,
+                    help="y 模型的二次项（标定文件优先）；0 = 纯线性")
     ap.add_argument("--x-bias-a", type=float, default=None,
                     help="横向偏差常数项（标定文件优先）")
     ap.add_argument("--x-bias-b", type=float, default=None,
@@ -294,6 +300,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--x-bias", type=float, default=0.0,
                     help="缺口横向固定偏移（像素，正=VT 比真值偏右）。"
                          "标定文件里给了就用文件里的；这里只是回退默认值")
+    ap.add_argument("--pulse-cycle", type=float, default=1.0,
+                    help="被互锁挡住时的'凑近-重测'周期（秒）")
+    ap.add_argument("--pulse-on", type=float, default=0.25,
+                    help="一个周期里放行动作的时间（秒）；其余时间停住重测。"
+                         "只用来'凑近看清'，每步都很短，不可能盲穿")
     ap.add_argument("--react-s", type=float, default=0.5,
                     help="从'相机看到'到'动作生效'的延迟上界（秒）。用于算可刹停距离"
                          "= v*react_s*2；v 由位姿历史在线估计。这是实测的管道延迟，"
@@ -345,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
                 a.x_bias = float(_c.get("x_bias", 0.0) or 0.0)
                 #: 横向偏差**随 y 线性变化**的两个系数（x_corr = a + b*(y-240)）。
                 #: 单常数只能折中：实测同一画面 wall@280 偏 +0.9、wall@420 偏 +8.4。
+                a.y_qc = float(_c.get("q_c", 0.0) or 0.0)
                 a.x_bias_a = float(_c.get("x_bias_a", a.x_bias) or 0.0)
                 a.x_bias_b = float(_c.get("x_bias_b", 0.0) or 0.0)
                 print(f"  calib_loaded: scale={a.y_scale} bias={a.y_bias} "
@@ -527,7 +539,7 @@ def main(argv: list[str] | None = None) -> int:
             pass
 
     #: 读者线程与主循环共享的"安全互锁"状态（跨线程只能通过可变对象传递）
-    lock_state = {"unknown_ahead": 0}
+    lock_state = {"unknown_ahead": 0, "block_t0": time.monotonic()}
 
     # 决策输出线程：@MOVE → 主机
     def reader() -> None:
@@ -544,9 +556,19 @@ def main(argv: list[str] | None = None) -> int:
             changed = act != last_act
             last_act = act
             if lock_state["unknown_ahead"] > 0:
-                #: 前方有未测明的墙：无论 CLI 说什么都先停住（互锁，不依赖任何阈值）。
-                #: 注意这里必须 `continue`：用 `return` 会把整个 reader 线程退出。
-                link.send_move(0)
+                #: 前方有未测明的墙：**先停住**（互锁，不依赖阈值）。
+                #: 但"一直停着"会死锁：有些墙在当前位置就是量不出缺口（贴画面上下沿、
+                #: 被反光/角色挡住），只有凑近才看得到 —— 实测 demo3/demo4 就卡在
+                #: 墙前 20 单位处一动不动（act=0 十几秒）。
+                #: 所以加一个**有限接近**：每 cycle_s 里只放行 pulse_s 的动作，
+                #: 剩下的时间停住重测。每步都很短，不可能盲穿过去，但能凑近把墙量清。
+                _now = time.monotonic()
+                _t0 = float(lock_state.get("block_t0") or _now)
+                _ph = (_now - _t0) % max(0.2, a.pulse_cycle)
+                if _ph < a.pulse_on:
+                    link.send_move(act)          # 短脉冲：接近一点点
+                else:
+                    link.send_move(0)            # 其余时间停住、让 VT 重新测
                 continue
             if not paused and time.monotonic() >= nudge_until:
                 link.send_move(act)
@@ -618,7 +640,7 @@ def main(argv: list[str] | None = None) -> int:
             #: 现在的规则不需要阈值：把"已知墙"和"看见但没量出缺口的墙"都换算成
             #: 世界 y，取**最近的一道在前方的墙**；只要最近那道是"没量过的"，就停。
             def _w(vy: float) -> float:
-                return vt_world_y(vy, py, half, a.y_scale, a.y_bias, a.field_h)
+                return vt_world_y(vy, py, half, a.y_scale, a.y_bias, a.field_h, a.y_qc)
 
             _nearest_known = min((k for k in known if k > py + 10.0), default=None)
             _nearest_unknown = None
@@ -631,6 +653,8 @@ def main(argv: list[str] | None = None) -> int:
                     _nearest_unknown = _wy
             if _nearest_unknown is not None and (
                     _nearest_known is None or _nearest_unknown < _nearest_known - 5.0):
+                if not lock_state["unknown_ahead"]:
+                    lock_state["block_t0"] = time.monotonic()
                 lock_state["unknown_ahead"] = 1
                 lock_state["blocked_at"] = round(_nearest_unknown, 1)
             else:
@@ -719,7 +743,8 @@ def main(argv: list[str] | None = None) -> int:
                    px=round(px, 1), n_vt=len(walls))
                 walls = []
             for w in walls:
-                gy = vt_world_y(w["y"], py_cap, half, a.y_scale, a.y_bias, a.field_h)
+                gy = vt_world_y(w["y"], py_cap, half, a.y_scale, a.y_bias, a.field_h,
+                                a.y_qc)
                 ahead = gy - py
                 if not (5.0 < gy < a.field_h - 8.0) or ahead < -5.0:
                     continue

@@ -300,13 +300,17 @@ class SshLink:
 
 def start_camera_pipe(target: str, key: str, extra: str = "",
                       vt_bin: str = "/root/tools/vt_board",
-                      fps: float = 2.0, cam_w: int = 320, cam_h: int = 240) -> dict:
+                      fps: float = 2.0, cam_w: int = 320, cam_h: int = 240,
+                      record: bool = False) -> dict:
     """在板子上拉起相机管线：ffmpeg 抓 /dev/video0 → vt_board（VT 在板端）。
 
     **板端决策的输入只能是这条链路**（用户硬规则）。同时写 /tmp/vt_source=camera，
     板端 agent 会校验这个标记，synthetic 输入会被直接拒绝。
     """
     import subprocess
+    split = "split=3[a][b][c]" if record else "split=2[a][b]"
+    extra_map = ('-map "[c]" -c:v mpeg4 -q:v 5 -r 15 -y /tmp/cam_rec.mp4 '
+                 if record else '')
     cmd = (
         #: 注意：这里必须用 `pkill -x`（按进程名精确匹配）而不是 `pkill -f`。
         #: 这条命令是**通过 ssh 传过去的一整行**，remote bash 自己的 cmdline 里就
@@ -329,9 +333,10 @@ def start_camera_pipe(target: str, key: str, extra: str = "",
         'nohup bash -c \'ffmpeg -hide_banner -loglevel error '
         '-fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 '
         '-f v4l2 -input_format mjpeg -video_size 640x480 -i /dev/video0 '
-        f'-filter_complex "fps={fps:g},scale={cam_w}:{cam_h},split=2[a][b]" '
+        f'-filter_complex "fps={fps:g},scale={cam_w}:{cam_h},{split}" '
         '-map "[a]" -f rawvideo -pix_fmt rgb24 - '
         '-map "[b]" -update 1 -q:v 5 -y /tmp/cam.jpg '
+        f'{extra_map}'
         f'| {vt_bin} --w {cam_w} --h {cam_h} --frame-roi 0 0 {cam_w} {cam_h} '
         '--quad-file /tmp/quad.json --quad-state /tmp/qb.txt '
         '--jsonl /tmp/vt.jsonl %s >/dev/null\' '
@@ -559,6 +564,8 @@ def main(argv: list[str] | None = None) -> int:
                          "喂 320 等于每个页面像素只剩 0.41 个输入像素，墙只有 3 px 高，"
                          "行定位抖动 ±8；喂 640 抖动减半、缺口边界更稳（实测）")
     ap.add_argument("--cam-h", type=int, default=240, help="VT 输入高度")
+    ap.add_argument("--cam-record", action="store_true",
+                    help="把板端相机原始画面录一份 /tmp/cam_rec.mp4（给'相机视觉录像'用）")
     a = ap.parse_args(argv)
 
     spec = ScenarioSpec.load(a.scenario)
@@ -747,7 +754,8 @@ def main(argv: list[str] | None = None) -> int:
     if a.board_ssh and a.start_camera_pipe:
         _cam = start_camera_pipe(a.board_ssh, a.ssh_key, extra=a.vt_board_extra,
                                  vt_bin=a.cam_vt_bin, fps=a.cam_fps,
-                                 cam_w=a.cam_w, cam_h=a.cam_h)
+                                 cam_w=a.cam_w, cam_h=a.cam_h,
+                                 record=a.cam_record)
         print(f"  相机管线: {_cam}", file=sys.stderr)
         if not _cam.get("ok"):
             print("  ⚠ 相机管线没起来：板端会没有图像，本轮不会产生有效决策",

@@ -63,7 +63,10 @@ def set_exposure(value: int | None) -> None:
     相同）——我第一次搜索就是被这个坑成"所有候选都一样亮"的。
     """
     if value is None:
-        ssh("v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto_priority=0 2>/dev/null; "
+        #: **恢复自动时要把 priority 交还给自动**（=1）。只设 exposure_auto=3 而
+        #: priority 仍为 0，自动曝光不会真正收敛 —— 我这样把相机留在近黑状态，
+        #: 后面连续两次闭环被"相机看不到页面"闸门拦下（页面其实在屏上，只是全黑）。
+        ssh("v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto_priority=1 2>/dev/null; "
             "v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto=3 2>/dev/null; "
             "v4l2-ctl -d /dev/video0 --set-ctrl=white_balance_temperature_auto=1 2>/dev/null; "
             "echo ok")

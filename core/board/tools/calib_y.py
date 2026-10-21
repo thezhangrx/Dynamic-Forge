@@ -84,6 +84,64 @@ def collect_pairs(run_dir: Path) -> list[tuple[float, float, int]]:
     return pairs
 
 
+def fit_quad(pairs: list[tuple[float, float, int]], truth_y: list[float], half: float,
+             scale0: float = 1.0, bias0: float = 0.0, tol: float = 40.0,
+             rounds: int = 4) -> dict:
+    """y 的**二次**模型：world = (py-half) + a + b*vy + c*vy²。
+
+    为什么线性不够：页面四角只给单应 8 自由度，广角畸变让"同一像素行在不同高度上
+    对应的场地 y"不是线性的。实测一轮闭环里 16 行墙的 y 残差随 vy 呈弧形（679 应
+    是 640、836 应是 780、1578 应是 1620），线性拟合只能折中，残差 30~100 →
+    板子的世界模型里出现"错位的墙" → 规划器以为走廊被堵死，直接停住不动
+    （demo3/demo4/demo5 卡死都是这个）。
+    """
+    a, b = float(bias0), float(scale0)     # a 常数项、b 一次项
+    c = 0.0                                 # 二次项
+    for _ in range(max(1, rounds)):
+        rows: list[tuple[float, float, float]] = []
+        for (vy, py, _fr) in pairs:
+            world = (py - half) + a + b * vy + c * vy * vy
+            t = min(truth_y, key=lambda v: abs(v - world))
+            if abs(t - world) <= tol:
+                rows.append((vy, t - py + half, world - t))
+        if len(rows) < 12:
+            break
+        # 最小二乘（正规方程 3x3）
+        import itertools
+        basis = [(1.0, v, v * v) for (v, _y, _r) in rows]
+        rhs = [y for (_v, y, _r) in rows]
+        m = [[sum(bi[i] * bi[j] for bi in basis) for j in range(3)] for i in range(3)]
+        v = [sum(bi[i] * r for bi, r in zip(basis, rhs)) for i in range(3)]
+        for i in range(3):                     # 高斯消元
+            p = max(range(i, 3), key=lambda k: abs(m[k][i]))
+            m[i], m[p] = m[p], m[i]
+            v[i], v[p] = v[p], v[i]
+            if abs(m[i][i]) < 1e-12:
+                break
+            for k in range(i + 1, 3):
+                f = m[k][i] / m[i][i]
+                for j in range(i, 3):
+                    m[k][j] -= f * m[i][j]
+                v[k] -= f * v[i]
+        if abs(m[2][2]) < 1e-12:
+            break
+        c = v[2] / m[2][2]
+        b = (v[1] - m[1][2] * c) / m[1][1]
+        a = (v[0] - m[0][1] * b - m[0][2] * c) / m[0][0]
+        del itertools
+    res: list[float] = []
+    for (vy, py, _fr) in pairs:
+        world = (py - half) + a + b * vy + c * vy * vy
+        t = min(truth_y, key=lambda v: abs(v - world))
+        if abs(t - world) <= tol:
+            res.append(abs(world - t))
+    res.sort()
+    return {"q_a": round(a, 4), "q_b": round(b, 6), "q_c": round(c, 9),
+            "q_rmse": round(res[len(res) // 2], 3) if res else None,
+            "q_samples": len(res),
+            "scale": round(b, 5), "bias": round(a, 3)}   # 兼容旧字段（取一次项）
+
+
 def fit_x_bias(vt_rows: list[dict], frame_py: dict[int, float], truth_gaps: list[tuple],
                truth_y: list[float], scale: float, bias: float,
                half: float) -> tuple[float, float, int]:
@@ -199,7 +257,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"样本不足（{len(pairs)}），本轮跳过标定", flush=True)
         return 3
 
-    res = fit(pairs, truth_y, 0.5 * a.view_h, tol=a.tol)
+    lin = fit(pairs, truth_y, 0.5 * a.view_h, tol=a.tol)
+    res = fit_quad(pairs, truth_y, 0.5 * a.view_h,
+                   scale0=float(lin.get("scale") or 1.0),
+                   bias0=float(lin.get("bias") or 0.0), tol=a.tol)
+    res.update({"lin_rmse": lin.get("rmse"), "lin_max": lin.get("max_abs")})
 
     #: 同一批样本顺带拟合横向固定偏差（页面四角单应挡不住桶形畸变）
     meta = cfg.get("meta", {})
