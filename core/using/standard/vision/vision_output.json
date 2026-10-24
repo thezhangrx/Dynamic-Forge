@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/bullet-platform/standard/vision/vision_output.json",
+  "title": "VisionFrame（视觉输出）",
+  "description": "视觉模块对外的唯一输出格式：一帧里看到了什么。载荷里的 player / obstacles 直接复用规范一与规范二的 schema（相对 $ref），本条消息只额外补上「时间、坐标系、单位、标定、观测质量」这些属于『观测』而非『实体』的信息。",
+  "x-standard-version": 1,
+  "type": "object",
+  "required": ["standard_version", "seq", "stamp", "frame_id", "units"],
+  "additionalProperties": false,
+  "properties": {
+    "standard_version": { "type": "integer", "const": 1, "description": "本规范版本。" },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "帧序号，单调递增。只用于去重与丢帧检测，绝不用来算 dt。"
+    },
+    "stamp": {
+      "type": "number",
+      "description": "采集时刻（秒），来自 v4l2_buffer.timestamp 或仿真 sim_time。测速的唯一合法时间基准。"
+    },
+    "frame_id": {
+      "type": "string",
+      "default": "field",
+      "description": "本帧所有位置/速度所在的坐标系。消费者不得自行推断速度的参考系。"
+    },
+    "camera_frame_id": {
+      "type": ["string", "null"],
+      "default": "camera",
+      "description": "相机自身坐标系，供标定追溯。"
+    },
+    "units": {
+      "type": "string",
+      "enum": ["px", "m"],
+      "description": "载荷单位。标定完成前必须是 px；完成后为 m。必须显式声明，不允许隐含。"
+    },
+    "metres_per_unit": {
+      "type": ["number", "null"],
+      "default": null,
+      "exclusiveMinimum": 0,
+      "description": "1 个世界单位等于多少米。约定同 nav_msgs/MapMetaData.resolution。units=m 时为 1.0。"
+    },
+    "field_origin": {
+      "type": ["array", "null"],
+      "default": null,
+      "items": { "type": "number" },
+      "minItems": 2,
+      "maxItems": 2,
+      "description": "图像像素 (0,0) 对应的场地坐标 [x, y]。对应 ROS MapMetaData.origin。"
+    },
+    "image_width": { "type": ["integer", "null"], "default": null, "minimum": 1 },
+    "image_height": { "type": ["integer", "null"], "default": null, "minimum": 1 },
+    "calibration": { "$ref": "#/$defs/Calibration" },
+    "player": {
+      "oneOf": [
+        { "$ref": "../player/player.json" },
+        { "type": "null" }
+      ],
+      "description": "角色观测；null 表示这一帧没看到角色。"
+    },
+    "obstacles": {
+      "type": "array",
+      "items": { "$ref": "../obstacle/obstacle.json" },
+      "default": [],
+      "description": "障碍观测列表。在视觉输出里 Obstacle.id 就是跟踪 ID（track id），跨帧稳定；它与平台真值的 id 不是同一个 ID 空间。"
+    },
+    "gaps": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/GapObs" },
+      "default": [],
+      "description": "缺口列表（派生关系，不是实体）。由构成缺口的两段墙推出，用 blockers 指回它们的 id。"
+    },
+    "target": {
+      "oneOf": [
+        { "$ref": "#/$defs/TargetObs" },
+        { "type": "null" }
+      ],
+      "description": "目标区域观测；字段与平台 target f32[6] 对齐，可直接写回 State 帧。"
+    },
+    "diagnostics": {
+      "type": ["object", "null"],
+      "default": null,
+      "description": "诊断计数，不参与决策。",
+      "additionalProperties": true,
+      "properties": {
+        "n_obstacles": { "type": "integer", "minimum": 0 },
+        "occluded_fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "field_span": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "识别到的场地 x 范围 [x_min, x_max]（像素）。"
+        },
+        "elapsed_ms": { "type": "number", "minimum": 0 },
+        "params": { "type": ["object", "null"], "description": "产生本帧的参数快照，用于复现。" }
+      }
+    }
+  },
+  "$defs": {
+    "Calibration": {
+      "title": "标定信息",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "description": "标定标识；载荷里通常只带 id，参数离线查表。" },
+        "K": {
+          "type": ["array", "null"],
+          "items": { "type": "number" },
+          "minItems": 9,
+          "maxItems": 9,
+          "description": "3x3 内参矩阵（行主序），对应畸变原图。注意 CameraInfo 的 K 是畸变原图、P 是校正后图，二者不可混用。"
+        },
+        "D": {
+          "type": ["array", "null"],
+          "items": { "type": "number" },
+          "description": "畸变系数（plumb_bob 等模型）。"
+        },
+        "H_field_from_image": {
+          "type": ["array", "null"],
+          "items": { "type": "number" },
+          "minItems": 9,
+          "maxItems": 9,
+          "description": "3x3 单应矩阵（图像 -> 场地，行主序）。这是把像素测量变成世界坐标的唯一映射，也是唯一真值源。"
+        },
+        "rms_reprojection_px": {
+          "type": ["number", "null"],
+          "default": null,
+          "minimum": 0,
+          "description": "标定重投影 RMS 残差（像素），标定质量的直接指标。"
+        }
+      }
+    },
+    "GapObs": {
+      "title": "缺口观测（派生关系）",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "center", "width", "blockers"],
+      "properties": {
+        "id": { "type": "integer", "minimum": 0, "description": "缺口自身的跟踪 ID，跨帧稳定（缺口会扫动）。" },
+        "center": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "缺口中心 [x, y]，世界系。"
+        },
+        "width": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "缺口宽度。与角色半径同单位，因此可直接与 2*radius 比较（平台硬约束：缺口不得小于玩家圆直径）。"
+        },
+        "axis": {
+          "type": "number",
+          "default": 0,
+          "description": "缺口轴向（弧度）= 墙长边方向。"
+        },
+        "blockers": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "构成这个缺口的两段墙的 Obstacle.id，按主轴排序 [左, 右]。"
+        },
+        "blocked_by_type": {
+          "type": ["string", "null"],
+          "default": "wall_with_gap",
+          "description": "产生该缺口的障碍类型。"
+        },
+        "reliable": {
+          "type": "boolean",
+          "default": true,
+          "description": "两侧边界是否都可信。有一侧被遮挡/高光饱和时为 false —— 此时宽度是推出来的而不是看到的，决策层应改用先验而不是盲信该值。"
+        },
+        "occluded": { "type": "boolean", "default": false, "description": "边界是否被遮挡或高光饱和。" },
+        "score": { "type": ["number", "null"], "default": null, "minimum": 0, "maximum": 1 }
+      }
+    },
+    "TargetObs": {
+      "title": "目标区域观测",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "shape"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "radius": { "type": ["number", "null"], "default": null, "exclusiveMinimum": 0 },
+        "shape": { "type": "string", "enum": ["circle", "rect"] },
+        "half_w": { "type": ["number", "null"], "default": null, "exclusiveMinimum": 0 },
+        "half_h": { "type": ["number", "null"], "default": null, "exclusiveMinimum": 0 },
+        "score": { "type": ["number", "null"], "default": null, "minimum": 0, "maximum": 1 },
+        "valid": { "type": "boolean", "default": true },
+        "occluded": { "type": "boolean", "default": false }
+      }
+    }
+  },
+  "examples": [
+    {
+      "standard_version": 1,
+      "seq": 741,
+      "stamp": 12.345,
+      "frame_id": "field",
+      "camera_frame_id": "camera0",
+      "units": "px",
+      "metres_per_unit": null,
+      "field_origin": [0.0, 0.0],
+      "image_width": 640,
+      "image_height": 480,
+      "calibration": {
+        "id": "cam0-uncalibrated",
+        "K": null,
+        "D": null,
+        "H_field_from_image": null,
+        "rms_reprojection_px": null
+      },
+      "player": { "x": 221.3, "y": 333.4, "radius": 9.0, "vx": 12.5, "vy": -30.0, "speed": 120.0, "alive": true, "score": 0.92 },
+      "obstacles": [
+        { "id": 2001, "type": "wall_with_gap", "type_id": 2, "shape": "rect", "x": 177.0, "y": 141.0, "vx": 0.0, "vy": -40.0, "half_w": 177.5, "half_h": 9.5, "rotation": 0.0, "angle": -1.5708, "group_id": 11, "score": 0.95, "valid": true, "occluded": false },
+        { "id": 2002, "type": "wall_with_gap", "type_id": 2, "shape": "rect", "x": 447.0, "y": 153.0, "vx": 0.0, "vy": -40.0, "half_w": 47.5, "half_h": 8.0, "rotation": 0.0, "angle": -1.5708, "group_id": 11, "score": 0.71, "valid": true, "occluded": true }
+      ],
+      "gaps": [
+        { "id": 1, "center": [377.0, 147.0], "width": 45.0, "axis": 0.0, "blockers": [2001, 2002], "blocked_by_type": "wall_with_gap", "reliable": false, "occluded": true, "score": 0.71 }
+      ],
+      "target": { "x": 221.4, "y": 182.6, "radius": 12.5, "shape": "circle", "score": 0.88, "valid": true, "occluded": false },
+      "diagnostics": { "n_obstacles": 2, "occluded_fraction": 0.18, "field_span": [0, 494], "elapsed_ms": 144 }
+    }
+  ]
+}

@@ -28,7 +28,7 @@ WALL_THICK = 8.0
 
 
 def vt_world_y(vy: float, py: float, half: float, y_scale: float, y_bias: float,
-               field_h: float = 3420.0, q_c: float = 0.0) -> float:
+               field_h: float = 3420.0) -> float:
     """VT 帧内 y → 场地 y。
 
     标定方法（对照画面里缺口已知的两道墙）：起点 py=40、真值 y=220 的墙 VT 报
@@ -40,11 +40,7 @@ def vt_world_y(vy: float, py: float, half: float, y_scale: float, y_bias: float,
     1.0286 倍（所以 scale≈1/1.0286）。**不要**再按 clamp 后的可见带算：那会把
     起点附近的墙整体错一行，而且缺口会配到隔壁那道墙上（实测左右侧各错 180）。
     """
-    #: q_c ≠ 0 时用**二次**模型（吸收广角畸变带来的"同一像素行在不同高度对应不同
-    #: 场地 y"）。实测线性模型整轮残差 9.2 px(max 40)、二次 1.2 px；线性残差会让
-    #: 板子的世界模型里出现"错位的墙"，规划器以为走廊堵死就直接停住不动。
-    return ((float(py) - float(half)) + y_scale * float(vy) + y_bias
-            + q_c * float(vy) * float(vy))
+    return (float(py) - float(half)) + y_scale * float(vy) + y_bias
 
 
 class VtTail:
@@ -158,16 +154,12 @@ class StdioLink:
         self.pose = (320.0, 60.0, 10.0)
         self.pose_seq = 0
         self.pose_t = time.monotonic()
-        self.start_req = False
         self._lock = threading.Lock()
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self) -> None:
         for line in sys.stdin:
             t = line.strip()
-            if t.startswith("@START"):
-                self.start_req = True       # 主机开跑：让主循环重新压住平台
-                continue
             if not t.startswith("@POSE"):
                 continue
             try:
@@ -275,12 +267,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--field-h", type=float, default=3420.0)
     ap.add_argument("--goal", type=float, nargs=2, default=(320.0, 3360.0))
     ap.add_argument("--view-h", type=float, default=480.0)
-    #: **膨胀半径默认由角色半径推**（半径 + 4）。以前默认 26：板端存进表里的缺口
-    #: 已经两侧各收过 margin（≈70 宽），再各膨胀 26 只剩 18 < 角色直径 20 ——
-    #: 规划器把这些缺口全判成"过不去"，于是回 0（卡死）或者贴着边挤过去
-    #: （实测 r8 min_clearance +1.72、r12/r13/r14 min_clearance −10：中心压进墙里）。
-    #: 这条"自动推"写在下面对 inflate<=0 的分支里，但默认值 26 让那个分支永远不生效。
-    ap.add_argument("--inflate", type=float, default=0.0)
+    ap.add_argument("--inflate", type=float, default=26.0)
     ap.add_argument("--pause-ahead", type=float, default=220.0)
     ap.add_argument("--y-bias", type=float, default=0.0,
                     help="同上的截距；外部四边形正确时为 0")
@@ -294,36 +281,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gap-margin", type=float, default=10.0)
     ap.add_argument("--state-file", default="/tmp/board_state.txt",
                     help="把发给决策的 @STATE 逐行落盘（事后核查墙覆盖率）")
-    ap.add_argument("--player-radius", type=float, default=10.0,
-                    help="角色半径（场地单位）；用于自动推 inflate 与余量判据")
     ap.add_argument("--player-tol", type=float, default=30.0,
                     help="VT 角色 x 与主机 px 偏差超过这个值 → 判为几何坏帧（整帧作废）")
     ap.add_argument("--warmup", type=float, default=2.5,
                     help="开局预热：前 N 秒不收墙（白框四角还在收敛）")
     ap.add_argument("--consensus-frames", type=int, default=3,
                     help="同一道墙要几帧一致才入表（2 帧时偶发错行缺口会被收下）")
-    ap.add_argument("--y-qc", type=float, default=0.0,
-                    help="y 模型的二次项（标定文件优先）；0 = 纯线性")
-    ap.add_argument("--x-bias-a", type=float, default=None,
-                    help="横向偏差常数项（标定文件优先）")
-    ap.add_argument("--x-bias-b", type=float, default=None,
-                    help="横向偏差随 y 的斜率（标定文件优先）")
     ap.add_argument("--x-bias", type=float, default=0.0,
                     help="缺口横向固定偏移（像素，正=VT 比真值偏右）。"
                          "标定文件里给了就用文件里的；这里只是回退默认值")
-    ap.add_argument("--stuck-timeout", type=float, default=1.5,
-                    help="多少秒没前进判为'卡住'（触发重测/侧移）")
-    ap.add_argument("--stuck-rounds", type=int, default=3,
-                    help="连续这么多次'卡住→重测'仍无进展就放弃自救，把控制权交还规划器")
-    ap.add_argument("--pulse-cycle", type=float, default=1.0,
-                    help="被互锁挡住时的'凑近-重测'周期（秒）")
-    ap.add_argument("--pulse-on", type=float, default=0.25,
-                    help="一个周期里放行动作的时间（秒）；其余时间停住重测。"
-                         "只用来'凑近看清'，每步都很短，不可能盲穿")
-    ap.add_argument("--react-s", type=float, default=0.5,
-                    help="从'相机看到'到'动作生效'的延迟上界（秒）。用于算可刹停距离"
-                         "= v*react_s*2；v 由位姿历史在线估计。这是实测的管道延迟，"
-                         "不是场景参数；换相机/降分辨率后应重新量一次")
     ap.add_argument("--tol-vy", type=float, default=7.0,
                     help="多帧一致时允许的帧内墙行差（像素）。**这是噪声参数，不是场景参数**："
                          "实测静止条件下同一道墙的 vy 重复性 1σ≈8 px，卡在 7 会把一半"
@@ -339,9 +305,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pause-timeout", type=float, default=4.0,
                     help="一次暂停最多等这么久；VT 越快这个值越该小（现在 6 fps"
                          "下 consensus 通常 <0.5 s 就够，4 s 会把整轮时间全吃掉）")
-    ap.add_argument("--vt-latency", type=float, default=0.6,
-                    help="画面链路延时（秒）：相机曝光+ffmpeg+页面推流+板端读取。"
-                         "实测 0.6 s（A/B 换画面测出来的），见 docs/闭环标准配置.md")
     ap.add_argument("--settle", type=float, default=0.9,
                     help="暂停后等多久再收候选帧（VT 有 ~0.5 s 延迟）")
     ap.add_argument("--from-end", action="store_true",
@@ -352,14 +315,6 @@ def main(argv: list[str] | None = None) -> int:
                     help="板端结构化事件（JSONL）：VT 帧/pause/add_wall/fix/nudge/move")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
-    if a.inflate <= 0.0:
-        #: 自动：留 4 px 余量即可；再大就可能把"自己能过"的缺口判成过不去
-        a.inflate = float(a.player_radius) + 4.0
-    #: 横向偏差的默认值归一（标定文件里没有就退回常数项/0）
-    if a.x_bias_a is None:
-        a.x_bias_a = float(a.x_bias)
-    if a.x_bias_b is None:
-        a.x_bias_b = 0.0
 
     t_boot = time.monotonic()
     #: 自动标定的 y 换算系数：优先用标定文件（由 calib_y.py 自动解出），
@@ -375,11 +330,6 @@ def main(argv: list[str] | None = None) -> int:
                 #: 和 scale/bias 一样是**标定产物**，不是手调常数：由 calib_y 用
                 #: 一组静止画面 + 真值算中位数得到，写进同一个 calib 文件。
                 a.x_bias = float(_c.get("x_bias", 0.0) or 0.0)
-                #: 横向偏差**随 y 线性变化**的两个系数（x_corr = a + b*(y-240)）。
-                #: 单常数只能折中：实测同一画面 wall@280 偏 +0.9、wall@420 偏 +8.4。
-                a.y_qc = float(_c.get("q_c", 0.0) or 0.0)
-                a.x_bias_a = float(_c.get("x_bias_a", a.x_bias) or 0.0)
-                a.x_bias_b = float(_c.get("x_bias_b", 0.0) or 0.0)
                 print(f"  calib_loaded: scale={a.y_scale} bias={a.y_bias} "
                       f"({calib_file})", file=sys.stderr, flush=True)
         except (OSError, ValueError):
@@ -427,30 +377,7 @@ def main(argv: list[str] | None = None) -> int:
     #: 缺口窗口 -> 已入库的墙 y。同一道物理墙远/近两次测量会被映射成不同的 y
     #: （映射依赖 py，实测 215 → 345），按 y 去重就会重复入表、出现"同侧两道墙"。
     #: 缺口位置与 py 无关，用它当身份最稳。
-    #: **在线噪声估计**（不写死容差）：
-    #:   sig_y = 墙行 y 的重复性；sig_e = 缺口左右边界的重复性。
-    #: 由每次"多帧一致"里同一道墙的散度做 EWMA 得到。所有"同一道墙/缺口合理"
-    #: 的判据都用它们乘系数，而不是 ±25 / ±30 / ±45 这类凭经验写死的数。
-    sig_y = 4.0
-    sig_e = 3.0
-
-    def row_tol() -> float:
-        """同一道墙的 y 容差：由在线噪声与**已学到的行间距**共同决定。
-
-        两道真墙的 y 相差"行间距"（本场景 140，但这里不写死：取已知行间距的
-        最小值）。容差取行间距的 1/3 与 6σ_y 的较小者，保证既不会把两道墙
-        合成一道，也不会把同一道墙的两次测量当成两道。
-        """
-        #: 2026-10-21 实测：板端墙行的**单次测量误差**不是 1~2 px —— 亮屏/灯斑
-        #: 条件下同一道墙偶尔会被量到 27~29 px 之外（r8：528.2/665.7/947.4 三道
-        #: 都是"真墙 +28"）。原来 6σ_y（≈18）的容差把这种测量当成了**另一道新墙**，
-        #: 于是同一道物理墙在表里出现两次（r4 出现过五道），规划器判"走廊全堵"
-        #: 停住，审计也把它们判成"盲穿"。容差取 12σ_y（实测 ≈25~30），既能把
-        #: 同一道墙的两次测量并成一道，又远小于真墙间距（140）的 1/3。
-        ys = sorted(known)
-        gaps = [b - a for a, b in zip(ys, ys[1:]) if b - a > 8.0]
-        spacing = min(gaps) if gaps else 140.0
-        return max(12.0, min(spacing / 3.0, 12.0 * sig_y))
+    known_by_gap: dict[tuple[int, int], float] = {}
     seq = 0
     last_act = 0
     last_vt_seq = -1
@@ -460,7 +387,6 @@ def main(argv: list[str] | None = None) -> int:
     nudge_until = 0.0
     nudge_act = 0
     stuck_tries = 0
-    stuck_rounds = 0        #: 连续"卡住→重测"却没进展的轮数（>--stuck-rounds 就放弃自救）
     pause_seen: list[tuple[float, float, float]] = []
     last_prog_py = -1e9
     last_prog_t = time.monotonic()
@@ -528,11 +454,11 @@ def main(argv: list[str] | None = None) -> int:
         """
         if gl < 20.0 or gr > 620.0:
             return "edge"
-        #: **不再用"缺口窗口相同"判重复**。墙的身份已经在上面按"行身份"
-        #: （y ± row_tol）判过了；再叠一层缺口身份会误杀真墙：实测 full1 里
-        #: 同一行的缺口边缘在帧间会跳 ±40 px（sig_e 被污染到 39.7），于是
-        #: 2598 次 `dup_known` 把绝大多数候选拒掉 —— 只学到 27 道（且含错行），
-        #: 板子世界模型残缺 → 17 次盲穿、卡在 y≈3158。
+        for d in known_detail:
+            if abs(float(d["y"]) - gy) <= 250.0 \
+                    and abs(float(d["gl"]) - gl) <= 25.0 \
+                    and abs(float(d["gr"]) - gr) <= 25.0:
+                return "dup_known"
         return ""
 
     def emit_state(px: float, py: float, pr: float) -> None:
@@ -541,12 +467,6 @@ def main(argv: list[str] | None = None) -> int:
         for d in known_detail:
             y = float(d["y"])
             gl = float(d["gl"]); gr = float(d["gr"])
-            #: **已经穿过去的墙不再当障碍发**：它的膨胀体（inflate）会盖住角色
-            #: 当前位置，导致"角色在障碍里"→ 没有可行路径 → 规划器永远回 0。
-            #: 实测 final2：卡在 y=554.5 时 @STATE 里还带着 371/423.5/533.3 三道
-            #: 身后的墙，inflate 26 把它们各自膨胀成几十像素厚，直接把角色包住。
-            if y < py - 2.0 * pr:
-                continue
             if gl > 4.0:
                 obs.append(f"{gl * 0.5:.1f} {y:.1f} {gl * 0.5:.1f} 4.0 0.0")
             if gr < 636.0:
@@ -572,43 +492,6 @@ def main(argv: list[str] | None = None) -> int:
         except (BrokenPipeError, OSError):
             pass
 
-    #: 读者线程与主循环共享的"安全互锁"状态（跨线程只能通过可变对象传递）
-    lock_state = {"unknown_ahead": 0, "block_t0": time.monotonic()}
-
-    #: 主机开跑前会发一条 `@START`：板端要把状态清干净、重新压住平台。
-    #: 为什么需要：闸门校验要跑 20~40 s，这段时间板端的"停车测量"早超时恢复了，
-    #: 主机一开跑就把**队列里那条旧动作**执行掉 —— 实测 r15 在 t_sim=0.01 就
-    #: 执行了 act=2（往右横移），随后直着撞上真值 y=80 的墙（x≈371 在缺口外）。
-    #: front_guard 会在 reader 线程里被调，可能早于主循环第一次取位姿 —— 先给
-    #: 一份"最保守"的默认值（位置未知时不许前向），避免 NameError 把读者线程打死。
-    px, py = 0.0, 0.0
-    pose_ready = False
-
-    def front_guard(act_: int) -> int:
-        """**自己认的缺口之外，不许往前开**（只许横移）。
-
-        为什么：规划器给的是"朝缺口中心走"，但缺口两侧各收了 margin、加上横向
-        标定偏差，实际 x 可能仍在自己认的缺口边缘以外；这时"前进"就是拿真值更宽
-        的缺口赌没撞（审计把这种叫"侥幸"：r12 就判了侥幸）。安全第一：不在缺口里
-        就只放行 ±x，先把 x 摆进缺口再走。
-        """
-        if act_ not in (3, 5, 6):        # 3=+y 5=左上 6=右上
-            return act_
-        if not pose_ready:
-            return 0                     # 位姿还没到：别动
-        ahead = [d for d in known_detail if float(d["y"]) > py]
-        if not ahead:
-            return act_                 # 还没学到墙：保持原动作（互锁会管）
-        d = min(ahead, key=lambda q: float(q["y"]) - py)
-        gl_, gr_ = float(d["gl"]), float(d["gr"])
-        if gl_ + 1.0 <= px <= gr_ - 1.0:
-            return act_
-        if act_ == 5:
-            return 1
-        if act_ == 6:
-            return 2
-        return 0
-
     # 决策输出线程：@MOVE → 主机
     def reader() -> None:
         nonlocal last_act
@@ -623,42 +506,10 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             changed = act != last_act
             last_act = act
-            if lock_state["unknown_ahead"] > 0:
-                if paused or time.monotonic() < nudge_until:
-                    #: **暂停/开局一律不动**。以前这里不看 paused，直接放行
-                    #: "每 cycle 里 0.25 s 的 act" —— 开局决策进程给的第一个动作
-                    #: 是"朝终点斜着走"(6=+x+y)，于是平台在**还没学到第一道墙**的
-                    #: 时候就斜着冲出去：实测 r12/r13/r14 三轮**都在同一个点**
-                    #: （真值 y=80 的墙、x≈347，正是缺口右侧的墙面）把中心压进墙里
-                    #: （min_clearance −10.0）。这不是偶然，是开局的固定 bug。
-                    link.send_move(0)
-                    continue
-                #: 前方有未测明的墙：**先停住**（互锁，不依赖阈值）。
-                #: 但"一直停着"会死锁：有些墙在当前位置就是量不出缺口（贴画面上下沿、
-                #: 被反光/角色挡住），只有凑近才看得到 —— 实测 demo3/demo4 就卡在
-                #: 墙前 20 单位处一动不动（act=0 十几秒）。
-                #: 所以加一个**有限接近**：每 cycle_s 里只放行 pulse_s 的动作，
-                #: 剩下的时间停住重测。每步都很短，不可能盲穿过去，但能凑近把墙量清。
-                _now = time.monotonic()
-                _t0 = float(lock_state.get("block_t0") or _now)
-                _ph = (_now - _t0) % max(0.2, a.pulse_cycle)
-                if _ph < a.pulse_on:
-                    link.send_move(front_guard(act))   # 短脉冲：接近一点点
-                else:
-                    link.send_move(0)            # 其余时间停住、让 VT 重新测
-                continue
             if not paused and time.monotonic() >= nudge_until:
-                link.send_move(front_guard(act))
+                link.send_move(act)
                 if changed:
                     ev("move_sent", act=int(act), src="cli")
-            elif paused and time.monotonic() >= nudge_until:
-                #: **暂停期间持续压住**：只在暂停那一刻发一次 0 是不够的 ——
-                #: 决策进程还会继续吐 @MOVE，读者线程和主线程抢着发，最后一条
-                #: 常常是"继续走"，于是"停住测量"变成了"边走边测"。实测 r8：
-                #: 同一批里两道墙都偏 +26~28 单位（画面是 1.5 s 前的位置），
-                #: 墙表里就多出 528/665 这种"错一行"的墙，审计判成盲穿。
-                #: 每来一条决策就补一个 0，代价是几条 TCP 小包。
-                link.send_move(0)
 
     threading.Thread(target=reader, daemon=True).start()
     print(f"  board agent: vt={a.vt_jsonl} host={a.host}:{a.port} "
@@ -680,22 +531,7 @@ def main(argv: list[str] | None = None) -> int:
     extras: list[tuple[float, float, float]] = []
     while True:
         s = vt.latest()
-        if getattr(link, "start_req", False):
-            link.start_req = False
-            paused = True
-            collecting = False
-            extras = []
-            prev_extras = []
-            pause_seen = []
-            pause_t0 = time.monotonic()
-            last_prog_py, last_prog_t = py, time.monotonic()
-            link.send_move(0)
-            ev("start_hold", py=round(py, 1), n_known=len(known))
-            if a.verbose:
-                print("  @START：重新压住平台，等第一道墙测清楚", file=sys.stderr,
-                      flush=True)
         px, py, pr = link.get_pose()
-        pose_ready = True
         now_m = time.monotonic()
         pose_hist.append((now_m, py))
         if len(pose_hist) > 600:      # ≈5 s @110 Hz
@@ -703,28 +539,14 @@ def main(argv: list[str] | None = None) -> int:
         if py > last_prog_py + 2.0:
             last_prog_py = py
             last_prog_t = now_m
-            stuck_rounds = 0        #: 真的前进了，自救计数清零
-        elif not paused and now_m - last_prog_t > a.stuck_timeout:
+        elif not paused and now_m - last_prog_t > 1.5:
             #: 位置 1.5 s 没前进：多半是贴着墙沿推不过去，停下来按近距离重新测缺口。
             paused = True
             force_fix = True
             pause_t0 = now_m
             last_prog_t = now_m
             link.send_move(0)
-            stuck_rounds += 1
-            #: **死循环保护**：'卡住→重测'如果连续 a.stuck_rounds 次都没换来进展，
-            #: 就不能再自救了 —— 实测 final1 卡在 y=565.8 时这套逻辑跑了 60 s：
-            #: 每 1.5 s 判一次 stuck → nudge 左/右来回 → py 一毫米没动。
-            #: 到这里改为"不再 nudge，把控制权交还规划器"并记事件。
-            if stuck_rounds > a.stuck_rounds:
-                nudge_until = 0.0
-                force_fix = False
-                ev("stuck_giveup", rounds=int(stuck_rounds), py=round(py, 1),
-                   nudge_until=0.0)
-                if a.verbose:
-                    print(f"  stuck ×{stuck_rounds} 放弃自救 y={py:.1f}", file=sys.stderr)
-            ev("stuck", t_sim=None, rounds=int(stuck_rounds), giveup=bool(
-                stuck_rounds > a.stuck_rounds))
+            ev("stuck", t_sim=None)
             if a.verbose:
                 print(f"  stuck at y={py:.1f} → refit", file=sys.stderr, flush=True)
         if extras_t and time.monotonic() - extras_t > 1.5:
@@ -740,38 +562,6 @@ def main(argv: list[str] | None = None) -> int:
             #: 几何自检：页面把角色画在它的场地 x 上（视口中线固定 320），所以
             #: VT 量到的角色 x 应该 ≈ 主机 px。偏了就说明白框/四边形检测坏了，
             #: 这一帧的缺口 x 一律不可信 —— 整帧丢掉，别让它污染 known。
-            #: **前方有"看得见但量不出缺口"的墙 → 不许前进**。
-            #: 只靠"learned 的墙"来判断安全是不够的：开局或换行时，VT 明明看到
-            #: 一条墙带却量不出缺口，板子却以为自己什么都不知道、于是直着开过去
-            #: （实测 s1e：t=2.42 在 wall@360 上 -10）。这条互锁不看真值、不看
-            #: 场景参数，只用板端自己的观测：只要前方有未测明的墙，就发 0 等测。
-            _ngy = s.get("no_gap_y") or []
-            #: **前方任何"看得见但还没入表"的墙 → 不许前进**（互锁，无阈值）。
-            #: 判据只用板端自己的观测：把本帧"有缺口的墙"和"看得见但量不出缺口的行"
-            #: 都换算成世界 y，凡是"在后方 10 单位以上、且已知表里没有另一道 y 相近的墙"
-            #: 的，都算"未记录"，一律停住等它被测出来。
-            #: 之前的版本只检查 no_gap_y，漏掉了"VT 能测到、但 agent 还没接受"的墙 ——
-            #: 实测 fix4 就是这样在 t=0.67 s 盲穿了第一道墙（y=82，−10）。
-            def _w(vy: float) -> float:
-                return vt_world_y(vy, py, half, a.y_scale, a.y_bias, a.field_h, a.y_qc)
-
-            _vis: list[float] = []
-            for _wall in (s.get("walls") or []):
-                try:
-                    _vis.append(_w(float(_wall.get("y", 0.0))))
-                except (TypeError, ValueError):
-                    pass
-            for _y in _ngy:
-                try:
-                    _vis.append(_w(float(_y)))
-                except (TypeError, ValueError):
-                    pass
-            _unrecorded = [v for v in _vis
-                           if v > py + 10.0
-                           and not any(abs(v - k) <= row_tol() for k in known)]
-            lock_state["unknown_ahead"] = 1 if _unrecorded else 0
-            lock_state["blocked_at"] = (round(min(_unrecorded), 1)
-                                        if _unrecorded else None)
             pv = s.get("player")
             dx_p = None if pv is None else float(pv[0]) - px
             #: 竖直方向的"帧新鲜度"：页面**不做夹取**，它永远把角色画在可见带
@@ -798,13 +588,7 @@ def main(argv: list[str] | None = None) -> int:
             py_cap = py
             contemporaneous = True
             if t_fr is not None:
-                #: **画面链路延时补偿**：`s["t"]` 是板端"读到这一帧"的时刻，而帧里
-                #: 的画面是更早 0.6 s 拍的（相机曝光→ffmpeg→页面推流→查看器）。
-                #: 实测这段延时 ≈0.6 s：平台 58 单位/s，不补偿就是 **+29 单位/道墙**
-                #: 的系统误差 —— 同一道墙在 y=795 被记成 943.8（+19），r4/r5/r7 的
-                #: "走廊全堵→规划器停住"全是这么来的。静止时这段补偿是 0（位姿不变），
-                #: 所以它对"停稳再测"那条纪律没有任何副作用。
-                _py_at = py_at(float(t_fr) - float(a.vt_latency))
+                _py_at = py_at(float(t_fr))
                 if _py_at is not None:
                     py_cap = float(_py_at)
                     lag_ms = round((now_m - float(t_fr)) * 1000.0, 1)
@@ -861,8 +645,7 @@ def main(argv: list[str] | None = None) -> int:
                    px=round(px, 1), n_vt=len(walls))
                 walls = []
             for w in walls:
-                gy = vt_world_y(w["y"], py_cap, half, a.y_scale, a.y_bias, a.field_h,
-                                a.y_qc)
+                gy = vt_world_y(w["y"], py_cap, half, a.y_scale, a.y_bias, a.field_h)
                 ahead = gy - py
                 if not (5.0 < gy < a.field_h - 8.0) or ahead < -5.0:
                     continue
@@ -878,12 +661,8 @@ def main(argv: list[str] | None = None) -> int:
                        gr=round(float(w.get("gr", 640.0)), 1),
                        w=round(_raw_w, 1))
                     continue
-                #: 横向修正按**这道墙在帧内的页面 y** 取（畸变是"画面内位置"的函数；
-                #: 用绝对场地 y 会在远处墙上算出上百 px 的荒谬修正）
-                _vy_w = float(w.get("y", 0.0))
-                _xc = a.x_bias_a + a.x_bias_b * (_vy_w - a.view_h * 0.5)
-                gl = float(w.get("gl", 0.0)) - _xc + margin
-                gr = float(w.get("gr", 640.0)) - _xc - margin
+                gl = float(w.get("gl", 0.0)) - a.x_bias + margin
+                gr = float(w.get("gr", 640.0)) - a.x_bias - margin
                 if gr - gl < 60.0:
                     c = 0.5 * (gl + gr)
                     gl, gr = c - 35.0, c + 35.0
@@ -916,7 +695,7 @@ def main(argv: list[str] | None = None) -> int:
             #: 的缺口窗口可能落在 ±25 内，把**真的新墙**也滤掉了，板子于是盲开撞墙。
             #: 这个预过滤已删除；减少停车只能从"暂停时长"想办法，不能牺牲候选。
             extras = [e for e in raw
-                      if not any(abs(e[0] - k) <= row_tol() for k in known)]
+                      if not any(abs(e[0] - k) <= 55.0 for k in known)]
             prev_extras = list(extras)
             extras_t = time.monotonic()
             if extras and not paused and not collecting:
@@ -1021,43 +800,43 @@ def main(argv: list[str] | None = None) -> int:
                     _batch_gaps: list[tuple[float, float, float]] = []
                     for _acc in accept:
                         gy, gl, gr = _acc[0], _acc[1], _acc[2]
-                        if any(abs(gy - k) <= row_tol() for k in known):
+                        if any(abs(gy - k) <= 55.0 for k in known):
                             continue
-                        #: **按"行身份"去重**（以前按"缺口身份"：gl/gr 相差 ≤25
-                        #: 且完全不看 y 就当成同一道墙）。后者会把真的新墙吃掉：
-                        #: 实测 acc9 里 wall@1480（gap 240.8–332.8）被 52 次判成
-                        #: 已学的 wall@1198 —— 两道墙差 282 单位却"因为缺口像"而
-                        #: 不许入表，于是板子盲穿过去（audit_crossings 判为 blind）。
-                        #: 现在同一道墙 = y 相差 ≤ row_tol()，缺口只做二次确认。
-                        _near = [d for d in known_detail
-                                 if abs(float(d["y"]) - gy) <= row_tol()]
-                        if _near:
-                            d = min(_near, key=lambda q: abs(float(q["y"]) - gy))
-                            _dc = abs(0.5 * (float(d["gl"]) + float(d["gr"]))
-                                      - 0.5 * (gl + gr))
-                            if (abs(float(d["gl"]) - gl) > 0.5
-                                    or abs(float(d["gr"]) - gr) > 0.5):
-                                #: 同一条墙的重测：只许"细化"，不许搬家
-                                if _dc > 4.0 * sig_e:
-                                    ev("reject_gap", why="same_row_far_gap",
-                                       y=round(gy, 1), gl=round(gl, 1),
-                                       gr=round(gr, 1), old_y=round(float(d["y"]), 1),
-                                       old_gl=round(float(d["gl"]), 1),
-                                       old_gr=round(float(d["gr"]), 1), dc=round(_dc, 1))
-                                    continue
-                                d["gl"], d["gr"] = round(gl, 1), round(gr, 1)
-                            ev("wall_same_row", y=round(gy, 1),
-                               old_y=round(float(d["y"]), 1), gl=round(gl, 1),
-                               gr=round(gr, 1), refined=bool(
-                                   abs(float(d["gl"]) - gl) > 0.5
-                                   or abs(float(d["gr"]) - gr) > 0.5))
+                        #: 同一个缺口窗口 = 同一道物理墙。远/近两次测量会被映射成
+                        #: 不同的 y（映射依赖 py，实测同一道墙 215 → 355），旧逻辑
+                        #: 就把它当成"新墙"再加一条，于是出现同侧两道墙、缺口相同。
+                        #: 这里按"缺口身份"去重：命中已知墙就更新它的 y（取更近一次的
+                        #: 测量），绝不重复入表。
+                        _key = (int(round(gl / 10.0)), int(round(gr / 10.0)))
+                        _same_y = known_by_gap.get(_key)
+                        _same = None
+                        if _same_y is not None:
+                            _same = {"y": _same_y}
+                        if _same is not None:
+                            _old_y = float(_same["y"])
+                            _new_ahead = abs(gy - py)
+                            _old_ahead = abs(_old_y - py)
+                            if _new_ahead + 20.0 < _old_ahead:
+                                known_by_gap[_key] = round(gy, 1)
+                                for _d in known_detail:
+                                    if abs(float(_d["y"]) - _old_y) <= 1e-6:
+                                        _d["y"] = round(gy, 1)
+                                        break
+                                for _i, _k in enumerate(known):
+                                    if abs(_k - _old_y) <= 1e-6:
+                                        known[_i] = round(gy, 1)
+                                        break
+                            ev("wall_same_gap", y=round(gy, 1), old_y=_old_y,
+                               gl=round(gl, 1), gr=round(gr, 1),
+                               updated=bool(_new_ahead + 20.0 < _old_ahead))
                             continue
                         _why = gap_suspect(gy, gl, gr)
                         if not _why and gap_width_outlier(gl, gr):
                             _why = "width_outlier"
                         if not _why:
                             for (_by, _bgl, _bgr) in _batch_gaps:
-                                if abs(_by - gy) <= row_tol():
+                                if abs(_bgl - gl) <= 20.0 and abs(_bgr - gr) <= 20.0 \
+                                        and abs(_by - gy) >= 100.0:
                                     _why = "dup_batch"
                                     break
                         if _why:
@@ -1066,6 +845,7 @@ def main(argv: list[str] | None = None) -> int:
                             continue
                         _batch_gaps.append((gy, gl, gr))
                         known.append(gy)
+                        known_by_gap[_key] = round(gy, 1)
                         known_detail.append({"y": round(gy, 1), "gl": round(gl, 1),
                                              "gr": round(gr, 1),
                                              "source": "board_vt"})
@@ -1086,24 +866,6 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"  [dbg] seen={len(pause_seen)} agree={len(agree)} "
                               f"raw={[round(v[0], 1) for v in raw[:3]]}",
                               file=sys.stderr, flush=True)
-                    #: 用本次"同一道墙"的原始帧散度更新噪声估计（EWMA）
-                    if accept and len(pause_seen) >= 3:
-                        _gy0 = accept[0][0]
-                        _grp = [o for o in pause_seen
-                                if abs(o[0] - _gy0) <= row_tol()]
-                        if len(_grp) >= 3:
-                            import statistics as _st
-                            _sy = _st.pstdev([o[0] for o in _grp])
-                            _se = _st.pstdev([o[i] for o in _grp for i in (1, 2)])
-                            #: 用**中位数**而不是均值做 EWMA，避免个别帧把噪声估计
-                            #: 顶到几十像素（once 被顶高，下面的"同墙重测"判据就会
-                            #: 变得过宽/过窄）。上限也夹一下：>15 px 说明这一组根本
-                            #: 不是同一道墙，不该拿来更新噪声。
-                            if _se <= 15.0:
-                                sig_e = 0.8 * sig_e + 0.2 * max(_se, 1.0)
-                            sig_y = 0.8 * sig_y + 0.2 * max(_sy, 0.3)
-                            ev("noise_est", sig_y=round(sig_y, 2), sig_e=round(sig_e, 2),
-                               n=len(_grp))
                     known.sort(key=lambda v: v)
                     remain = [e for e in extras
                               if not any(abs(e[0] - k) <= 30.0 for k in known)]
@@ -1144,17 +906,6 @@ def main(argv: list[str] | None = None) -> int:
         emit_state(px, py, pr)
         if time.monotonic() - last_status >= 2.0:
             last_status = time.monotonic()
-            #: **输入流体检**：VT 文件在长、但 seq 不长 = agent 的读取失效
-            #: （inode 被替换/offset 越界）。没有这条，就只能看到"怎么不学墙"，
-            #: 却不知道是视觉断了 —— 之前几轮就是在这个盲区里瞎改参数。
-            try:
-                _sz = Path(a.vt_jsonl).stat().st_size
-            except OSError:
-                _sz = -1
-            ev("vt_health", vt_size=_sz, vt_seq=int((s or {}).get("seq", -1)),
-               n_vt=len((s or {}).get("walls") or []), py=round(py, 1),
-               known=len(known), blocked=lock_state.get("unknown_ahead"),
-               paused=bool(paused), collecting=bool(collecting))
             print(f"  board: known={len(known)} paused={paused} "
                   f"vt_walls={len(s.get('walls', [])) if s else 0}", file=sys.stderr,
                   flush=True)

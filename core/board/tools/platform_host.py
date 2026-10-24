@@ -276,23 +276,6 @@ class SshLink:
             self.move_log = []
         return out
 
-    def send_start(self) -> bool:
-        """告诉板端"主机现在开始跑了"：清空它闸门期间攒下的动作、重新压住平台。
-
-        为什么必须有：闸门校验要 20~40 s，这段时间板端的"停车测量"早超时恢复了，
-        它会持续按决策进程的动作发 @MOVE。主机一开跑就把**队列里那条旧动作**
-        执行掉 —— 实测 r15 在 t_sim=0.01 就执行了 act=2（往右），随后直着撞上
-        真值 y=80 的墙（x≈371 在缺口外，min_clearance −10）。
-        """
-        if self.proc.poll() is not None:
-            return False
-        try:
-            self.proc.stdin.write(b"@START\n")
-            self.proc.stdin.flush()
-            return True
-        except (OSError, ValueError):
-            return False
-
     def send_pose(self, x: float, y: float, r: float) -> bool:
         if self.proc.poll() is not None:
             return False
@@ -317,25 +300,13 @@ class SshLink:
 
 def start_camera_pipe(target: str, key: str, extra: str = "",
                       vt_bin: str = "/root/tools/vt_board",
-                      fps: float = 2.0, cam_w: int = 320, cam_h: int = 240,
-                      record: bool = False) -> dict:
+                      fps: float = 2.0, cam_w: int = 320, cam_h: int = 240) -> dict:
     """在板子上拉起相机管线：ffmpeg 抓 /dev/video0 → vt_board（VT 在板端）。
 
     **板端决策的输入只能是这条链路**（用户硬规则）。同时写 /tmp/vt_source=camera，
     板端 agent 会校验这个标记，synthetic 输入会被直接拒绝。
     """
     import subprocess
-    #: **录像绝不能塞进滤波图里**（2026-10-21 实测的根因）：
-    #: 以前是 `-filter_complex "...split=3[a][b][c]"` + `-map "[c]" -c:v mpeg4`，
-    #: 三路输出共用同一张图 —— mpeg4 软件编码一慢，整张图就被拖住，喂给 VT 的
-    #: 那些帧是**几秒前**拍的（实测帧里画面对应 py≈711，而位姿已经到 798，
-    #: 差 87 单位 ≈ 6.7 s）。板子于是照着过时的画面规划：同一道墙在不同 py 被
-    #: 记成 346/359/398/417/427 五道，规划器判"走廊全堵"直接停住（r4/r5 都卡死）。
-    #: 现在录像走**独立的输出流**：`-map 0:v -c:v copy`，Mjpeg 直接拷封装，
-    #: 不解码、不进滤波图、不占 CPU。容器用 matroska（mp4 里塞 mjpeg 不稳）。
-    split = "split=2[a][b]"
-    extra_map = ('-map 0:v -c:v copy -r 12 -f matroska -y /tmp/cam_rec.mkv '
-                 if record else '')
     cmd = (
         #: 注意：这里必须用 `pkill -x`（按进程名精确匹配）而不是 `pkill -f`。
         #: 这条命令是**通过 ssh 传过去的一整行**，remote bash 自己的 cmdline 里就
@@ -345,32 +316,13 @@ def start_camera_pipe(target: str, key: str, extra: str = "",
         #: 否则管线起来只能拿到 "Device or resource busy"（实测 acc1 就这么空跑）。
         'pkill -f "[m]jpeg_server.py"; pkill -x vt_board; pkill -x vt_sparse; '
         'pkill -x ffmpeg; sleep 0.3; '
-        #: 相机曝光：**默认交给自动曝光**。曾经想"锁死更稳"，实测锁在 200 时
-        #: 整幅画面过曝全白、40 帧里 0 帧能测出墙（这台相机 exposure_absolute
-        #: 的有效范围跟场景亮度强相关，拍屏幕时自动值远低于 200）。
-        #: 需要固定参数时显式打开 CAM_CTRL_LOCK=1，并自己确认画面亮度正常。
-        #: **gamma 固定 100**（2026-10-21 实测）：这台相机的自动曝光会收敛到
-        #: "整幅发灰"的状态（场地中位数 150~170，墙/场地对比被压平），VT 的行带
-        #: 检测就会配到灯斑/反光上（实测 r4：墙行残差 p90 +38 px、16% 超过 20 px，
-        #: 同一道墙被记成 346/359/398/417/427 五道，规划器直接死锁）。
-        #: gamma 是**固定的色调曲线**，不随曝光变：gamma=120 时场地中位 112，
-        #: gamma=100 时 56、gamma=90 时 28（墙始终饱和在 254）。取 100 → 场地暗、
-        #: 墙亮，而且自动曝光在亮/暗两个吸引子上都能用。
-        'if command -v v4l2-ctl >/dev/null 2>&1; then '
-        'v4l2-ctl -d /dev/video0 --set-ctrl=gamma="${CAM_GAMMA:-100}" 2>/dev/null || true; fi; '
-        'if [ "${CAM_CTRL_LOCK:-0}" = "1" ] && command -v v4l2-ctl >/dev/null 2>&1; then '
-        'v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto=1 '
-        '--set-ctrl=exposure_absolute="${EXPOSURE_ABS:-50}" '
-        '--set-ctrl=white_balance_temperature_auto=0 '
-        '--set-ctrl=white_balance_temperature="${WB_TEMP:-4000}" 2>/dev/null || true; fi; '
         'rm -f /tmp/vt.jsonl /tmp/cam.jpg; '
         'nohup bash -c \'ffmpeg -hide_banner -loglevel error '
         '-fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 '
         '-f v4l2 -input_format mjpeg -video_size 640x480 -i /dev/video0 '
-        f'-filter_complex "fps={fps:g},scale={cam_w}:{cam_h},{split}" '
+        f'-filter_complex "fps={fps:g},scale={cam_w}:{cam_h},split=2[a][b]" '
         '-map "[a]" -f rawvideo -pix_fmt rgb24 - '
         '-map "[b]" -update 1 -q:v 5 -y /tmp/cam.jpg '
-        f'{extra_map}'
         f'| {vt_bin} --w {cam_w} --h {cam_h} --frame-roi 0 0 {cam_w} {cam_h} '
         '--quad-file /tmp/quad.json --quad-state /tmp/qb.txt '
         '--jsonl /tmp/vt.jsonl %s >/dev/null\' '
@@ -397,23 +349,6 @@ def start_camera_pipe(target: str, key: str, extra: str = "",
                 "detail": txt[-260:]}
     except (OSError, subprocess.SubprocessError) as exc:
         return {"ok": False, "error": repr(exc)}
-
-
-def stop_camera_pipe(target: str, key: str) -> None:
-    """跑完把板端相机管线停掉。
-
-    为什么要有：管线是 nohup 起来的，platform_host 退出后它还活着、一直占着
-    /dev/video0 —— 下一次"标定/抓帧/预览"就会拿到 "Device or resource busy"
-    （实测：一个残留 ffmpeg 让曝光测量连续 3 次失败，排查了半天）。
-    """
-    import subprocess
-    try:
-        subprocess.run(["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
-                        "-o", "ConnectTimeout=8", target,
-                        "pkill -x vt_sparse; pkill -x vt_board; pkill -x ffmpeg; echo ok"],
-                       capture_output=True, timeout=20)
-    except (OSError, subprocess.SubprocessError):
-        pass
 
 
 def quad_fingerprint(target: str, key: str) -> str:
@@ -598,8 +533,6 @@ def main(argv: list[str] | None = None) -> int:
                          "喂 320 等于每个页面像素只剩 0.41 个输入像素，墙只有 3 px 高，"
                          "行定位抖动 ±8；喂 640 抖动减半、缺口边界更稳（实测）")
     ap.add_argument("--cam-h", type=int, default=240, help="VT 输入高度")
-    ap.add_argument("--cam-record", action="store_true",
-                    help="把板端相机原始画面录一份 /tmp/cam_rec.mkv（给'相机视觉录像'用）")
     a = ap.parse_args(argv)
 
     spec = ScenarioSpec.load(a.scenario)
@@ -665,37 +598,9 @@ def main(argv: list[str] | None = None) -> int:
                   field_bg=field_rgb, resizable=False)
     page = PygameRenderer(show_potential=False, **common)
     install_stop_signals()
-    #: **热力图窗口会跟平台窗口抢同一块画面**：pygame 只有一个 display surface，
-    #: 两个 PygameRenderer 各自 render() 会让窗口内容在"平台页"和"亮热力图"之间
-    #: 交替 —— 相机拍到的就是交替的两种画面（实测静态 40 帧：前 10 帧平均亮度 89
-    #: 有墙，后 30 帧平均 170 没墙；这个现象把 s2c 卡死过一次）。
-    #: 所以拍摄（相机取景）用的运行**不创建热力图窗口**：--field-hz < 0.1 时直接用
-    #: 平台渲染器，热力图视频（field_mp4）自然也不录。
-    if a.field_hz >= 0.1:
-        field_view = PygameRenderer(show_potential=True,
-                                    potential_every=max(1, int(a.field_every)),
-                                    **common)
-    else:
-        field_view = page
-
-    #: **平台窗口必须压在热力图窗口上面**。两个 PygameRenderer 各开一扇窗，
-    #: 相机看到的是"最上面那扇"；热力图窗偶尔会盖到平台窗上 → 相机拍到亮热力图
-    #: → 墙检测全丢（实测静态 40 帧只后 30 帧全灭、亮度从 89 跳到 170）。
-    #: 这里显式把平台窗抬到最前，并在跑的过程中定期再抬一次。
-    try:
-        page._force_window_front()          # noqa: SLF001 - 同仓库内部方法
-    except Exception:                        # noqa: BLE001
-        pass
-
-    def _keep_page_on_top() -> None:
-        while True:
-            time.sleep(2.0)
-            try:
-                page._force_window_front()   # noqa: SLF001
-            except Exception:                # noqa: BLE001
-                return
-
-    threading.Thread(target=_keep_page_on_top, daemon=True).start()
+    field_view = PygameRenderer(show_potential=True,
+                                potential_every=max(1, int(a.field_every)),
+                                **common)
 
     server = FrameServer(a.port)
     base = page.render(env.world)
@@ -776,11 +681,8 @@ def main(argv: list[str] | None = None) -> int:
         except json.JSONDecodeError:
             calib_prev = {}
     quad_now = quad_fingerprint(a.board_ssh, a.ssh_key) if a.board_ssh else ""
-    _quad_moved = (bool(calib_prev) and quad_moved(calib_prev.get("quad") or "",
-                                                   quad_now, a.quad_tol))
-    need_calib = (not calib_prev) or _quad_moved
-    #: 相机/窗口真的移动过（quad 指纹变了）→ 必须重标，不许被"旧系数更好"挡住
-    need_calib_reason = "quad_moved" if _quad_moved else ("" if calib_prev else "no_calib")
+    need_calib = (not calib_prev) or quad_moved(calib_prev.get("quad") or "", quad_now,
+                                               a.quad_tol)
     print(f"  标定: 已有={bool(calib_prev)} 相机指纹={quad_now!r} "
           f"→ {'本轮跑完重新标定' if need_calib else '沿用现有系数（相机没动）'}",
           file=sys.stderr)
@@ -788,8 +690,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.board_ssh and a.start_camera_pipe:
         _cam = start_camera_pipe(a.board_ssh, a.ssh_key, extra=a.vt_board_extra,
                                  vt_bin=a.cam_vt_bin, fps=a.cam_fps,
-                                 cam_w=a.cam_w, cam_h=a.cam_h,
-                                 record=a.cam_record)
+                                 cam_w=a.cam_w, cam_h=a.cam_h)
         print(f"  相机管线: {_cam}", file=sys.stderr)
         if not _cam.get("ok"):
             print("  ⚠ 相机管线没起来：板端会没有图像，本轮不会产生有效决策",
@@ -869,12 +770,7 @@ def main(argv: list[str] | None = None) -> int:
             if _now - _last_pub >= 0.05:
                 _last_pub = _now
                 try:
-                    _pg_img = page.render(env.world)
-                    publisher.submit(_pg_img)
-                    #: 闸门期间留一张"主机自己画出来的页面"做对照：
-                    #: 相机看到的东西和它不一致时，一眼就知道是渲染还是相机的事。
-                    if _pg_img is not None and not (run_dir / "gate_page.png").exists():
-                        cv2.imwrite(str(run_dir / "gate_page.png"), _pg_img)
+                    publisher.submit(page.render(env.world))
                 except Exception:  # noqa: BLE001
                     pass
             try:
@@ -886,81 +782,23 @@ def main(argv: list[str] | None = None) -> int:
             except (OSError, _sp.SubprocessError):
                 lines = []
             ok_seen = 0
-            n_wall = 0
-            n_ply = 0
-            _last = {}
-            #: **闸门还要"稳"**：只数"有墙有角色"的帧是不够的 —— 相机刚上电时
-            #: AE 还在收敛，前 1~2 s 会报出"一行亮带 + 一个宽缺口"这种假墙
-            #: （实测 r6 开局就把 y=164.5 当成墙收进表里，规划器再也理不顺）。
-            #: 判据改成：最近 24 帧里要有 ≥12 帧的行带**签名一致**（行坐标 ±8 px），
-            #: 并且这些帧里角色也看得到 —— 只有收敛后的画面才能连续一致。
-            sigs: dict[tuple, list] = {}
-            recent = []
-            for ln in lines[-24:]:
-                try:
-                    rec = json.loads(ln)
-                except json.JSONDecodeError:
-                    continue
-                rows = tuple(sorted(round(float(w.get("y", 0.0)) / 8.0) * 8
-                                    for w in (rec.get("walls") or [])))
-                recent.append((rows, rec))
-            stable = 0
-            stable_rows: tuple = ()
-            for rows, _r in recent:
-                if not rows:
-                    continue
-                cnt = sum(1 for r2, _ in recent
-                          if len(r2) == len(rows)
-                          and all(abs(a - b) <= 8 for a, b in zip(r2, rows)))
-                if cnt > stable:
-                    stable, stable_rows = cnt, rows
-            ok_stable = sum(1 for rows, rec in recent
-                            if rec.get("player") and rows == stable_rows)
             for ln in lines[-30:]:
                 try:
                     rec = json.loads(ln)
                 except json.JSONDecodeError:
                     continue
-                if rec.get("walls"):
-                    n_wall += 1
-                if rec.get("player"):
-                    n_ply += 1
                 if rec.get("walls") and rec.get("player"):
                     ok_seen += 1
-                _last = rec
-            #: 闸门单帧"证据"落盘：失败时不用再猜（相机到底拍到了什么）
-            if lines:
-                try:
-                    (run_dir / "gate_vt.jsonl").write_text(
-                        "\n".join(lines[-40:]) + "\n", encoding="utf-8")
-                except OSError:
-                    pass
-            if ok_seen >= 5 and stable >= 12 and ok_stable >= 8:
+            if ok_seen >= 5:
                 break
-            detail = (f"最近 {len(lines)} 帧里只有 {ok_seen} 帧同时有墙+角色"
-                      f"（稳定行带 {stable}/24 帧、其中带角色 {ok_stable} 帧）；"
-                      f"（有墙 {n_wall} 帧 / 有角色 {n_ply} 帧；"
-                      f"最后一帧 geom={_last.get('frame_geom')} "
-                      f"walls={len(_last.get('walls') or [])} "
-                      f"player={_last.get('player')} n={_last.get('n')}）")
-            print(f"    [闸门] {detail}", file=sys.stderr)
+            detail = f"最近 {len(lines)} 帧里只有 {ok_seen} 帧同时有墙+角色"
             time.sleep(1.0)
-        if ok_seen < 5 or stable < 12 or ok_stable < 8:
+        if ok_seen < 5:
             print(f"\n  ✗ 拒跑：相机没看到平台页面（{detail}）。", file=sys.stderr)
             print("    常见原因：平台窗口被终端/浏览器盖住、窗口跑到屏幕外、"
                   "或预览服务还占着 /dev/video0。", file=sys.stderr)
             print("    先确认 http://192.168.137.242:8099/ 里能看到页面再重跑。",
                   file=sys.stderr)
-            #: 把板端这次的相机录像拉回来，失败原因可以直接看图
-            try:
-                _sp.run(["scp", "-q", "-i", a.ssh_key,
-                         "-o", "StrictHostKeyChecking=no",
-                         f"{a.board_ssh}:/tmp/cam_rec.mkv",
-                         str(run_dir / "gate_cam.mkv")], timeout=60)
-                print(f"    相机录像已存 {run_dir / 'gate_cam.mkv'}",
-                      file=sys.stderr)
-            except (OSError, _sp.SubprocessError):
-                pass
             abort_early = "camera_not_seeing_page"
         else:
             abort_early = None
@@ -976,46 +814,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(run_dir / "summary.json").write_text(
             json.dumps(_sum, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"  已写 {run_dir / 'summary.json'}", file=sys.stderr)
-        #: 闸门失败也要收尸：这条 return 在正常收尾之前，以前会留下 nohup 的
-        #: ffmpeg|vt_sparse 一直占着 /dev/video0，下一轮直接 Device busy。
-        if a.board_ssh:
-            stop_camera_pipe(a.board_ssh, a.ssh_key)
-        if viewer is not None:
-            try:
-                viewer.send_signal(2)
-                viewer.wait(timeout=3.0)
-            except Exception:                     # noqa: BLE001
-                pass
-        link.stop()
         return 3
-
-    if a.board_ssh and hasattr(link, "send_start"):
-        #: 开跑握手：让板端重新压住平台、丢掉闸门期间攒下的旧动作，再等它 0.8 s。
-        #: 这 0.8 s 里平台必须是真的停住的（时间不重要，安全重要）。
-        try:
-            link.send_start()
-            t_hold = time.monotonic()
-            while time.monotonic() - t_hold < 0.8:
-                link.send_pose(*[float(v) for v in (env.world.player[0],
-                                                    env.world.player[1],
-                                                    env.world.player[4])])
-                time.sleep(0.02)
-            link.drain_moves()
-            with link._lock:
-                link.act = 0
-            _n_hold = 0
-            for _ in range(20):
-                link.send_pose(*[float(v) for v in (env.world.player[0],
-                                                    env.world.player[1],
-                                                    env.world.player[4])])
-                time.sleep(0.02)
-                if link.act != 0:
-                    _n_hold += 1
-            print(f"  开跑握手：@START 已发，板端 {_n_hold}/20 个动作非 0（应接近 0）",
-                  file=sys.stderr)
-            log.event("start_handshake", nonzero=_n_hold)
-        except Exception:                             # noqa: BLE001
-            pass
 
     if not a.board_ssh:
         print("  等板子连 TCP ...", file=sys.stderr)
@@ -1187,45 +986,17 @@ def main(argv: list[str] | None = None) -> int:
             elif len(_pairs) < 30:
                 print(f"  自动标定跳过：样本不足（{len(_pairs)}）", file=sys.stderr)
             else:
-                #: **不许用更差的标定覆盖更好的**：静态 40 帧标定的 rmse 能到 0.1 px，
-                #: 而整轮数据（含贴边墙、远景墙）拟合出来常常 rmse 8~12 px。
-                #: 以前每轮结束都无条件覆盖 → 上一轮刚标好的系数被更差的顶掉，
-                #: 下一轮 |Δy| 从 1.4 跳到 8.8（s1b 实测）。这里加两道闸：
-                #:   ① 新拟合 rmse 必须 ≤ 旧系数在同一批样本上的 rmse（即"更解释数据"）
-                #:   ② 旧系数若明显更好，就保留旧的（除非 quad 指纹变了 → 必须重标）
-                #: **不再用整轮数据覆盖标定**。
-                #: 原因：整轮数据里混着贴边墙/远景墙（畸变最大处）和运动帧，
-                #: 拟合出来的 rmse 8~12 px；而"固定画面 40 帧 + 真值"的静态标定
-                #: 能做到 rmse 0.1 px。以前每轮结束都无条件覆盖 → 上一轮刚标好的
-                #: 系数被更差的顶掉，下一轮 |Δy| 从 1.4 跳到 8.8（s1b/s1c 实测）。
-                #: 现在只在**完全没有标定**时用整轮数据兜底（bootstrap），
-                #: 需要重标时只打标记，由静态标定流程（calib_static.sh）来做。
-                if calib_prev:
-                    print("  自动标定：已有静态标定，本轮数据不覆盖"
-                          + ("（quad 变了，需要重标：bash core/board/tools/calib_static.sh）"
-                             if need_calib_reason == "quad_moved" else ""),
-                          file=sys.stderr)
-                    summary["calib"] = {"reused": True, **{
-                        k: calib_prev.get(k) for k in ("scale", "bias", "x_bias", "rmse")}}
-                    if need_calib_reason == "quad_moved":
-                        summary["calib"]["needs_recalib"] = True
-                    _res = None
-                    _skip_fit = True
-                if not calib_prev:
-                    _res = calib_y.fit(_pairs, _truth, 240.0, tol=30.0, rounds=6)
-                    _res.update({"quad": quad_now, "run": str(run_dir),
-                                 "scenario": a.scenario})
-                if _res is not None and (_res.get("samples", 0) < 30
-                                         or (_res.get("rmse") or 999.0) > 20.0):
+                _res = calib_y.fit(_pairs, _truth, 240.0, tol=30.0, rounds=6)
+                _res.update({"quad": quad_now, "run": str(run_dir),
+                             "scenario": a.scenario})
+                if (_res.get("samples", 0) < 30
+                        or (_res.get("rmse") or 999.0) > 20.0):
                     print(f"  自动标定质量不足（samples={_res.get('samples')} "
                           f"rmse={_res.get('rmse')}）：保留旧系数", file=sys.stderr)
                     summary["calib"] = {"rejected": True, **_res}
                     _res = None
-        except Exception as exc:  # noqa: BLE001
-            #: 标定这一段出任何错都不能连累"写 summary"：以前这里只捕
-            #: ImportError/OSError/ValueError，结果一个 AttributeError 就把整轮
-            #: 证据弄丢了（s1d：跑完了却没 summary.json）。
-            print(f"  自动标定失败（不影响本轮结论）：{exc!r}", file=sys.stderr)
+        except (ImportError, OSError, ValueError) as exc:
+            print(f"  自动标定失败：{exc!r}", file=sys.stderr)
 
         if _res is not None:
             calib_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1255,8 +1026,6 @@ def main(argv: list[str] | None = None) -> int:
                                                      indent=2) + "\n")
     log.close()
     print(json.dumps(summary, ensure_ascii=False, indent=2), file=sys.stderr)
-    if a.board_ssh:
-        stop_camera_pipe(a.board_ssh, a.ssh_key)
     print(f"  证据日志 {run_dir}", file=sys.stderr)
 
     time.sleep(a.hold)
