@@ -27,6 +27,14 @@
 #
 # 产物：<tag>.bit / <tag>_util.rpt / <tag>_timing.rpt / <tag>_addr.rpt
 # =============================================================================
+#: ⚠ **Windows 中文环境的编码坑**（2026-10-24 定位）：
+#: Tcl 系统编码默认是本地代码页（如 cp936），而 Vivado 自带的 .tcl/.xml 是 UTF-8，
+#: 于是 `source` 时报 `couldn't read file "...utils.tcl": Illegal byte sequence`，
+#: 上层表现为 `ERROR: [Common 17-217] Failed to load feature 'ipintegrator'.`
+#: （GUI 里跑脚本会直接崩掉）。**必须在任何 source 之前把系统编码钉成 utf-8。**
+catch {encoding system utf-8}
+catch {fconfigure stdout -encoding utf-8}
+
 set rtl_dir [lindex $argv 0]
 set bd_dir  [lindex $argv 1]
 set out_dir [lindex $argv 2]

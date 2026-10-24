@@ -155,6 +155,26 @@ ERROR: [#UNDEF] Error in evaluating command source [rdi::utils::find_approot_fil
 
 → 结论：**位流重建需要一次交互式（GUI）运行**，或在干净的安装上重跑。
 
+### round 5：编码不是唯一原因，D 盘读文件不可靠（日志证据）
+
+加了 `encoding system utf-8` 之后 `Illegal byte sequence` 消失（这个坑是真的），
+但 BD 继续在**别的**文件上失败，而且每次报的文件/错误都不同：
+
+```
+第 1 次: couldn't read file ".../xguifrmwork/init.tcl": No error
+第 2 次: couldn't read file ".../rsb/busdef/AXIMM/busdef.tcl": no such file or directory
+第 3 次: couldn't read file ".../xguifrmwork/utils.tcl": Illegal byte sequence
+第 4 次: couldn't read file ".../roe_framer_v1_0/.../xroe_framer_base_v4.tcl": invalid argument
+         + ".../rsb/design_assist/conn/axi4/rules.tcl": No error
+```
+
+而这些文件在 WSL 里 `ls`/`cat` 都正常（同一文件连读 20 次 0.23 s），
+Vivado 脚本里 `source`/`open` 也成功 —— **只有 BD 子系统读不到**。
+`du -sh` 整个安装目录会超时（>45 s 没完），说明 **D 盘在大量小文件顺序读上不可靠**。
+
+→ **结论：需要把 Vivado 安装挪到可靠磁盘（C:，剩 31 GB）或重装**；
+这已连续 3 轮（round 3/4/5）卡在同一条件上。
+
 ## 下一步（按顺序）
 
 1. **P3 / L0**：同一批帧（≥300 张真实 640×360 帧）分别喂 PL 与跑 C 参考
