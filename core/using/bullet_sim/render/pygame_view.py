@@ -128,11 +128,6 @@ class PygameRenderer:
         calibration_marker_color: tuple[int, int, int] = (128, 0, 128),
         wall_color: tuple[int, int, int] = WALL_COLOR,
         show_fiducials: bool = True,
-        #: 角色码带（`standard/tagstrip.py` 的契约，把这一帧的位姿编进画面）
-        #: **默认关**（2026-10-24 用户口径）：整轮回退到 acc9 时，画面里不许再出现
-        #: 码带 —— 它是 A 路的实验产物，现在只影响"相机看到的画面长什么样"。
-        #: 要开就显式 show_tag_strip=True（platform_host 以后加 --tag-strip）。
-        show_tag_strip: bool = False,
         #: **跟随角色 y 滚动**（平台 v2）：窗口只显示角色上下各 `follow_h/2` 的带，
         #: 水平仍是全宽。墙/角色超出这一带的会被裁掉（真实相机只拍这一屏）。
         follow_player: bool = False,
@@ -233,7 +228,6 @@ class PygameRenderer:
         #: 可以全程可见，于是每一帧都能反解单次标定（视觉侧据此判断"标定还成立吗"）。
         #: 位图与布局在 ``standard.fiducial``（平台画、视觉认，共享契约）。
         self.show_fiducials = bool(show_fiducials)
-        self.show_tag_strip = bool(show_tag_strip)
         # 环境变量覆盖（`BULLET_FOLLOW=240`）：不必改 CLI 就能给"静态墙平台"开跟随。
         import os as _os
         _fh = _os.environ.get("BULLET_FOLLOW", "")
@@ -548,12 +542,6 @@ class PygameRenderer:
 
         # --- player: visible body + real hitbox -------------------------
         self._draw_player(screen, world, vp)
-        # --- 角色码带：把**这一帧的位姿**编进画面（板端据此直接定 y）---------
-        #: 与 `standard/fiducial.py` 同一套路：位图/几何是共享契约
-        #: （`standard/tagstrip.py`），平台画、板端读。
-        if self.show_tag_strip:
-            self._draw_tag_strip(screen, world, vp)
-
         # --- 四角标定标记（ArUco）---------------------------------------
         # 画在目标之上：标记要**完整可见**才能被解码，被一条墙线切过就废了。
         import os as _os2
@@ -788,30 +776,6 @@ class PygameRenderer:
         if self.show_hitboxes:
             pygame.draw.circle(screen, (255, 80, 80), (int(px), int(py)), r, 2)
             pygame.draw.circle(screen, (255, 255, 255), (int(px), int(py)), 1)
-
-    def _draw_tag_strip(self, screen: Any, world: Any, vp: Viewport) -> None:
-        """角色码带：角色圆心下方一条 9 位条码，编着**这一帧的角色绝对 y**。
-
-        为什么挂在角色身上：角色永远在视口中心且画在最后一层（不会被墙盖住），
-        而且它就是"需要定姿的那个物体" ⇒ 编码与位姿天然同期，相机延迟再大也不影响。
-        几何/颜色/编码定义全部来自 `standard.tagstrip`（共享契约），这里只负责画。
-        """
-        try:
-            from standard.tagstrip import COLOR_RGB, rects_for
-        except ImportError:            # 板端/单测环境没有 standard 包时静默跳过
-            return
-        p = world.player
-        for rc in rects_for(float(p[0]), float(p[1])):
-            #: 场地 y 向上为正（Viewport 把 y 翻了），所以两个对角都映射再取 min/max，
-            #: 与 y 方向无关（同 `_draw_fiducials` 的做法）。
-            ax, ay = vp.world_to_screen(rc.x, rc.y)
-            bx, by = vp.world_to_screen(rc.x + rc.w, rc.y + rc.h)
-            x0, x1 = (ax, bx) if ax <= bx else (bx, ax)
-            y0, y1 = (ay, by) if ay <= by else (by, ay)
-            pygame.draw.rect(
-                screen, COLOR_RGB,
-                (int(round(x0)), int(round(y0)),
-                 max(1, int(round(x1 - x0))), max(1, int(round(y1 - y0)))))
 
     def _draw_world_axes(self, screen: Any, world: Any, vp: Viewport) -> None:
         """World-coordinate grid; the numeric tick labels need ``show_text``.

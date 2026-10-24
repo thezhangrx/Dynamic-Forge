@@ -1,11 +1,11 @@
 {
-  "scale": 0.93153,
-  "bias": 7.489,
-  "samples": 6437,
-  "rows_matched": 1338,
-  "rmse": 8.26,
-  "max_abs": 29.89,
+  "scale": 0.85973,
+  "bias": 39.868,
+  "samples": 3989,
+  "rows_matched": 1071,
+  "rmse": 9.31,
+  "max_abs": 29.55,
   "quad": "",
-  "run": "/home/zhang/FPGA/data/fpga/loop_logs/run_20261024_110028_acc9r3",
+  "run": "/home/zhang/FPGA/data/fpga/loop_logs/run_20261024_181610_acc9r16",
   "scenario": "configs/20_walls_alt_24_dy140.json"
 }

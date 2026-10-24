@@ -339,6 +339,14 @@ def start_camera_pipe(target: str, key: str, extra: str = "",
         'rm -f /tmp/vt.jsonl /tmp/cam.jpg; '
         'nohup bash -c \'ffmpeg -hide_banner -loglevel error '
         '-fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 '
+        #: 2026-10-24 实测：YUYV 清晰度 +49% 但 **USB 带宽撑不住**（640×480@30 =
+        #: 18.4 MB/s，dwc2 上跑一会儿就静默断流，抓帧全超时）→ 暂回 MJPG。
+        #: 原注释：只改采集格式，MJPG→YUYV（未压缩 4:2:2，
+        #: 去掉 JPEG 块效应）。实测清晰度 +49%、平坦区噪声 −28%，视角不变。
+        #: YUYV 必须显式 -framerate，否则协商失败。
+        #: YUYV 640×480 设备只支持 30 fps（`--list-formats-ext`），申请 12 会协商失败、
+        #: 出几十帧就停（实测 cam.jpg 停在 68 s 前、VT 随后 0 帧 → 闸门拒跑）。
+        #: 所以**设备按 30 要，滤镜里 fps=12 降帧**。
         f'-f v4l2 -input_format mjpeg -video_size 640x480 -i {dev} '
         f'-filter_complex "fps={fps:g},scale={cam_w}:{cam_h},split=2[a][b]" '
         '-map "[a]" -f rawvideo -pix_fmt rgb24 - '

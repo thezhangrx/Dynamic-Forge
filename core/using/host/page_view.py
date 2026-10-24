@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import socket
 import sys
 import time
 from pathlib import Path
@@ -107,10 +106,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--w", type=int, default=1280)
     ap.add_argument("--h", type=int, default=960)
     ap.add_argument("--fps", type=float, default=30.0)
-    ap.add_argument("--present-udp", type=int, default=0,
-                    help="每 paint 后往 127.0.0.1:PORT 发一行 `P <monotonic>`；"
-                         "0=关。这是 G1 的**呈现时刻**来源：主机据此知道"
-                         "'这一帧什么时候真的出现在屏幕上'")
     ap.add_argument("--fullscreen", action="store_true",
                     help="全屏显示。WSLg(RAIL) 下全屏窗口通常会被抬成前台窗口，"
                          "比固定位置的无边框窗口更不容易被别的窗口盖住 —— 相机看不到"
@@ -152,14 +147,6 @@ def main(argv: list[str] | None = None) -> int:
         cw, ch = args.w, min(args.h, sh)
     off_x, off_y = (sw - cw) // 2, (sh - ch) // 2
     client = MjpegClient(args.url).start()
-    #: G1 呈现回传：UDP、无阻塞、发不出去就算了（绝不因为上报拖慢呈现）
-    _psock = None
-    if int(args.present_udp) > 0:
-        try:
-            _psock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            _psock.setblocking(False)
-        except OSError:
-            _psock = None
     last_seq = -1
     last_frame = None
     last_paint = 0.0
@@ -203,15 +190,6 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"⚠ 15 s 没收到帧：{client.last_error}", file=sys.stderr)
                         waiting_since = now
                 pygame.display.flip()
-                if _psock is not None:
-                    try:
-                        #: **帧序号**必须一起回传：主机据此倒查这一帧的位姿。
-                        #: 只回传时刻是不够的 —— MJPEG 有缓冲，按时刻回查会取到
-                        #: 比真正画在屏幕上的更新的帧（实测偏 20~67 单位）。
-                        _psock.sendto(b"S %d %.6f\n" % (int(last_seq), time.monotonic()),
-                                      ("127.0.0.1", int(args.present_udp)))
-                    except OSError:
-                        pass
                 if raiser is None:
                     raiser = WindowRaiser()
             if args.idle_exit > 0 and now - waiting_since > args.idle_exit:

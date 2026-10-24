@@ -43,7 +43,14 @@ BOARD="root@192.168.137.242"
 KEY="data/fpga/board_ssh/board_key"
 QUAD_LOCAL="data/fpga/quad.json"
 CALIB_LOCAL="data/fpga/calib_y.json"
-SCENARIO="configs/20_walls_alt_24_dy140.json"
+#: 2026-10-24 用户口径：**整轮回退到 acc9（git 0806d81）那一轮**再跑一次。
+#: 所以场景也回到 acc9 用的 `20_walls_alt_24_dy140.json`（首墙 80、末墙 3340）；
+#: 10-23 定的 `_y120`（整排墙 +40）原样留在 configs/ 里，随时可以 SCENARIO= 切回。
+#: 2026-10-24 用户口径：**先把开局距离拉开**。acc9 的 `_dy140` 首墙在 80、出生 40，
+#: 出生瞬间间隙只有 24.8（半径 10 + 半墙厚 4）；换回 10-23 定的 `_y120`（首墙 120，
+#: 整排墙 +40）→ 开局距离 80 单位、间隙 64.8，板子多 1 s 时间去认第一道墙。
+#: 2026-10-24 锁定（acc9r16 = 目前最好的一轮）：8 道缺口中等幅度，0 碰撞 / 24-24 / +9.92。
+SCENARIO="${SCENARIO:-configs/20_walls_alt_24_dy140_gap8.json}"
 CHECK=0
 TAG="std"
 SECONDS_SIM=220
@@ -90,6 +97,19 @@ echo "== 4. 推 quad / 标定到板子 =="
 [ -f "$QUAD_LOCAL" ]  && scp -q -i "$KEY" -o StrictHostKeyChecking=no "$QUAD_LOCAL"  "$BOARD:/tmp/quad.json"  && echo "  quad  → /tmp/quad.json"
 [ -f "$CALIB_LOCAL" ] && scp -q -i "$KEY" -o StrictHostKeyChecking=no "$CALIB_LOCAL" "$BOARD:/tmp/calib_y.json" && echo "  calib → /tmp/calib_y.json"
 
+#: 2026-10-24 回退：阈值写死成 acc9 那一组，**不再读** `data/fpga/params.json`。
+#: 那份是 calib_py40 那轮 auto_tune 的产物（4 / 6 / 0.975），比 acc9 紧得多；
+#: 实测 base7/base8 用它 → `page_stale` 806 次、放行 0 帧、覆盖率 2~5/24、角色慢慢挪。
+CONS=8; TOLVY=16; SETTLE=1.0
+echo "  阈值 = 放宽准入后（2026-10-24 用户口径）: consensus=$CONS tol-vy=$TOLVY settle=${SETTLE}s"
+
+echo "== 4b. 板上自己的任务文件（只有自己的信息/任务/定位基准，**没有墙**）=="
+"$PY" core/board/tools/make_task.py "$SCENARIO" -o /tmp/task.json >/dev/null
+mkdir -p /tmp/_task && cp /tmp/task.json /tmp/_task/task.json
+scp -q -i "$KEY" -o StrictHostKeyChecking=no /tmp/_task/task.json \
+    "$BOARD:/root/vision_state/task.json" && \
+    echo "  task  → /root/vision_state/task.json（$(python3 -c "import json;d=json.load(open('/tmp/task.json'));print('spawn',d['spawn'],'goal',d['goal'],'speed',d['speed'],'dt',round(d['dt'],6))")）"
+
 echo "== 5. 开跑（标准参数）=="
 # 参数对照（改任何一条都要重跑并留 run log 作证据，见 AGENTS.md R4）：
 #   场景     20 道墙、dy=140、seed 固定
@@ -100,18 +120,37 @@ echo "== 5. 开跑（标准参数）=="
 #   标定     data/fpga/calib_y.json（scale 0.9632 / bias 5.266）
 #   决策     板端 field_cli_board（Dijkstra），障碍只来自已学到的墙
 #   暂停     settle 0.65 s / 单次暂停上限 1.5 s
-exec "$PY" -u core/board/tools/platform_host.py \
+"$PY" -u core/board/tools/platform_host.py \
     --scenario "$SCENARIO" \
-    --port 8498 --tcp 9006 --speed 0.5 \
+    --port "${LOOP_PORT:-8498}" --tcp 9006 --speed 0.5 \
     --max-seconds "$SECONDS_SIM" --render-hz 30 --field-hz 1 --follow-scale 1 \
     --tag "$TAG" --hold 2 \
     --wall-rgb 255,240,200 --field-rgb 12,14,20 --bg-rgb 0,0,0 \
     --fiducial-side 28 --fiducial-anchor band --frame-px 2 --field-every 5 \
     --board-ssh "$BOARD" --ssh-key "$KEY" \
     --board-agent /root/tools/board_agent.py --board-python python3 \
-    --board-extra "--from-end --verbose --consensus-frames 8 --tol-vy 16 --settle 1.0 --pause-timeout 3.5" \
+    --board-extra "--from-end --verbose --consensus-frames $CONS --tol-vy $TOLVY --settle $SETTLE --pause-timeout 3.5" \
     --connect-timeout 90 \
     --calib "$CALIB_LOCAL" --calib-board /tmp/calib_y.json --quad-tol 6 \
     --viewer --viewer-fullscreen --viewer-pos 320,60 --viewer-size 1280x960 \
     --viewer-margin 0 \
     --cam-vt-bin /root/tools/vt_sparse --cam-fps 12 --cam-w 640 --cam-h 480
+
+echo
+echo "== 取回相机录像（cam_rec.mkv）=="
+NEWEST0=$(ls -dt data/fpga/loop_logs/run_* 2>/dev/null | head -1)
+if [ -n "$NEWEST0" ]; then
+    mkdir -p "$NEWEST0/videos"
+    scp -q -i "$KEY" -o StrictHostKeyChecking=no "root@192.168.137.242:/tmp/cam_rec.mkv" \
+        "$NEWEST0/videos/cam_rec.mkv" 2>/dev/null && \
+        echo "  已存 $NEWEST0/videos/cam_rec.mkv（$(du -h "$NEWEST0/videos/cam_rec.mkv" | cut -f1)）" || \
+        echo "  没有 cam_rec.mkv（录制未开启或本轮太短）"
+fi
+
+echo
+echo "== 自动验收（grade_run.py）=="
+NEWEST=$(ls -dt data/fpga/loop_logs/run_* 2>/dev/null | head -1)
+if [ -n "$NEWEST" ]; then
+    "$PY" core/board/tools/grade_run.py "$NEWEST" || echo "（验收未通过，见上面 5 项）"
+fi
+

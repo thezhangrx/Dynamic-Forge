@@ -39,10 +39,12 @@ core/board/tools/board_agent.py|board
 core/board/tools/vt_sparse.cpp|board
 core/board/tools/start_cam.sh|board
 core/board/tools/field_decision_cli.cpp|board
+core/board/tools/cam_settings_locked.sh|board
 core/board/field_m1.hpp|board
 data/fpga/quad.json|calib
 data/fpga/calib_y.json|calib
 configs/20_walls_alt_24_dy140.json|configs
+configs/20_walls_alt_24_dy140_gap8.json|configs
 "
 
 bad=0; n=0

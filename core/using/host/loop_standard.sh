@@ -46,7 +46,11 @@ CALIB_LOCAL="data/fpga/calib_y.json"
 #: 2026-10-24 用户口径：**整轮回退到 acc9（git 0806d81）那一轮**再跑一次。
 #: 所以场景也回到 acc9 用的 `20_walls_alt_24_dy140.json`（首墙 80、末墙 3340）；
 #: 10-23 定的 `_y120`（整排墙 +40）原样留在 configs/ 里，随时可以 SCENARIO= 切回。
-SCENARIO="${SCENARIO:-configs/20_walls_alt_24_dy140.json}"
+#: 2026-10-24 用户口径：**先把开局距离拉开**。acc9 的 `_dy140` 首墙在 80、出生 40，
+#: 出生瞬间间隙只有 24.8（半径 10 + 半墙厚 4）；换回 10-23 定的 `_y120`（首墙 120，
+#: 整排墙 +40）→ 开局距离 80 单位、间隙 64.8，板子多 1 s 时间去认第一道墙。
+#: 2026-10-24 锁定（acc9r16 = 目前最好的一轮）：8 道缺口中等幅度，0 碰撞 / 24-24 / +9.92。
+SCENARIO="${SCENARIO:-configs/20_walls_alt_24_dy140_gap8.json}"
 CHECK=0
 TAG="std"
 SECONDS_SIM=220
@@ -97,7 +101,7 @@ echo "== 4. 推 quad / 标定到板子 =="
 #: 那份是 calib_py40 那轮 auto_tune 的产物（4 / 6 / 0.975），比 acc9 紧得多；
 #: 实测 base7/base8 用它 → `page_stale` 806 次、放行 0 帧、覆盖率 2~5/24、角色慢慢挪。
 CONS=8; TOLVY=16; SETTLE=1.0
-echo "  阈值 = acc9 手写值: consensus=$CONS tol-vy=$TOLVY settle=${SETTLE}s"
+echo "  阈值 = 放宽准入后（2026-10-24 用户口径）: consensus=$CONS tol-vy=$TOLVY settle=${SETTLE}s"
 
 echo "== 4b. 板上自己的任务文件（只有自己的信息/任务/定位基准，**没有墙**）=="
 "$PY" core/board/tools/make_task.py "$SCENARIO" -o /tmp/task.json >/dev/null
