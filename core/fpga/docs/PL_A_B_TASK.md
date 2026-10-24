@@ -84,6 +84,37 @@ trailer   : CRC32(zlib) 4 B
    → 用 RTL 自带的 `tb_axi --fifo` 逐字节对比（sim 已能证明 RTL 侧），再用 1 像素宽的
    标记图案定位偏移量。
 
+## L0 第二轮（2026-10-24，RTL 侧已证明正确）
+
+**协仿真（AXI + PS 推像素 FIFO）在当前 RTL 上通过**，用的就是板上对拍失败的那批帧：
+
+```
+./obj_dir/Vvision_axi /home/zhang/FPGA/data/fpga/stim_color 2 --fifo --verbose
+  帧 0: AXI 路径一致（508 字节, 8 障碍, 4 缺口, 角色 1）  [经 PS 推像素 FIFO]
+  帧 1: AXI 路径一致（508 字节, 8 障碍, 4 缺口, 角色 1）  [经 PS 推像素 FIFO]
+  比对项 2229，不符 0
+```
+
+结论：**当前 RTL 的 FIFO 喂数路径与 C 参考逐位一致**（8 障碍/4 缺口），
+而板上同一帧给出 `n_obs=0` → **板上 `bd_vision.bin` 比当前 RTL 旧**（它是 10-15 的构建，
+`vision_pixfeed.v` 也在 10-15 才加）。
+
+## 位流重建被 Vivado 安装问题挡住（本轮实测）
+
+从 WSL 用 `cmd.exe` 调 `D:\Vivado\Vivado\2018.3\bin\vivado.bat`：
+
+| 步骤 | 结果 |
+|---|---|
+| `vivado.bat -version` | ✅ `Vivado v2018.3` |
+| `bd_vision.tcl`（缺 IP） | 报"找不到打包好的 IP"，符合脚本预期 |
+| `bd_pack.tcl` 第 1 次 | ❌ `couldn't read file D:/Vivado/.../unimacro_vhdl.tcl: No error` |
+| `bd_pack.tcl` 第 2 次 | ❌ `couldn't read file D:/Vivado/.../common.tcl: no such file or directory` |
+
+同一文件在 `/mnt/d` 下**存在且可读**（`ls` 正常），但 Vivado 自己的综合进程读不到 ——
+两次报的**不同文件**，说明是安装/磁盘读取层面的间歇故障，不是某个文件真缺。
+
+→ **重建位流目前不可行**，需要先修 Vivado 安装（重装或把安装挪到本地盘 C:）。
+
 ## 下一步（按顺序）
 
 1. **P3 / L0**：同一批帧（≥300 张真实 640×360 帧）分别喂 PL 与跑 C 参考

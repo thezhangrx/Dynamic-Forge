@@ -79,7 +79,7 @@ def load_rgb(path: str, w: int, h: int) -> bytes:
     return np.ascontiguousarray(rgb).tobytes()
 
 
-def push_frame(m, rgb: bytes, seq: int, stamp_ns: int) -> float:
+def push_frame(m, rgb: bytes, seq: int, stamp_ns: int, pad: int = 0) -> float:
     """推进一整帧并等 frame_done；返回耗时（秒）。"""
     assert len(rgb) % 4 == 0, "帧字节数必须是 4 的倍数（整字写 FIFO）"
     #: 顺序**必须是"先 start 再推像素"**：vision_top 只在收到 frame_start 的
@@ -99,6 +99,9 @@ def push_frame(m, rgb: bytes, seq: int, stamp_ns: int) -> float:
     while not (rd(m, kOffCtrl) & 0x1):
         if time.perf_counter() - t_wait > 0.2:
             raise RuntimeError("PL 200 ms 内没有进入忙碌（start 没生效？）")
+    if pad:
+        rgb = b"\x00" * int(pad) + rgb       # 前面补 0，测"流水线起始吞掉几个字节"
+        rgb = rgb[:len(rgb) // 4 * 4]
     words = struct.unpack("<%dI" % (len(rgb) // 4), rgb)
     for v in words:
         wr(m, kOffPixPush, v)
@@ -143,6 +146,8 @@ def main(argv=None) -> int:
     ap.add_argument("--w", type=int, default=640)
     ap.add_argument("--h", type=int, default=360)
     ap.add_argument("--repeat", type=int, default=1)
+    ap.add_argument("--pad", type=int, default=0,
+                    help="帧前多推 N 个字节（定位 FIFO/流水线吃掉的起始字节数）")
     ap.add_argument("--jsonl", default="")
     a = ap.parse_args(argv)
 
@@ -153,7 +158,7 @@ def main(argv=None) -> int:
     ok_all = True
     try:
         for i in range(a.repeat):
-            dt = push_frame(m, rgb, seq=i + 1, stamp_ns=time.monotonic_ns())
+            dt = push_frame(m, rgb, seq=i + 1, stamp_ns=time.monotonic_ns(), pad=a.pad)
             r = read_frame(m)
             ok = r["ok_magic"] and r["ok_len"] and r["ok_crc"]
             ok_all &= ok
