@@ -175,6 +175,37 @@ Vivado 脚本里 `source`/`open` 也成功 —— **只有 BD 子系统读不到
 → **结论：需要把 Vivado 安装挪到可靠磁盘（C:，剩 31 GB）或重装**；
 这已连续 3 轮（round 3/4/5）卡在同一条件上。
 
+## 🎯 round 6：找到 PL 判不出墙的**直接原因**（RTL 侧，实测）
+
+在板上直接读 `PIXSTAT.buffered`（`0x0D8`），逐次推字：
+
+```
+flush 后 buffered = 0
+推第 1 个字（32 位写 0x0D4）→ buffered = 12   （+12 = **3 个字**）
+推第 2 个 → 24   （再 +12）
+...
+对照：8 位写 0x0D4 → buffered +4（1 个字）
+```
+
+→ **一次 32 位 AXI 写会让像素 FIFO 进 3 份同样的字**。整帧于是被 3 倍重复，
+流水线看到的画面必然错位 ⇒ `n_obs=0`；而帧长/CRC 仍然自洽（所以一直没被发现）。
+cosim 里没暴露，是因为仿真模型的 AXI 从机每笔写只提交一次。
+
+同一批帧、同一份字节、同一份参数，唯一差的就是这条写通道。
+
+### 修法
+
+RTL 侧：`vision_axi.v` 的 `W_PIXPUSH` 分支要在"一笔写只脉冲一次"上做一次性保护
+（或查清 GP 口为什么对一次 32 位 store 提交 3 次）。改完必须重出位流。
+
+### 重出位流目前仍被 Vivado 卡住
+
+我已经把框架按相对路径 `source` 的 40 个 helper（`init.tcl`/`mig_utils.tcl`/`gt_utils.tcl`/
+`ip_integrator_utils.tcl`/…）都摆到了 `C:\pl_build\cwd`，但 batch 模式下
+`create_bd_design`/`create_bd_cell` 仍在框架初始化（`update_boundary` 缺失）处失败 ——
+**BD 框架在 batch 模式下初始化不完整**（GUI 交互模式可以，但 GUI 跑 tcl 之前会崩，
+崩的原因之一已修：`encoding system utf-8`）。
+
 ## 下一步（按顺序）
 
 1. **P3 / L0**：同一批帧（≥300 张真实 640×360 帧）分别喂 PL 与跑 C 参考

@@ -92,6 +92,10 @@ module vision_axi #(
     localparam [11:0] ADDR_PIXPUSH = 12'h0D4;  // 写：推一个 32 位字（4 个打包字节）
     localparam [11:0] ADDR_PIXSTAT = 12'h0D8;  // 读：{ovf, level[15:0]}
     localparam [11:0] ADDR_PIXCTL  = 12'h0DC;  // 写：bit0=像素源(0=din_*外部,1=FIFO) bit1=flush
+    //: 诊断（2026-10-24）：PS 推入的字节数 / 异或 / 和（只读，flush 清零）
+    localparam [11:0] ADDR_PIXDBG0 = 12'h0E0;
+    localparam [11:0] ADDR_PIXDBG1 = 12'h0E4;
+    localparam [11:0] ADDR_PIXDBG2 = 12'h0E8;
     localparam [11:0] ADDR_FRAME  = 12'h100;   // 几何帧窗口
     localparam [11:0] ADDR_FRAME_END = ADDR_FRAME + FRAME_BYTES[11:0];
     localparam [FB_BITS:0] FB_MAX    = FRAME_BYTES[FB_BITS:0];
@@ -123,6 +127,9 @@ module vision_axi #(
     localparam [ADDR_W-3:0] W_PIXPUSH  = ADDR_PIXPUSH[ADDR_W-1:2];
     localparam [ADDR_W-3:0] W_PIXSTAT  = ADDR_PIXSTAT[ADDR_W-1:2];
     localparam [ADDR_W-3:0] W_PIXCTL   = ADDR_PIXCTL[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_PIXDBG0  = ADDR_PIXDBG0[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_PIXDBG1  = ADDR_PIXDBG1[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_PIXDBG2  = ADDR_PIXDBG2[ADDR_W-1:2];
     localparam [ADDR_W-3:0] W_FRAME    = ADDR_FRAME[ADDR_W-1:2];
     localparam [ADDR_W-3:0] W_FRAME_END = ADDR_FRAME_END[ADDR_W-1:2];
     // 配置块的窗口边界保持用**字节地址**判（ADDR_CONFIG+0x080 是字对齐的，
@@ -165,6 +172,7 @@ module vision_axi #(
     wire        pf_vld, pf_sof, pf_eol;
     wire [7:0]  pf_r, pf_g, pf_b;
     wire        pix_busy;
+    wire [31:0] pix_dbg_bytes, pix_dbg_xor, pix_dbg_sum;
 
     // ---- 几何帧缓冲（按 32 bit 字存，字节写用位选，读一次给一个字）------
     reg [31:0]      frame_mem [0:FRAME_BYTES/4-1];
@@ -254,7 +262,8 @@ module vision_axi #(
         .sink_ready(busy),      // 见 vision_pixfeed.v：busy 恰在进入 S_RECV 时拉高
         .dout_vld(pf_vld), .dout_sof(pf_sof), .dout_eol(pf_eol),
         .dout_r(pf_r), .dout_g(pf_g), .dout_b(pf_b),
-        .busy(pix_busy)
+        .busy(pix_busy),
+        .dbg_bytes(pix_dbg_bytes), .dbg_xor(pix_dbg_xor), .dbg_sum(pix_dbg_sum)
     );
 
     // 像素源二选一（**逐条对应**：vld/sof/eol/r/g/b 必须整体切换，不能混）
@@ -426,6 +435,9 @@ module vision_axi #(
                     W_CTRL:   rdata_q <= ctrl_rd;
                     // [15:0] 还在缓冲的**字节**数；[16] 溢出（粘滞）；[17] 这一帧还在放
                     W_PIXSTAT: rdata_q <= {14'b0, pix_busy, pix_ovf, pix_buffered};
+                    W_PIXDBG0: rdata_q <= pix_dbg_bytes;
+                    W_PIXDBG1: rdata_q <= pix_dbg_xor;
+                    W_PIXDBG2: rdata_q <= pix_dbg_sum;
                     W_FLEN:   rdata_q <= {{(32-FB_BITS-1){1'b0}}, frame_len};
                     W_SEQ:    rdata_q <= cfg_seq_r;
                     W_STAMP0: rdata_q <= cfg_stamp_r[31:0];

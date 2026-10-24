@@ -67,7 +67,14 @@ module vision_pixfeed #(
     output reg  [7:0]  dout_r,
     output reg  [7:0]  dout_g,
     output reg  [7:0]  dout_b,
-    output reg         busy                // 本帧还没放完
+    output reg         busy,               // 本帧还没放完
+    // ---- 诊断（2026-10-24 加）：PS 推入的字节数 / 异或 / 和 ----------------
+    //: 为什么需要：板上喂帧后 PL 判不出墙，而 cosim 同一批帧是对的 —— 需要
+    //: **直接证明"我推的字节是否原样到达"**。三个累加量足够定位丢字/错位：
+    //: 主机端对同一份字节算同样的量，一致 ⇒ 传输没问题，问题在判据侧。
+    output reg  [31:0] dbg_bytes,
+    output reg  [31:0] dbg_xor,
+    output reg  [31:0] dbg_sum
 );
 
     // -----------------------------------------------------------------------
@@ -130,10 +137,12 @@ module vision_pixfeed #(
             ovf  <= 1'b0; busy <= 1'b0;
             dout_vld <= 1'b0; dout_sof <= 1'b0; dout_eol <= 1'b0;
             dout_r <= 8'd0; dout_g <= 8'd0; dout_b <= 8'd0;
+            dbg_bytes <= 32'd0; dbg_xor <= 32'd0; dbg_sum <= 32'd0;
         end else begin
             // ---- FIFO 写 ----
             if (flush) begin
                 wptr <= 0; rptr <= 0; ovf <= 1'b0;
+                dbg_bytes <= 32'd0; dbg_xor <= 32'd0; dbg_sum <= 32'd0;
                 acc  <= 64'd0; nb <= 4'd0;
                 px <= 16'd0; py <= 16'd0; busy <= 1'b0;
             end else begin
@@ -142,6 +151,9 @@ module vision_pixfeed #(
                     else begin
                         mem[wptr[AW-1:0]] <= push_data;
                         wptr <= wptr + 1'b1;
+                        dbg_bytes <= dbg_bytes + 32'd4;
+                        dbg_xor   <= dbg_xor ^ push_data;
+                        dbg_sum   <= dbg_sum + push_data;
                     end
                 end
                 if (pop) rptr <= rptr + 1'b1;
