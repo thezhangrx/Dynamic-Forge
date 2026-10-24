@@ -54,6 +54,26 @@ update_compile_order -fileset sources_1
 puts "@@@ 已加入 IP 仓库 $out_dir @@"
 
 # ---- 块设计 ----------------------------------------------------------------
+#: ⚠ Vivado 2018.3 的块设计在第一次 `create_bd_design` 时会去 source
+#: `$APPROOT/scripts/xguifrmwork/init.tcl`，而那个 init.tcl 第 10 行写的是
+#: **相对路径** `source -notrace mig_utils.tcl` —— 从别的工作目录跑批量脚本时
+#: CWD 不是它自己的目录，于是报：
+#:     couldn't read file "mig_utils.tcl": No error
+#:     ERROR: [#UNDEF] Error in evaluating command source init.tcl
+#:     invalid command name "::xgui::utils::init_utils"
+#: 修法：**先切到它自己的目录把它 source 一遍**（init 是幂等的），再建块设计。
+set _xgd [expr {[info exists ::env(VIVADO_XGUI_DIR)] ? $::env(VIVADO_XGUI_DIR)
+                : "D:/Vivado/Vivado/2018.3/scripts/xguifrmwork"}]
+if {[file exists [file join $_xgd init.tcl]]} {
+    set _cwd [pwd]
+    cd $_xgd
+    if {[catch {source -notrace [file join $_xgd init.tcl]} _e]} {
+        puts "@@@ 预加载 xguifrmwork/init.tcl 失败：$_e @@"
+    } else {
+        puts "@@@ 已预加载 xguifrmwork/init.tcl（Vivado 2018.3 相对路径坑）@@"
+    }
+    cd $_cwd
+}
 create_bd_design "sys"
 
 # ① PS7，套用从厂商 demo 移植过来的配置

@@ -135,6 +135,26 @@ trailer   : CRC32(zlib) 4 B
 和上面同类：**Vivado 读自己的安装文件间歇失败**（D: 盘）。IP 打包（只跑综合）能过，
 块设计要读更多安装脚本，命中概率更高。正在重试；若持续失败需重装 Vivado 或换盘。
 
+### 块设计阶段的新证据（round 4 收尾）
+
+同一个文件，**脚本里 `source` 成功、BD 子系统里报读不到**：
+
+```
+# 我的测试脚本里：
+@@@ source 成功 @@          （source D:/Vivado/.../rsb/busdef/AXIMM/busdef.tcl）
+@@@ open  成功 @@
+
+# BD 流程里（create_bd_design "sys"）：
+couldn't read file "D:/Vivado/Vivado/2018.3/scripts/xguifrmwork/init.tcl": No error
+ERROR: [#UNDEF] Error in evaluating command source [rdi::utils::find_approot_file ...]
+```
+
+再加一条：把 **CWD 设成 Vivado 安装根目录** 也没用（同样报 init.tcl 读不到）。
+说明不是"文件不存在/无权限"，而是 **Vivado 2018.3 的 BD 子系统在这台机器上
+用 `-mode batch` 时取 approot 文件失败**（GUI 交互模式下通常不会）。
+
+→ 结论：**位流重建需要一次交互式（GUI）运行**，或在干净的安装上重跑。
+
 ## 下一步（按顺序）
 
 1. **P3 / L0**：同一批帧（≥300 张真实 640×360 帧）分别喂 PL 与跑 C 参考
