@@ -115,6 +115,26 @@ trailer   : CRC32(zlib) 4 B
 
 → **重建位流目前不可行**，需要先修 Vivado 安装（重装或把安装挪到本地盘 C:）。
 
+## 位流重建：修掉三个真 bug，仍卡在 Vivado 读自身安装文件（2026-10-24 round 4）
+
+脚本 `core/fpga/synth/bd_vision.tcl` 有三处**真 bug**（这也解释了"板上位流是旧的"——
+这个脚本此前根本没跑通过）：
+
+| # | 位置 | 问题 | 修法 |
+|---|---|---|---|
+| 1 | 第 167 行 | `puts "…range=64K` **少一个闭合引号** → `extra characters after close-quote` | 补 `"` |
+| 2 | 第 60 行 | `source {//wsl.localhost/...}/ps7_params.tcl` 写死 WSL UNC 路径 | 改成"与本脚本同目录" |
+| 3 | 第 52 行后 | `add_files` 之后没有 `update_compile_order`，`-reference tpg_source` 解析不到 | 加一行 |
+
+另外 `-nolog -nojournal` 会让 Vivado 报**读不到自己的脚本**
+（`unimacro_vhdl.tcl` / `common.tcl`）——去掉这两个参数后 IP 打包一次通过。
+
+**当前阻塞**：块设计阶段报
+`Error in evaluating command source [rdi::utils::find_approot_file scripts/xguifrmwork/init.tcl]`
+`invalid command name "::xgui::utils::init_utils"` ——
+和上面同类：**Vivado 读自己的安装文件间歇失败**（D: 盘）。IP 打包（只跑综合）能过，
+块设计要读更多安装脚本，命中概率更高。正在重试；若持续失败需重装 Vivado 或换盘。
+
 ## 下一步（按顺序）
 
 1. **P3 / L0**：同一批帧（≥300 张真实 640×360 帧）分别喂 PL 与跑 C 参考

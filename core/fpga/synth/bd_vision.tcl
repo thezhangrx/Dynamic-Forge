@@ -50,6 +50,7 @@ update_ip_catalog -rebuild
 add_files -norecurse [glob $rtl_dir/*.v]
 add_files -norecurse [glob $bd_dir/*.v]
 set_property include_dirs "$rtl_dir $bd_dir" [current_fileset]
+update_compile_order -fileset sources_1
 puts "@@@ 已加入 IP 仓库 $out_dir @@"
 
 # ---- 块设计 ----------------------------------------------------------------
@@ -57,7 +58,7 @@ create_bd_design "sys"
 
 # ① PS7，套用从厂商 demo 移植过来的配置
 create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7_0
-source {//wsl.localhost/Ubuntu/home/zhang/FPGA/core/fpga/synth/ps7_params.tcl}
+source [file join [file dirname [file normalize [info script]]] ps7_params.tcl]
 set failed [apply_vendor_ps7 [get_bd_cells ps7_0]]
 puts "@@@ PS7 参数失败 [llength $failed] 项 @@"
 
@@ -164,7 +165,7 @@ if {$_off ne "0x43C00000"} {
     puts "@@@ 基址没钉住：读回 $_off != 0x43C00000 @@"
     exit 1
 }
-puts "@@@ 基址已钉死 @@@ vision_0_reg0 offset=$_off range=64K
+puts "@@@ 基址已钉死 @@@ vision_0_reg0 offset=$_off range=64K"
 # ⚠ `report_bd_address` 是更新版本才有的命令，2018.3 里没有
 #   （踩过：`invalid command name "report_bd_address"`，整个脚本在这里停住）。
 #   地址已经在上面用 get_property 逐段打出来了，写进日志就够了。
