@@ -92,6 +92,13 @@ def push_frame(m, rgb: bytes, seq: int, stamp_ns: int) -> float:
     wr(m, kOffStamp1, (stamp_ns >> 32) & 0xFFFFFFFF)
     t0 = time.perf_counter()
     wr(m, kOffCtrl, 1)               # 先启动这一帧
+    #: **必须等 busy 拉高再推像素**：vision_top 在收到 din_sof 之前忽略所有像素，
+    #: 而 pixfeed 的放行条件就是"流水线已经开始收"（busy 高）。不等的话开头几十个
+    #: 像素被吞 → 整帧错位，但帧长/CRC 仍然自洽（这个坑很隐蔽，实测 n_obs=0）。
+    t_wait = time.perf_counter()
+    while not (rd(m, kOffCtrl) & 0x1):
+        if time.perf_counter() - t_wait > 0.2:
+            raise RuntimeError("PL 200 ms 内没有进入忙碌（start 没生效？）")
     words = struct.unpack("<%dI" % (len(rgb) // 4), rgb)
     for v in words:
         wr(m, kOffPixPush, v)
