@@ -101,6 +101,11 @@ echo "== 4. 推 quad / 标定到板子 =="
 #: 那份是 calib_py40 那轮 auto_tune 的产物（4 / 6 / 0.975），比 acc9 紧得多；
 #: 实测 base7/base8 用它 → `page_stale` 806 次、放行 0 帧、覆盖率 2~5/24、角色慢慢挪。
 CONS=8; TOLVY=16; SETTLE=1.0
+#: 感知源：默认仍是 CPU 的 vt_sparse（基线可原样复跑）。
+#: 换成 PL：CAM_VT_BIN=/root/tools/pl_vision core/board/tools/loop_standard.sh
+#: **只换这一个二进制**，参数/闸门/决策/协议一律不动（见 AGENTS.md R1/R2）。
+CAM_VT_BIN="${CAM_VT_BIN:-/root/tools/vt_sparse}"
+echo "  感知源 = $CAM_VT_BIN"
 echo "  阈值 = 放宽准入后（2026-10-24 用户口径）: consensus=$CONS tol-vy=$TOLVY settle=${SETTLE}s"
 
 echo "== 4b. 板上自己的任务文件（只有自己的信息/任务/定位基准，**没有墙**）=="
@@ -126,15 +131,15 @@ echo "== 5. 开跑（标准参数）=="
     --max-seconds "$SECONDS_SIM" --render-hz 30 --field-hz 1 --follow-scale 1 \
     --tag "$TAG" --hold 2 \
     --wall-rgb 255,240,200 --field-rgb 12,14,20 --bg-rgb 0,0,0 \
-    --fiducial-side 28 --fiducial-anchor band --frame-px 2 --field-every 5 \
+    --fiducial-side 48 --fiducial-anchor band --frame-px 2 --field-every 5 \
     --board-ssh "$BOARD" --ssh-key "$KEY" \
     --board-agent /root/tools/board_agent.py --board-python python3 \
     --board-extra "--from-end --verbose --consensus-frames $CONS --tol-vy $TOLVY --settle $SETTLE --pause-timeout 3.5" \
     --connect-timeout 90 \
     --calib "$CALIB_LOCAL" --calib-board /tmp/calib_y.json --quad-tol 6 \
-    --viewer --viewer-fullscreen --viewer-pos 320,60 --viewer-size 1280x960 \
+    --viewer --viewer-fullscreen --viewer-pos 320,60 --viewer-size 1440x1080 \
     --viewer-margin 0 \
-    --cam-vt-bin /root/tools/vt_sparse --cam-fps 12 --cam-w 640 --cam-h 480
+    --cam-vt-bin "$CAM_VT_BIN" --cam-fps 12 --cam-w 640 --cam-h 480
 
 echo
 echo "== 取回相机录像（cam_rec.mkv）=="

@@ -62,6 +62,30 @@ PAIRS = {
     "ADDR_PIXPUSH": "kOffPixPush",
     "ADDR_PIXSTAT": "kOffPixStat",
     "ADDR_PIXCTL":  "kOffPixCtl",
+    # 像素 FIFO 诊断口（0x0E0..0x0F8）：`pl_vision` 的推入校验要读它们
+    "ADDR_PIXDBG0":   "kOffPixDbg0",
+    "ADDR_PIXDBG1":   "kOffPixDbg1",
+    "ADDR_PIXDBG2":   "kOffPixDbg2",
+    "ADDR_PIXZSTRB":  "kOffPixZStrb",
+    "ADDR_PIXMEM":    "kOffPixMem",
+    "ADDR_PIXPTR":    "kOffPixPtr",
+    "ADDR_PIXCOMMIT": "kOffPixCommit",
+    # P0（正射进 PL）寄存器块 0x900..0x95F：`pl_vision --p0` 的全部配置与状态
+    "ADDR_FRMCTL":    "kOffFrmCtl",
+    "ADDR_FRMBASE":   "kOffFrmBase",
+    "ADDR_FRMC0C1":   "kOffFrmC0C1",
+    "ADDR_FRMR0R1":   "kOffFrmR0R1",
+    "ADDR_FRM_H0":    "kOffFrmH0",
+    "ADDR_FRM_PY16":  "kOffFrmPy16",
+    "ADDR_FRM_PS16":  "kOffFrmPs16",
+    "ADDR_FRM_PY24L": "kOffFrmPy24L",
+    "ADDR_FRM_PY24H": "kOffFrmPy24H",
+    "ADDR_FRM_PS24":  "kOffFrmPs24",
+    "ADDR_FRMDBG0":   "kOffFrmDbg0",
+    "ADDR_FRMDBG1":   "kOffFrmDbg1",
+    "ADDR_FRMDBG2":   "kOffFrmDbg2",
+    "ADDR_FRMLINE":   "kOffFrmLine",
+    "ADDR_FRMDIAG":   "kOffFrmDiag",
 }
 
 

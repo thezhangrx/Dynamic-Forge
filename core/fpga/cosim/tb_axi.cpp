@@ -57,7 +57,34 @@ enum {
     A_PIXPUSH        = 0x0D4,   // 写：推一个 32 位字（4 个打包字节）
     A_PIXSTAT        = 0x0D8,   // 读：[15:0]占用 [16]溢出 [17]还在放
     A_PIXCTL         = 0x0DC,   // 写：bit0 像素源(0=外部/TPG,1=FIFO) bit1 flush
+    // r8 起新增的 FIFO 诊断口（test_rtl_address_map 逐项核对，缺一个就红）
+    A_PIXDBG0        = 0x0E0,   // 读：本次推入的字节数
+    A_PIXDBG1        = 0x0E4,   // 读：推入字节的异或
+    A_PIXDBG2        = 0x0E8,   // 读：推入字节的和
+    A_PIXZSTRB       = 0x0EC,   // 读：被忽略的 WSTRB=0 写次数
+    A_PIXMEM         = 0x0F0,   // 写：FIFO 字地址；读：该字
+    A_PIXPTR         = 0x0F4,   // 读：{字数, 蓄水池字节}
+    A_PIXCOMMIT      = 0x0F8,   // 读：打到 PIXPUSH 的写次数
     A_FRAME          = 0x100,
+    // ---- P0（正射进 PL）寄存器块：0x900..（RTL 的 ADDR_FRM*，见 vision_axi.v）----
+    //: 约定：协同样例**不驱动**这些（正射在 cosim 里靠 tb_ortho_sys 单独验），
+    //: 这里写出来是为了让 `test_axi_address_map_matches_between_rtl_and_cosim`
+    //: 能把"地址映射"当成契约核对 —— 少了任何一条，PS 侧就会读到别的窗口。
+    A_FRMCTL         = 0x900,
+    A_FRMBASE        = 0x904,
+    A_FRMC0C1        = 0x908,
+    A_FRMR0R1        = 0x90C,
+    A_FRM_H0         = 0x910,
+    A_FRM_PY16       = 0x934,
+    A_FRM_PS16       = 0x938,
+    A_FRM_PY24L      = 0x93C,
+    A_FRM_PY24H      = 0x940,
+    A_FRM_PS24       = 0x944,
+    A_FRMDBG0        = 0x948,
+    A_FRMDBG1        = 0x94C,
+    A_FRMDBG2        = 0x950,
+    A_FRMLINE        = 0x954,
+    A_FRMDIAG        = 0x958,   // 只读诊断：camadapt 帧首 cnt/wp/rp
     A_CFG_STATUS     = 0x07C    // 4*31：vision_top 的 CFG_STATUS
 };
 
@@ -83,6 +110,15 @@ static int g_w_delay = 1;
 //  这是"PS 喂帧"通路唯一的判据 —— 它必须给出与直接灌 din_* **逐字节相同**的
 //  几何帧，否则真摄像头接上去就会出别的结果。
 static bool g_via_fifo = false;
+//: `--word-gap N`：每推一个像素字，空转 N 拍（模拟板上 PS 喂数比流水线慢得多）。
+//: 为什么要它：板上实测 Python 推一帧要 490 ms ≈ **每 142 拍才推一个字**，而流水线
+//: 消费 1 像素/拍。cosim 一直按"能推多快推多快"跑，从没覆盖过这个节奏。
+static int g_word_gap = 0;
+//: `--mimic-gp`：模拟**板上实测**的主控行为 —— 一次 32 位 store 在真硅上变成
+//: **3 笔 AXI 写**（1 笔带数据 + 2 笔 WSTRB=0）。板上取证：像素流里每个字变成
+//: 12 字节（4 数据 + 8 个零），灰度图上表现为严格的 [0,0,x,y] 周期 4 图案。
+//: 这个选项就是为了在仿真里把那条路径走出来。
+static bool g_mimic_gp = false;
 
 static void cmp_u32(const char *what, long long idx, uint32_t got, uint32_t want)
 {
@@ -235,7 +271,7 @@ int main(int argc, char **argv)
 {
     Verilated::commandArgs(argc, argv);
     if (argc < 3) {
-        fprintf(stderr, "用法: %s <stim_dir> <frames> [--verbose] [--bright N] [--w-delay N]\n", argv[0]);
+        fprintf(stderr, "用法: %s <stim_dir> <frames> [--verbose] [--bright N] [--w-delay N] [--fifo] [--word-gap N]\n", argv[0]);
         return 2;
     }
     std::string dir = argv[1];
@@ -247,6 +283,8 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--verbose")) g_verbose = true;
         else if (!strcmp(argv[i], "--w-delay") && i + 1 < argc) g_w_delay = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fifo")) g_via_fifo = true;
+        else if (!strcmp(argv[i], "--word-gap") && i + 1 < argc) g_word_gap = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--mimic-gp")) g_mimic_gp = true;
         else if (!strcmp(argv[i], "--bright") && i + 1 < argc) params.bright_min = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bright-spread") && i + 1 < argc) params.bright_spread = atoi(argv[++i]);
         // 反面控制：只改 RTL 的寄存器、不改 C 的参数 → AXI 路径必须报不一致
@@ -526,7 +564,15 @@ int main(int argc, char **argv)
                                    | ((uint32_t)rgb[4 * i + 1] << 8)
                                    | ((uint32_t)rgb[4 * i + 2] << 16)
                                    | ((uint32_t)rgb[4 * i + 3] << 24);
-                if (!axi_write(A_PIXPUSH, w32)) { CHECK(false, "推像素超时"); break; }
+                if (g_mimic_gp) {
+                    // 板上实测：一笔带数据的写 + 两笔 WSTRB=0 的写
+                    if (!axi_write_s(A_PIXPUSH, w32, 0xF)) { CHECK(false, "推像素超时"); break; }
+                    if (!axi_write_s(A_PIXPUSH, 0, 0x0)) { CHECK(false, "推像素超时"); break; }
+                    if (!axi_write_s(A_PIXPUSH, 0, 0x0)) { CHECK(false, "推像素超时"); break; }
+                } else {
+                    if (!axi_write(A_PIXPUSH, w32)) { CHECK(false, "推像素超时"); break; }
+                }
+                for (int g = 0; g < g_word_gap; g++) step();
             }
             // 溢出位必须没立（TB 推得比消费者慢，FIFO 只会被抽空）
             uint32_t st = 0;
@@ -585,6 +631,19 @@ int main(int argc, char **argv)
                 CHECK(axi_write(A_DBG_SEL, ((uint32_t)y << 4) | 3u), "写 DBG_SEL 超时");
                 CHECK(axi_read(A_DBG_DATA, &v), "读 DBG_DATA 超时");
                 cmp_u32("row_count", y, v & 0xFFFFu, rowc_g[y]);
+            }
+            // 灰度图对拍（`TB_DUMP_GRAY=N` 时打印前 N 个像素，用来和板上实测比对）
+            if (const char *dg = getenv("TB_DUMP_GRAY")) {
+                int n = atoi(dg);
+                printf("RTL gray[0:%d] = ", n);
+                for (int i = 0; i < n; i++) {
+                    CHECK(axi_write(A_DBG_SEL, ((uint32_t)i << 4) | 0u), "写 DBG_SEL 超时");
+                    CHECK(axi_read(A_DBG_DATA, &v), "读 DBG_DATA 超时");
+                    printf("%d,", (int)(v & 0xFF));
+                }
+                printf("\nref gray[0:%d] = ", n);
+                for (int i = 0; i < n; i++) printf("%d,", (int)gray_g[i]);
+                printf("\n");
             }
             // 读状态寄存器（vision_top 的 CFG_STATUS：bit0 busy, bit1 done, [23:8] 计数）
             CHECK(axi_read(A_CFG_STATUS, &v), "读 CFG_STATUS 超时");

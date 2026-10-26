@@ -68,6 +68,21 @@ enum CfgAddr : uint32_t {
     kCfgCount           = 21,   // 共 21 个（0..20）
 };
 
+//: P1a 的自适应亮度参数（cfg 21..28，见 vision_top.v 的 CFG_LUMA_*）。
+//: **故意不进 kCfgCount**：那张表是"21 个检测参数"，有测试钉住数量；这 8 个是
+//: 另一套判据（luma_mode=1）的参数，默认全关。它们同样会**粘住**，所以驱动开机
+//: 要把默认值写一遍，否则上一次谁开过 luma_mode=1，这一次就静默换了一套判据。
+enum LumaCfgAddr : uint32_t {
+    kCfgLumaMode      = 21,   // 0 = RGB 判据（默认）/ 1 = 自适应亮度判据
+    kCfgLumaPct       = 22,   // 亮度分位（默认 88）
+    kCfgLumaBias      = 23,   // 阈值 = 分位点 - bias（默认 20）
+    kCfgLumaMin       = 24,   // 阈值下限（默认 90）
+    kCfgLumaMax       = 25,   // 阈值上限（默认 200）
+    kCfgLumaPlayerMin = 26,   // 角色亮度下限（默认 165）
+    kCfgLumaEdgeRows  = 27,   // 上下各排除多少行（默认 8）
+    kCfgLumaRunMin    = 28,   // 行内亮游程 ≥ 它才算墙（默认 40）
+};
+
 //: 配置寄存器块的基址。写第 i 个就是 kRegBase + kOffConfig + cfg_offset(i)。
 //: （kOffConfig 就是 0，单列出来是为了与 vision_axi.v 的 ADDR_CONFIG 一一对应，
 //:   有一条测试逐项核对两边。）
@@ -99,6 +114,61 @@ constexpr uint32_t kOffPixPush = 0x0D4u;   // 写：像素 FIFO 推入（整字�
 constexpr uint32_t kOffPixStat = 0x0D8u;   // 读：[15:0]缓冲字节 [16]溢出 [17]还在放
 constexpr uint32_t kOffPixCtl  = 0x0DCu;   // 写：bit0 像素源(0=外部/TPG,1=FIFO) bit1 flush
 constexpr uint32_t kOffFrame  = 0x100u;   // 几何帧字节窗口
+
+// ---------------------------------------------------------------------------
+// 像素 FIFO 诊断口（0x0E0..0x0F8，只读）
+//
+// 只给**离线取证的驱动**用（`pl_vision` 的推入校验、`fifoprobe.py`）：
+// 0x0E0/0x0E4/0x0E8 是"PS 推进来的字节数 / 异或 / 和"，用来证明"PL 原样收到了
+// 我这一帧"（错位后的几何帧自己 CRC 自洽，外部无从发现，所以必须校验）。
+// 之所以要把它们写进契约：`pl_vision.cpp` 原来直接拿 0x0E0 这种裸数字去读，
+// 一旦 RTL 改地址就静默读到别的寄存器。
+// ---------------------------------------------------------------------------
+constexpr uint32_t kOffPixDbg0 = 0x0E0u;   // 读：推入字节数（flush 清零）
+constexpr uint32_t kOffPixDbg1 = 0x0E4u;   // 读：推入内容异或
+constexpr uint32_t kOffPixDbg2 = 0x0E8u;   // 读：推入内容和
+constexpr uint32_t kOffPixZStrb = 0x0ECu;  // 读：被忽略的 WSTRB=0 写次数
+constexpr uint32_t kOffPixMem  = 0x0F0u;   // 写：FIFO 字地址；读：该字内容
+constexpr uint32_t kOffPixPtr  = 0x0F4u;   // 读：{level[11:0], nb[3:0]}
+constexpr uint32_t kOffPixCommit = 0x0F8u; // 读：打到 PIXPUSH 的写次数（含被合并的）
+
+// ---------------------------------------------------------------------------
+// P0（正射进 PL）寄存器块：0x900..0x95F
+//
+// 0x000..0x07F 是 vision_top 的配置块，0x080..0x0FF 是调试/控制，0x100..0x8FF 是
+// 几何帧窗口（2048 B）——所以 0x900 起是空的，P0 就放在这里。
+//
+// 为什么这 9 个系数在 PS 算、不在 PL 算：单应求逆要浮点除法，PS 上是一次性的
+// （换标定才重算），PL 里只做"整数乘加 + 一次除法/像素"，两者逐位一致由构造保证
+// （`core/fpga/tools/ortho_fixed_ref.cpp` 是同一个式子）。
+// ---------------------------------------------------------------------------
+constexpr uint32_t kOffFrmCtl   = 0x900u;  // 写: bit0 像素源(1=正射) bit1 start bit2 清完成
+                                           // 读: {fills[15:0], 13'b0, done, busy, src}
+constexpr uint32_t kOffFrmBase  = 0x904u;  // 相机帧物理基址（字节，4 字节对齐）
+constexpr uint32_t kOffFrmC0C1  = 0x908u;  // {c1[15:0], c0[15:0]}  页面列范围
+constexpr uint32_t kOffFrmR0R1  = 0x90Cu;  // {r1[15:0], r0[15:0]}  页面行范围
+constexpr uint32_t kOffFrmH0    = 0x910u;  // h0..h8 = 0x910 + 4*i（h0..h5 Q16.16 / h6..h8 Q8.24）
+constexpr uint32_t kOffFrmPy16  = 0x934u;  // PY0_16（Q16.16 行基址）
+constexpr uint32_t kOffFrmPs16  = 0x938u;  // PS_16
+constexpr uint32_t kOffFrmPy24L = 0x93Cu;  // PY0_24 低 32 位
+constexpr uint32_t kOffFrmPy24H = 0x940u;  // PY0_24[39:32]（Q8.24：479.33*2^24 = 8.04e9 > 2^32）
+constexpr uint32_t kOffFrmPs24  = 0x944u;  // PS_24
+constexpr uint32_t kOffFrmDbg0  = 0x948u;  // {src_line[15:0], src_off[10:0], hit, miss, 3'b0}
+constexpr uint32_t kOffFrmDbg1  = 0x94Cu;  // {tag[15:0], fill_state[7:0], flags[5:0], fill_line[1:0]}
+constexpr uint32_t kOffFrmDbg2  = 0x950u;  // {flags[5:0], rd_idx[14:0], fills[10:0]}
+constexpr uint32_t kOffFrmLine  = 0x954u;  // {fill_line[15:2], axi_left[15:0], axi_state[1:0]}
+//: 0x958 只读诊断（2026-10-26）：{2'b0, sof_cnt[5:0], sof_wp[5:0], sof_rp[5:0], cnt[5:0], wp[5:0]}
+//: sof_* = camadapt 在**帧首那一拍**看到的缓冲状态（cnt>0 ⇒ 上一帧没排空 ⇒ 整帧右移）。
+constexpr uint32_t kOffFrmDiag  = 0x958u;
+
+//: FRMCTL 的位定义 —— **写和读的语义不同**（混用会得到假数）。
+//: 实测踩过：把读的 bit1（正射 busy）当成 done，于是第一帧"0.00 ms"就返回了。
+constexpr uint32_t kFrmSrc     = 1u << 0;   // 写：像素源 = 正射
+constexpr uint32_t kFrmStart   = 1u << 1;   // 写：启动一帧（同时起 vision_top 与正射）
+constexpr uint32_t kFrmClrDone = 1u << 2;   // 写：清掉粘滞的 done
+constexpr uint32_t kFrmStatusBusy  = 1u << 1;   // 读：正射在跑
+constexpr uint32_t kFrmStatusDone  = 1u << 2;   // 读：正射这帧做完了（粘滞）
+constexpr uint32_t kFrmFillsShift  = 16;        // 读：[31:16] = 行填充次数
 
 //: 写 kOffCtrl 时置 bit0 = 1 启动一帧（自清）。
 constexpr uint32_t kCtrlStart = 1u << 0;

@@ -44,7 +44,11 @@ module vision_axi #(
     parameter integer ADDR_W      = 12,
     // 几何帧窗口大小。上限 2048：帧窗口下标用 addr[FW_BITS+1:2] 整段选取，
     // 窗口必须落在 0x100..0xFFF 这一段里（实测最长帧 1804 字节，够用）。
-    parameter integer FRAME_BYTES = 2048
+    parameter integer FRAME_BYTES = 2048,
+    //: 本地实验用：1 = 把正射的 `hold` 强制接 0（拿掉"等 vision_top 收像素"的门控）。
+    //: 默认 0（正常行为）。只为在 cosim 里把"hold 是否影响 miss→填→命中"这条时间线分开，
+    //: **不需要重建位流**（综合时它是常数）。
+    parameter integer HOLD_BYPASS = 0
 ) (
     input  wire                  clk,
     input  wire                  aresetn,
@@ -74,7 +78,19 @@ module vision_axi #(
     input  wire                  din_eol,
     input  wire [7:0]            din_r,
     input  wire [7:0]            din_g,
-    input  wire [7:0]            din_b
+    input  wire [7:0]            din_b,
+
+    // ---- AXI4 读主口（P0：正射从 DDR 取相机帧；BD 里接 ps7 S_AXI_HP0）----
+    //: 为什么要在这一层引出：源帧在 DDR（PS 用 udmabuf 放），PL 必须自己按行去读
+    //: （PS 逐字推只有 4.4 M 字/s = 17.3 ms/帧，64 位 HP 口峰值 400 MB/s = 2.3 ms/帧）。
+    output wire [31:0]           m_araddr,
+    output wire [7:0]            m_arlen,
+    output wire                  m_arvalid,
+    input  wire                  m_arready,
+    input  wire [63:0]           m_rdata,
+    input  wire                  m_rlast,
+    input  wire                  m_rvalid,
+    output wire                  m_rready
 );
 
     localparam integer FB_BITS = $clog2(FRAME_BYTES);       // 2048 → 11
@@ -96,6 +112,31 @@ module vision_axi #(
     localparam [11:0] ADDR_PIXDBG0 = 12'h0E0;
     localparam [11:0] ADDR_PIXDBG1 = 12'h0E4;
     localparam [11:0] ADDR_PIXDBG2 = 12'h0E8;
+    localparam [11:0] ADDR_PIXZSTRB = 12'h0EC;   // 被忽略的 WSTRB=0 写次数
+    localparam [11:0] ADDR_PIXMEM   = 12'h0F0;   // 写：FIFO 字地址；读：该字内容
+    localparam [11:0] ADDR_PIXPTR   = 12'h0F4;   // {16'b0, level[11:0], nb[3:0]}
+    localparam [11:0] ADDR_PIXCOMMIT= 12'h0F8;   // 打到 PIXPUSH 的写次数（含被合并的）
+    // ---- P0（正射进 PL）寄存器块：0x900..0x95F --------------------------
+    //: 为什么放在 0x900：0x000..0x07F 是 vision_top 的配置块，0x080..0x0FF 是调试/控制，
+    //: 0x100..0x8FF 是几何帧窗口（FRAME_BYTES=2048），所以 0x900 起是空的。
+    localparam [11:0] ADDR_FRMCTL  = 12'h900;  // 写: bit0 像素源(1=正射) bit1 start bit2 清完成
+                                               // 读: {fills[15:0], 13'b0, done, busy, src}
+    localparam [11:0] ADDR_FRMBASE = 12'h904;  // 相机帧物理基址（字节，4 字节对齐）
+    localparam [11:0] ADDR_FRMC0C1 = 12'h908;  // {c1[15:0], c0[15:0]}  页面列范围
+    localparam [11:0] ADDR_FRMR0R1 = 12'h90C;  // {r1[15:0], r0[15:0]}  页面行范围
+    localparam [11:0] ADDR_FRM_H0  = 12'h910;  // h0..h8：0x910 + 4*i
+    localparam [11:0] ADDR_FRM_PY16= 12'h934;  // PY0_16（Q16.16 行基址，int32 够）
+    localparam [11:0] ADDR_FRM_PS16= 12'h938;  // PS_16
+    localparam [11:0] ADDR_FRM_PY24L=12'h93C;  // PY0_24 低 32 位
+    localparam [11:0] ADDR_FRM_PY24H=12'h940;  // PY0_24[39:32]（Q8.24 常数 8.04e9 > 2^32）
+    localparam [11:0] ADDR_FRM_PS24= 12'h944;  // PS_24
+    localparam [11:0] ADDR_FRMDBG0= 12'h948;   // {src_line[15:0], src_off[10:0], hit, miss, 3'b0}
+    localparam [11:0] ADDR_FRMDBG1= 12'h94C;   // {tag[15:0], fill_line[15:0]}
+    localparam [11:0] ADDR_FRMDBG2= 12'h950;   // {fills[15:0], flags[4:0], rd_idx[10:0]}
+    localparam [11:0] ADDR_FRMLINE= 12'h954;
+    //: 0x958 只读诊断：{2'b0, sof_cnt, sof_wp, sof_rp, cnt, wp}（各 6 位）
+    //: 目的：判断 camadapt 的缓冲在**帧首**是不是带着上一帧的残留（cnt>0）。
+    localparam [11:0] ADDR_FRMDIAG= 12'h958;   // {miss_line[15:0], 16'b0}（最近一次未命中行）
     localparam [11:0] ADDR_FRAME  = 12'h100;   // 几何帧窗口
     localparam [11:0] ADDR_FRAME_END = ADDR_FRAME + FRAME_BYTES[11:0];
     localparam [FB_BITS:0] FB_MAX    = FRAME_BYTES[FB_BITS:0];
@@ -130,8 +171,27 @@ module vision_axi #(
     localparam [ADDR_W-3:0] W_PIXDBG0  = ADDR_PIXDBG0[ADDR_W-1:2];
     localparam [ADDR_W-3:0] W_PIXDBG1  = ADDR_PIXDBG1[ADDR_W-1:2];
     localparam [ADDR_W-3:0] W_PIXDBG2  = ADDR_PIXDBG2[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_PIXZSTRB = ADDR_PIXZSTRB[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_PIXMEM   = ADDR_PIXMEM[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_PIXPTR   = ADDR_PIXPTR[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_PIXCOMMIT= ADDR_PIXCOMMIT[ADDR_W-1:2];
     localparam [ADDR_W-3:0] W_FRAME    = ADDR_FRAME[ADDR_W-1:2];
     localparam [ADDR_W-3:0] W_FRAME_END = ADDR_FRAME_END[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRMCTL   = ADDR_FRMCTL[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRMBASE  = ADDR_FRMBASE[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRMC0C1  = ADDR_FRMC0C1[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRMR0R1  = ADDR_FRMR0R1[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRM_H0   = ADDR_FRM_H0[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRM_PY16 = ADDR_FRM_PY16[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRM_PS16 = ADDR_FRM_PS16[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRM_PY24L= ADDR_FRM_PY24L[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRM_PY24H= ADDR_FRM_PY24H[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRM_PS24 = ADDR_FRM_PS24[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRMDBG0  = ADDR_FRMDBG0[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRMDBG1  = ADDR_FRMDBG1[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRMDBG2  = ADDR_FRMDBG2[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRMLINE  = ADDR_FRMLINE[ADDR_W-1:2];
+    localparam [ADDR_W-3:0] W_FRMDIAG  = ADDR_FRMDIAG[ADDR_W-1:2];
     // 配置块的窗口边界保持用**字节地址**判（ADDR_CONFIG+0x080 是字对齐的，
     // 对任何窄地址都等价于"字地址 < 32"），这样 aw_a/ar_a 的低 2 位也有用途。
 
@@ -166,7 +226,56 @@ module vision_axi #(
     // ---- PS 喂像素（真摄像头那条路）--------------------------------------
     reg         pix_src;          // 0 = din_*（外部/TPG），1 = PS 的 FIFO
     reg         pix_push;         // 一拍脉冲
+    //: **WSTRB=0 的写不是数据**（2026-10-24 真硅取证确认）。
+    //:
+    //: 现象：板上喂一整帧后 n_obs=0、帧长/CRC 却自洽；灰度图呈**严格周期 4**的
+    //: `[0,0,x,y]`（一半像素是 0）；白点标志从 idx 6700 漂到 20102（≈3×）。
+    //: 取证：`PIXSTAT.buffered` 是"边录边排空"的活计数（读的时机不同数不同），
+    //: 不能当计数器用；改用**整张灰度图与参考做相关**才看清形状。
+    //: 结论：GP 口对**一次 32 位 store** 实际发 **3 笔 AXI 写**（1 笔带数据 +
+    //: 2 笔 WSTRB=0）。原实现按"一笔写 = 一个字"处理，把 3 笔都压进 FIFO，
+    //: 于是像素流变成 12 字节/字（4 数据 + 8 个零）→ 整幅图错位 → 判不出墙。
+    //: cosim 一直没暴露：TB 的 `axi_write()` 只发**一笔** strb=0xF（已补
+    //: `--mimic-gp` 覆盖这个主控行为，可本地复现 149 处不符）。
+    //: 修法：按 AXI 语义 —— **WSTRB=0 的写不携带任何字节，不压**；部分字节写
+    //: 先按字节合并，等 4 个字节选通都到齐再压一个字（整字写仍是一拍压一次，
+    //: 快路径与 cosim 行为不变）。
     reg         pix_flush;        // 一拍脉冲
+    reg  [31:0] pix_acc;          // 部分字节写时攒着的字节（见下面的说明）
+    reg  [3:0]  pix_got;          // 已经到位的字节选通
+    reg  [31:0] pix_zstrb_cnt;    // 被忽略的 WSTRB=0 写次数（诊断用，0x0EC 只读）
+    reg  [31:0] pix_commit_cnt;   // 打到 PIXPUSH 的写次数（诊断用，0x0F8 只读）
+    reg  [10:0] pix_mem_addr_q;   // 要回读的 FIFO 字地址（0x0F0 写入）
+
+    // ---- P0（正射进 PL）寄存器 -------------------------------------------
+    //: 系数由 PS 按 `core/fpga/tools/ortho_fixed_ref.cpp` 的同一个式子算好写进来
+    //: （PL 不做浮点、不做单应求逆）。PY0_24 是 Q8.24 的 479.33*2^24 = 8.04e9 > 2^32，
+    //: 所以拆成两个 32 位寄存器（低 32 位 + [39:32]）；其余常数 int32 都装得下。
+    reg  signed [31:0] k_h0, k_h1, k_h2, k_h3, k_h4, k_h5, k_h6, k_h7, k_h8;
+    reg  signed [31:0] k_py16, k_ps16, k_ps24;
+    reg         [31:0] k_py24_lo;
+    reg         [7:0]  k_py24_hi;
+    reg  [9:0]  k_c0, k_c1, k_r0, k_r1;
+    reg  [31:0] frm_base;
+    reg         frm_src;          // 0 = 原路径（din_*/FIFO），1 = 正射
+    reg         frm_start;        // 一拍脉冲：同时启动 vision_top 与正射
+    reg         frm_done_lat;     // 粘滞的"正射这帧做完了"（PS 轮询会错过单拍脉冲）
+    //: 正射子系统对外信号
+    wire        of_vld, of_sof, of_eol, of_busy, of_done;
+    wire [7:0]  of_r, of_g, of_b;
+    wire [15:0] of_fills;
+    wire [15:0] of_dbg_line, of_dbg_fill_line, of_dbg_tag;
+    //: miss_line 的低 2 位在 FRMDBG 里不单独暴露（FRMLINE 用 [15:2]），留空不影响取证
+    wire [9:0]  of_dbg_px;
+    wire [7:0]  of_fill_state;
+    wire [15:0] of_axi_left;
+    wire [1:0]  of_axi_state;
+    wire        of_blk;
+    wire        of_dbg_hit, of_dbg_miss;
+    wire [14:0] of_dbg_rd_idx;
+    wire [5:0]  of_dbg_flags;
+    wire [31:0] pix_dbg_ptr;      // pixfeed 的 {level, nb}（0x0F4）
+    wire [31:0] pix_dbg_mem;      // pixfeed 的 mem[addr]（0x0F0）
     wire [15:0] pix_buffered;
     wire        pix_ovf;
     wire        pf_vld, pf_sof, pf_eol;
@@ -243,9 +352,11 @@ module vision_axi #(
             wstrb_merge26[25:24] = strb[3] ? newd[25:24] : old[25:24];
         end
     endfunction
-    // 32 位选通掩码版：PIXPUSH 要用**全 32 位**（一个像素的 4 个打包字节都在这儿）
-    wire [31:0] w_masked32 = wstrb_merge(32'd0, w_d, w_s);
-    wire [25:0] w_masked   = w_masked32[25:0];
+    // 26 位选通掩码（只给调试选择/配置用）。
+    // ⚠ 原来这里还留了一个 32 位的 `w_masked32`，但 PIXPUSH 的字节合并走的是
+    //   `pix_acc`（见下面的状态机），它没有任何读者 —— Verilator -Wall 的
+    //   UNUSEDSIGNAL 因此把 test_rtl_lint_clean 打成红。删掉，不留悬空网。
+    wire [25:0] w_masked = wstrb_merge26(26'd0, w_d[25:0], w_s);
 
     // =====================================================================
     // PS 喂像素：真摄像头采到的帧在 PS 手上，经 AXI 写进 FIFO，这里还原成
@@ -255,7 +366,7 @@ module vision_axi #(
 
     vision_pixfeed #(.WIDTH(WIDTH), .HEIGHT(HEIGHT)) u_pixfeed (
         .clk(clk), .rst_n(aresetn),
-        .push(pix_push), .push_data(w_masked32),
+        .push(pix_push), .push_data(pix_acc),
         // `level`（FIFO 里的字数）是纯诊断量，对外报的是 `buffered`（字节数，
         // 含蓄水池），所以这里不接 —— 留着悬空，避免"声明了却没人用"的 lint 告警。
         .flush(pix_flush), .buffered(pix_buffered), .ovf(pix_ovf),
@@ -263,16 +374,80 @@ module vision_axi #(
         .dout_vld(pf_vld), .dout_sof(pf_sof), .dout_eol(pf_eol),
         .dout_r(pf_r), .dout_g(pf_g), .dout_b(pf_b),
         .busy(pix_busy),
-        .dbg_bytes(pix_dbg_bytes), .dbg_xor(pix_dbg_xor), .dbg_sum(pix_dbg_sum)
+        .dbg_bytes(pix_dbg_bytes), .dbg_xor(pix_dbg_xor), .dbg_sum(pix_dbg_sum),
+        .dbg_mem_addr(pix_mem_addr_q), .dbg_mem_data(pix_dbg_mem), .dbg_ptr(pix_dbg_ptr)
     );
 
-    // 像素源二选一（**逐条对应**：vld/sof/eol/r/g/b 必须整体切换，不能混）
-    wire        src_vld = pf_sel ? pf_vld : din_vld;
-    wire        src_sof = pf_sel ? pf_sof : din_sof;
-    wire        src_eol = pf_sel ? pf_eol : din_eol;
-    wire [7:0]  src_r   = pf_sel ? pf_r   : din_r;
-    wire [7:0]  src_g   = pf_sel ? pf_g   : din_g;
-    wire [7:0]  src_b   = pf_sel ? pf_b   : din_b;
+    // =====================================================================
+    // P0：正射（DDR 里的 640×480 相机帧 → 640×360 页面像素）
+    //
+    // 数据流：PS 把相机帧 memcpy 进 udmabuf → 写 FRMBASE → 写 FRMCTL.start
+    //        → 本模块按行从 HP0 读（64 位 burst）→ 行缓存 32 行 → 正射
+    //        → 直接当 vision_top 的 din_*（不走 PIXPUSH，省掉 17.3 ms）
+    //
+    // ⚠ `hold = ~busy`：vision_top 没有背压，且每帧先进 S_HCLR 准备直方图
+    //   （约 257 拍 busy=0）。正射必须冻在那儿等，否则头几百个像素被静默丢掉。
+    // =====================================================================
+    wire [63:0] k_py24    = {{24{k_py24_hi[7]}}, k_py24_hi, k_py24_lo};
+    wire [39:0] k_py16_40 = {{8{k_py16[31]}}, k_py16};
+    wire [39:0] k_ps16_40 = {{8{k_ps16[31]}}, k_ps16};
+    wire [63:0] k_ps24_64 = {{32{k_ps24[31]}}, k_ps24};
+
+    vision_ortho_sys #(
+        .PL_W(WIDTH), .PL_H(HEIGHT), .SRC_W(640), .SRC_H(480)
+    ) u_ortho (
+        .clk(clk), .rst_n(aresetn),
+        .start(frm_start),
+        .hold(HOLD_BYPASS != 0 ? 1'b0 : ~busy),
+        .busy(of_busy), .done(of_done),
+        .h0(k_h0), .h1(k_h1), .h2(k_h2), .h3(k_h3), .h4(k_h4),
+        .h5(k_h5), .h6(k_h6), .h7(k_h7), .h8(k_h8),
+        .PY0_16(k_py16_40), .PS_16(k_ps16_40),
+        .PY0_24(k_py24), .PS_24(k_ps24_64),
+        .c0(k_c0), .c1(k_c1), .r0(k_r0), .r1(k_r1),
+        .frm_base(frm_base),
+        .m_araddr(m_araddr), .m_arlen(m_arlen), .m_arvalid(m_arvalid), .m_arready(m_arready),
+        .m_rdata(m_rdata), .m_rlast(m_rlast), .m_rvalid(m_rvalid), .m_rready(m_rready),
+        .out_vld(of_vld), .out_sof(of_sof), .out_eol(of_eol),
+        .out_r(of_r), .out_g(of_g), .out_b(of_b),
+        .dbg_src_line(of_dbg_line), .dbg_src_px(of_dbg_px), .dbg_miss(of_dbg_miss),
+        .dbg_fill_line(of_dbg_fill_line), .dbg_tag(of_dbg_tag), .dbg_hit(of_dbg_hit),
+        .dbg_rd_idx(of_dbg_rd_idx), .dbg_fills(of_fills), .dbg_flags(of_dbg_flags),
+        .dbg_fill_state(of_fill_state), .dbg_blk(of_blk),
+        .dbg_axi_left(of_axi_left), .dbg_axi_state(of_axi_state)
+    );
+
+    // ---- 相机域适配（P3）：正射之后、vision_top 之前 ------------------------
+    //: 为什么必须在 PL 里做：PL 的墙判据是**绝对阈值 + R−B**，而相机把暖白墙拍成中性偏蓝；
+    //: PS 侧的 `camera_domain_adapt()` 原来在正射之后重染色，P0 之后 PS 手上没有页面图了。
+    //: `flush`：一帧最后一像素进缓冲后还剩 <=41 个没吐，正交 done 后要把它们放完
+    //: （vision_top 按 640×360 计数，少一个都不收口）。
+    wire        ca_vld, ca_sof, ca_eol;
+    wire [7:0]  ca_r, ca_g, ca_b;
+    wire [31:0] ca_diag;   //: camadapt 只读诊断（0x958）
+    reg         frm_flush;
+    always @(posedge clk) begin
+        if (!aresetn) frm_flush <= 1'b0;
+        else if (frm_start) frm_flush <= 1'b0;
+        else if (of_done)   frm_flush <= 1'b1;
+    end
+    vision_camadapt #(.WIDTH(WIDTH)) u_camadapt (
+        .clk(clk), .rst_n(aresetn), .flush(frm_flush),
+        .in_vld(of_vld), .in_sof(of_sof), .in_eol(of_eol),
+        .in_r(of_r), .in_g(of_g), .in_b(of_b),
+        .out_vld(ca_vld), .out_sof(ca_sof), .out_eol(ca_eol),
+        .out_r(ca_r), .out_g(ca_g), .out_b(ca_b),
+        .dbg_diag(ca_diag)
+    );
+
+    // 像素源三选一（**逐条对应**：vld/sof/eol/r/g/b 必须整体切换，不能混）
+    //   frm_src=1 → 正射；否则按原口径（pix_src=1 → PS 的 FIFO，0 → 外部/TPG）
+    wire        src_vld = frm_src ? ca_vld : (pf_sel ? pf_vld : din_vld);
+    wire        src_sof = frm_src ? ca_sof : (pf_sel ? pf_sof : din_sof);
+    wire        src_eol = frm_src ? ca_eol : (pf_sel ? pf_eol : din_eol);
+    wire [7:0]  src_r   = frm_src ? ca_r   : (pf_sel ? pf_r   : din_r);
+    wire [7:0]  src_g   = frm_src ? ca_g   : (pf_sel ? pf_g   : din_g);
+    wire [7:0]  src_b   = frm_src ? ca_b   : (pf_sel ? pf_b   : din_b);
     vision_top #(.WIDTH(WIDTH), .HEIGHT(HEIGHT)) u_vision (
         .pix_clk(clk), .rst_n(aresetn),
         .din_vld(src_vld), .din_sof(src_sof), .din_eol(src_eol),
@@ -377,10 +552,21 @@ module vision_axi #(
             dbg_sel <= 0; dbg_idx <= 0; dbg_sub <= 0;
             cfg_seq_r <= 0; cfg_stamp_r <= 0;
             pix_src <= 1'b0; pix_push <= 1'b0; pix_flush <= 1'b0;
+            pix_acc <= 32'd0; pix_got <= 4'd0; pix_zstrb_cnt <= 32'd0;
+            pix_commit_cnt <= 32'd0; pix_mem_addr_q <= 11'd0;
             frame_wptr <= 0; frame_total <= 0; frame_len <= 0; frame_ovf <= 0;
+            k_h0 <= 0; k_h1 <= 0; k_h2 <= 0; k_h3 <= 0; k_h4 <= 0;
+            k_h5 <= 0; k_h6 <= 0; k_h7 <= 0; k_h8 <= 0;
+            k_py16 <= 0; k_ps16 <= 0; k_ps24 <= 0; k_py24_lo <= 0; k_py24_hi <= 0;
+            k_c0 <= 10'd0; k_c1 <= 10'd0; k_r0 <= 10'd0; k_r1 <= 10'd0;
+            frm_base <= 32'd0; frm_src <= 1'b0; frm_start <= 1'b0; frm_done_lat <= 1'b0;
         end else begin
             reg_we      <= 1'b0;      // 默认：写使能只持续一拍
             start_pulse <= 1'b0;
+            frm_start   <= 1'b0;   //: ⚠ 必须在这里清（case 之前）——写在 case 之后会盖掉
+                                   //:   W_FRMCTL 里 `frm_start <= 1'b1`（非阻塞，后写的赢），
+                                   //:   于是正射永远收不到 start（板上实测：fills=0、
+                                   //:   vision_top 卡在等像素，CTRL busy=1 不落）。
             pix_push    <= 1'b0;
             pix_flush   <= 1'b0;
 
@@ -408,15 +594,58 @@ module vision_axi #(
                     W_SEQ:    cfg_seq_r          <= wstrb_merge(cfg_seq_r, w_d, w_s);
                     W_STAMP0: cfg_stamp_r[31:0]  <= wstrb_merge(cfg_stamp_r[31:0],  w_d, w_s);
                     W_STAMP1: cfg_stamp_r[63:32] <= wstrb_merge(cfg_stamp_r[63:32], w_d, w_s);
+                    W_PIXMEM:   pix_mem_addr_q <= w_masked[10:0];
                     W_PIXPUSH: begin
-                        // 推一个 32 位字进像素 FIFO。**必须整字写**（strb=4'hF）
-                        // —— FIFO 没有"按字节合并"的语义，部分字节写没有意义。
-                        pix_push <= 1'b1;
+                        // 推一个 32 位字进像素 FIFO。**按字节选通判定**（见文件头
+                        // 那段"WSTRB=0 的写不是数据"）：真硅上一次 32 位 store 会
+                        // 拆成 1 笔 strb=0xF + 2 笔 strb=0，后者必须丢掉。
+                        pix_commit_cnt <= pix_commit_cnt + 32'd1;
+                        if (w_s == 4'h0) begin
+                            pix_zstrb_cnt <= pix_zstrb_cnt + 32'd1;   // 空选通：不压
+                        end else if ((pix_got | w_s) == 4'hF) begin
+                            pix_push <= 1'b1;                        // 4 字节到齐：压一个字
+                            pix_got  <= 4'd0;
+                            pix_acc  <= wstrb_merge(pix_acc, w_d, w_s);
+                        end else begin
+                            pix_got  <= pix_got | w_s;               // 部分字节：先攒着
+                            pix_acc  <= wstrb_merge(pix_acc, w_d, w_s);
+                        end
                     end
                     W_PIXCTL: begin
                         pix_src   <= w_masked[0];
                         pix_flush <= w_masked[1];
                     end
+                    // ---- P0：正射进 PL --------------------------------------
+                    W_FRMCTL: begin
+                        frm_src <= w_masked[0];
+                        //: bit1 同时启动 vision_top（start_pulse）与正射：两者必须
+                        //: 同一次写里起，否则"帧边界"对不上（正射会比 vision_top
+                        //: 早/晚一帧，像素整幅平移）。
+                        if (w_masked[1]) begin
+                            frm_start    <= 1'b1;
+                            start_pulse  <= 1'b1;
+                            frm_done_lat <= 1'b0;
+                        end
+                        if (w_masked[2]) frm_done_lat <= 1'b0;
+                    end
+                    W_FRMBASE:  frm_base  <= wstrb_merge(frm_base, w_d, w_s);
+                    //: 10 位（c1=560 装不进 9 位，见 vision_ortho 端口处的说明）
+                    W_FRMC0C1:  begin k_c0 <= w_masked[9:0]; k_c1 <= w_masked[25:16]; end
+                    W_FRMR0R1:  begin k_r0 <= w_masked[9:0]; k_r1 <= w_masked[25:16]; end
+                    W_FRM_H0:   k_h0 <= wstrb_merge(k_h0, w_d, w_s);
+                    W_FRM_H0+1: k_h1 <= wstrb_merge(k_h1, w_d, w_s);
+                    W_FRM_H0+2: k_h2 <= wstrb_merge(k_h2, w_d, w_s);
+                    W_FRM_H0+3: k_h3 <= wstrb_merge(k_h3, w_d, w_s);
+                    W_FRM_H0+4: k_h4 <= wstrb_merge(k_h4, w_d, w_s);
+                    W_FRM_H0+5: k_h5 <= wstrb_merge(k_h5, w_d, w_s);
+                    W_FRM_H0+6: k_h6 <= wstrb_merge(k_h6, w_d, w_s);
+                    W_FRM_H0+7: k_h7 <= wstrb_merge(k_h7, w_d, w_s);
+                    W_FRM_H0+8: k_h8 <= wstrb_merge(k_h8, w_d, w_s);
+                    W_FRM_PY16: k_py16  <= wstrb_merge(k_py16, w_d, w_s);
+                    W_FRM_PS16: k_ps16  <= wstrb_merge(k_ps16, w_d, w_s);
+                    W_FRM_PY24L:k_py24_lo <= wstrb_merge(k_py24_lo, w_d, w_s);
+                    W_FRM_PY24H:k_py24_hi <= w_masked[7:0];
+                    W_FRM_PS24: k_ps24  <= wstrb_merge(k_ps24, w_d, w_s);
                     default: ;                     // 未映射地址：忽略
                 endcase
             end else if (b_v && s_bready) begin
@@ -438,10 +667,42 @@ module vision_axi #(
                     W_PIXDBG0: rdata_q <= pix_dbg_bytes;
                     W_PIXDBG1: rdata_q <= pix_dbg_xor;
                     W_PIXDBG2: rdata_q <= pix_dbg_sum;
+                    W_PIXZSTRB: rdata_q <= pix_zstrb_cnt;
+                    W_PIXMEM:   rdata_q <= pix_dbg_mem;
+                    W_PIXPTR:   rdata_q <= pix_dbg_ptr;
+                    W_PIXCOMMIT: rdata_q <= pix_commit_cnt;
                     W_FLEN:   rdata_q <= {{(32-FB_BITS-1){1'b0}}, frame_len};
                     W_SEQ:    rdata_q <= cfg_seq_r;
                     W_STAMP0: rdata_q <= cfg_stamp_r[31:0];
                     W_STAMP1: rdata_q <= cfg_stamp_r[63:32];
+                    W_FRMCTL: rdata_q <= {of_fills, 13'd0, frm_done_lat, of_busy, frm_src};
+                    W_FRMBASE: rdata_q <= frm_base;
+                    W_FRMC0C1: rdata_q <= {6'b0, k_c1, 6'b0, k_c0};
+                    W_FRMR0R1: rdata_q <= {6'b0, k_r1, 6'b0, k_r0};
+                    //: 系数回读（R71：探针读回全 0 是因为这里没写读译码，不是硬件错）
+                    W_FRM_H0:   rdata_q <= k_h0;
+                    W_FRM_H0+1: rdata_q <= k_h1;
+                    W_FRM_H0+2: rdata_q <= k_h2;
+                    W_FRM_H0+3: rdata_q <= k_h3;
+                    W_FRM_H0+4: rdata_q <= k_h4;
+                    W_FRM_H0+5: rdata_q <= k_h5;
+                    W_FRM_H0+6: rdata_q <= k_h6;
+                    W_FRM_H0+7: rdata_q <= k_h7;
+                    W_FRM_H0+8: rdata_q <= k_h8;
+                    W_FRM_PY16: rdata_q <= k_py16;
+                    W_FRM_PS16: rdata_q <= k_ps16;
+                    W_FRM_PY24L:rdata_q <= k_py24_lo;
+                    W_FRM_PY24H:rdata_q <= {24'b0, k_py24_hi};
+                    W_FRM_PS24: rdata_q <= k_ps24;
+                    W_FRMDBG0: rdata_q <= {of_dbg_line, 1'b0, of_dbg_px, 2'b0, of_blk, of_dbg_hit, of_dbg_miss};
+                    W_FRMDBG1: rdata_q <= {of_dbg_tag, of_fill_state, of_dbg_flags, of_dbg_fill_line[1:0]};
+                    //: {flags, rd_idx[15:0], fills[10:0]} —— 全 16 位 rd_idx 都露出来
+                    //: （fills 的完整 16 位在 FRMCTL 里，不用重复）
+                    W_FRMDBG2: rdata_q <= {of_dbg_flags, of_dbg_rd_idx, of_fills[10:0]};
+                    //: 打包（32 位）：{miss_line[15:2], axi_left[15:0], axi_state[1:0]} + miss_line[1:0] 补满 32 位
+//:   tb 解码：left=(d>>4)&0xFFFF? —— 不用猜：tb 里按 `(d>>4)` 取不到时以本注释为准
+                    W_FRMLINE: rdata_q <= {of_dbg_fill_line[15:2], of_axi_left[15:0], of_axi_state};
+                    W_FRMDIAG: rdata_q <= ca_diag;
                     default:  rdata_q <= (ar_word >= W_FRAME &&
                                           ar_word <  W_FRAME_END)
                                          ? frame_word(ar_word[FW_BITS-1:0]
@@ -455,6 +716,8 @@ module vision_axi #(
             // frame_done 比 dout_last 晚一拍（vision_top 在 S_DONE 拉高），
             // 所以这里 frame_wptr 已经是整帧字节数。
             if (frame_done) frame_wptr <= 0;     // 收完一帧，窗口从头开始
+            //: 正射做完这帧 → 粘滞置位，PS 轮询 FRMCTL 不会漏掉单拍 done
+            if (of_done) frm_done_lat <= 1'b1;
             if (start_pulse) frame_ovf <= 1'b0;
             // 真实帧长在**最后一个字节**那一拍定：frame_total 不管窗口够不够
             // 都在数，所以窗口太小时 PS 也能看出"长度超了窗口"。
