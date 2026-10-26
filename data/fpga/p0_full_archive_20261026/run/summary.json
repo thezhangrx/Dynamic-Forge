@@ -1,0 +1,74 @@
+{
+  "scenario": "20_walls_alt_24",
+  "reached": true,
+  "t_sim_s": 99.2,
+  "wall_s": 198.4,
+  "final_pos": [
+    313.3,
+    3337.2
+  ],
+  "collisions": 0,
+  "moves": 1231,
+  "poses": 3836,
+  "min_clearance": -10.0,
+  "min_clearance_at": [
+    273.3,
+    216.7,
+    1.92
+  ],
+  "page_fps": 28.87,
+  "page_dropped": 17,
+  "rec_pages": 5740,
+  "rec_fields": 191,
+  "rec_dropped": [
+    0,
+    0
+  ],
+  "render_ms": 5.85,
+  "peer": "ssh:root@192.168.137.242",
+  "videos": {
+    "follow": "/home/zhang/FPGA/data/fpga/loop_logs/platform_20261026_184929_p0i_follow.mp4",
+    "field": "/home/zhang/FPGA/data/fpga/loop_logs/platform_20261026_184929_p0i_field.mp4"
+  },
+  "abort_reason": null,
+  "decision_source": "camera",
+  "run_dir": "/home/zhang/FPGA/data/fpga/loop_logs/run_20261026_184929_p0i",
+  "logs": {
+    "timeline": 11904,
+    "board_io": 5037,
+    "render": 5931,
+    "truth_rows": 24,
+    "local_truth": 196,
+    "host_events": 25
+  },
+  "board_files": {
+    "board_state.txt": {
+      "bytes": 17304051,
+      "lines": 21685
+    },
+    "board_events.jsonl": {
+      "bytes": 1053251,
+      "lines": 6081
+    },
+    "board_vt.jsonl": {
+      "bytes": 526639,
+      "lines": 2460
+    },
+    "camera_last.jpg": {
+      "bytes": 21234,
+      "age_s": -1.0,
+      "stale": true
+    }
+  },
+  "calib": {
+    "scale": 0.95159,
+    "bias": 11.957,
+    "samples": 6919,
+    "rows_matched": 990,
+    "rmse": 7.89,
+    "max_abs": 29.94,
+    "quad": "51.6,27.7,599.1,7.9,631.0,422.6,58.6,457.9",
+    "run": "/home/zhang/FPGA/data/fpga/loop_logs/run_20261026_184929_p0i",
+    "scenario": "configs/20_walls_alt_24_dy140_gap8.json"
+  }
+}

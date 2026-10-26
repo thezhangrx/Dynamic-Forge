@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# loop_standard.sh —— 闭环**标准配置**（2026-10-21 起：std7/std9）
+#
+#   相机 → 板端 vt_sparse（12 fps）→ 板端决策 → @MOVE → 主机渲染
+#
+#   2026-10-21 晚上的精度版（acc9）：VT 输入 640x480、墙行亚像素质心、锁曝光、
+#   8 帧中位数、按拍摄时刻配位姿、标定含横向偏差：
+#      到达=True  碰撞=0  最小间隙 +17.43  学到 23/24 道墙
+#      |Δy| 平均 1.4 px（max 2.3）   VT 12.0 帧/s
+#      证据：data/fpga/loop_logs/run_20261021_085727_acc9/
+#   上一版（std7/std9）：24/24、|Δy| 2.7/3.1、最小间隙 +18.2/+16.0
+#
+#   2026-10-20 的旧标准（sparse6）只学到 18/24、擦墙一次，已不再作标准。
+#
+# 这个脚本就是"标准"本身：所有参数都在这里，**不要**再手敲一长串 --foo。
+#
+#     bash core/board/tools/loop_standard.sh                 # 跑一轮（tag=std）
+#     bash core/board/tools/loop_standard.sh --tag try2      # 换个 tag
+#     bash core/board/tools/loop_standard.sh --seconds 40    # 缩短仿真时长
+#     bash core/board/tools/loop_standard.sh --check         # 只检查板子/标定，不开跑
+#
+# 前置条件（脚本会检查）：
+#   * 板子 192.168.137.242 可 ssh（key: data/fpga/board_ssh/board_key）
+#   * 板上有 /root/tools/vt_sparse、/root/tools/board_agent.py、/tmp/quad.json
+#   * data/fpga/calib_y.json 存在（y 换算系数，自动标定产物，不要手改）
+#   * 屏幕上**没有**别的 page_view/platform_host 窗口压在平台上面
+#     （历史坑：残留的 --hold 渲染进程把冻结页面挂在最前面，相机就拍它）
+#
+# 已知坏点（别开）：
+#   * --collect-moving 机制已修好，但**不如停车法**（std4：11/24、|Δy| 6.0），
+#     标准配置不启用它。sparse7 那次 90 Hz resume 空转的假"到达"已作废。
+#   * 按缺口身份预过滤候选（std8 试过）会把真墙滤掉（24/24→17/24），已回退。
+# ===========================================================================
+set -u
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$HERE/../../.." && pwd)
+cd "$ROOT"
+
+PY="$ROOT/Env/bin/python"
+BOARD="root@192.168.137.242"
+KEY="data/fpga/board_ssh/board_key"
+QUAD_LOCAL="data/fpga/quad.json"
+CALIB_LOCAL="data/fpga/calib_y.json"
+#: 2026-10-24 用户口径：**整轮回退到 acc9（git 0806d81）那一轮**再跑一次。
+#: 所以场景也回到 acc9 用的 `20_walls_alt_24_dy140.json`（首墙 80、末墙 3340）；
+#: 10-23 定的 `_y120`（整排墙 +40）原样留在 configs/ 里，随时可以 SCENARIO= 切回。
+#: 2026-10-24 用户口径：**先把开局距离拉开**。acc9 的 `_dy140` 首墙在 80、出生 40，
+#: 出生瞬间间隙只有 24.8（半径 10 + 半墙厚 4）；换回 10-23 定的 `_y120`（首墙 120，
+#: 整排墙 +40）→ 开局距离 80 单位、间隙 64.8，板子多 1 s 时间去认第一道墙。
+#: 2026-10-24 锁定（acc9r16 = 目前最好的一轮）：8 道缺口中等幅度，0 碰撞 / 24-24 / +9.92。
+SCENARIO="${SCENARIO:-configs/20_walls_alt_24_dy140_gap8.json}"
+CHECK=0
+TAG="std"
+SECONDS_SIM=220
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --tag)      TAG=$2; shift 2 ;;
+        --seconds)  SECONDS_SIM=$2; shift 2 ;;
+        --check)    CHECK=1; shift ;;
+        -h|--help)  sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "未知参数：$1（-h 看用法）" >&2; exit 2 ;;
+    esac
+done
+
+SSH="ssh -i $KEY -o StrictHostKeyChecking=no -o ConnectTimeout=8 $BOARD"
+
+echo "== 1. 板子与二进制 =="
+$SSH 'ls -l /root/tools/vt_sparse /root/tools/board_agent.py /root/tools/field_cli_board 2>/dev/null |
+        awk "{print \"  \", \$5, \$9}";
+      echo "  vt_source 源码 md5: $(md5sum /root/board_src/vt/vt_sparse.cpp | cut -c1-12)";
+      echo "  quad: $(cat /tmp/quad.json 2>/dev/null)";
+      echo "  calib: $(cat /tmp/calib_y.json 2>/dev/null | tr -d "\n " | cut -c1-80)"' || exit 3
+
+echo "== 2. 相机快照新鲜度（R5：快照过期就不能当'当前画面'）=="
+$SSH 'python3 - <<EOF
+import os, time
+p = "/tmp/cam.jpg"
+try:
+    print("  cam.jpg 年龄 = %.1f s" % (time.time() - os.path.getmtime(p)))
+except OSError:
+    print("  cam.jpg 不存在（本轮由管线重新生成）")
+EOF'
+
+echo "== 3. 残留渲染窗口（必须在跑之前清掉，否则会拍到冻结页面）=="
+LEFT=$(ps -eo pid,cmd | grep -aE "[p]latform_host" | wc -l)
+echo "  本机 platform_host 进程数 = $LEFT"
+if [ "$LEFT" -gt 0 ]; then
+    echo "  ⚠ 有残留：先 kill -TERM <pid>（现在装过协作退出，能收信号）"
+fi
+
+[ "$CHECK" = "1" ] && { echo "== --check 结束 =="; exit 0; }
+
+echo "== 4. 推 quad / 标定到板子 =="
+[ -f "$QUAD_LOCAL" ]  && scp -q -i "$KEY" -o StrictHostKeyChecking=no "$QUAD_LOCAL"  "$BOARD:/tmp/quad.json"  && echo "  quad  → /tmp/quad.json"
+[ -f "$CALIB_LOCAL" ] && scp -q -i "$KEY" -o StrictHostKeyChecking=no "$CALIB_LOCAL" "$BOARD:/tmp/calib_y.json" && echo "  calib → /tmp/calib_y.json"
+
+#: 2026-10-24 回退：阈值写死成 acc9 那一组，**不再读** `data/fpga/params.json`。
+#: 那份是 calib_py40 那轮 auto_tune 的产物（4 / 6 / 0.975），比 acc9 紧得多；
+#: 实测 base7/base8 用它 → `page_stale` 806 次、放行 0 帧、覆盖率 2~5/24、角色慢慢挪。
+CONS=8; TOLVY=16; SETTLE=1.0
+#: 感知源：默认仍是 CPU 的 vt_sparse（基线可原样复跑）。
+#: 换成 PL：CAM_VT_BIN=/root/tools/pl_vision core/board/tools/loop_standard.sh
+#: **只换这一个二进制**，参数/闸门/决策/协议一律不动（见 AGENTS.md R1/R2）。
+CAM_VT_BIN="${CAM_VT_BIN:-/root/tools/vt_sparse}"
+echo "  感知源 = $CAM_VT_BIN"
+echo "  阈值 = 放宽准入后（2026-10-24 用户口径）: consensus=$CONS tol-vy=$TOLVY settle=${SETTLE}s"
+
+echo "== 4b. 板上自己的任务文件（只有自己的信息/任务/定位基准，**没有墙**）=="
+"$PY" core/board/tools/make_task.py "$SCENARIO" -o /tmp/task.json >/dev/null
+mkdir -p /tmp/_task && cp /tmp/task.json /tmp/_task/task.json
+scp -q -i "$KEY" -o StrictHostKeyChecking=no /tmp/_task/task.json \
+    "$BOARD:/root/vision_state/task.json" && \
+    echo "  task  → /root/vision_state/task.json（$(python3 -c "import json;d=json.load(open('/tmp/task.json'));print('spawn',d['spawn'],'goal',d['goal'],'speed',d['speed'],'dt',round(d['dt'],6))")）"
+
+echo "== 5. 开跑（标准参数）=="
+# 参数对照（改任何一条都要重跑并留 run log 作证据，见 AGENTS.md R4）：
+#   场景     20 道墙、dy=140、seed 固定
+#   速度     0.5×（1 s 仿真 = 2 s 墙钟）
+#   相机     ffmpeg 640x480 → fps=12 → **640x480**（不再降到 320：页面 1:1，
+#            墙从 3 px 高变 6 px 高，行定位抖动砍半）+ 锁曝光/白平衡
+#   共识     8 帧取中位数，tol-vy 16（实测静止重复性 1σ≈8，卡 7 会剔掉一半好帧）
+#   标定     data/fpga/calib_y.json（scale 0.9632 / bias 5.266）
+#   决策     板端 field_cli_board（Dijkstra），障碍只来自已学到的墙
+#   暂停     settle 0.65 s / 单次暂停上限 1.5 s
+"$PY" -u core/board/tools/platform_host.py \
+    --scenario "$SCENARIO" \
+    --port "${LOOP_PORT:-8498}" --tcp 9006 --speed 0.5 \
+    --max-seconds "$SECONDS_SIM" --render-hz 30 --field-hz 1 --follow-scale 1 \
+    --tag "$TAG" --hold 2 \
+    --wall-rgb 255,240,200 --field-rgb 12,14,20 --bg-rgb 0,0,0 \
+    --fiducial-side 48 --fiducial-anchor band --frame-px 2 --field-every 5 \
+    --board-ssh "$BOARD" --ssh-key "$KEY" \
+    --board-agent /root/tools/board_agent.py --board-python python3 \
+    --board-extra "--from-end --verbose --consensus-frames $CONS --tol-vy $TOLVY --settle $SETTLE --pause-timeout 3.5" \
+    --connect-timeout 90 \
+    --calib "$CALIB_LOCAL" --calib-board /tmp/calib_y.json --quad-tol 6 \
+    --viewer --viewer-fullscreen --viewer-pos 320,60 --viewer-size 1440x1080 \
+    --viewer-margin 0 \
+    --cam-vt-bin "$CAM_VT_BIN" --cam-fps 12 --cam-w 640 --cam-h 480 \
+    --vt-board-extra "${VT_EXTRA:-}"
+
+echo
+echo "== 取回相机录像（cam_rec.mkv）=="
+NEWEST0=$(ls -dt data/fpga/loop_logs/run_* 2>/dev/null | head -1)
+if [ -n "$NEWEST0" ]; then
+    mkdir -p "$NEWEST0/videos"
+    scp -q -i "$KEY" -o StrictHostKeyChecking=no "root@192.168.137.242:/tmp/cam_rec.mkv" \
+        "$NEWEST0/videos/cam_rec.mkv" 2>/dev/null && \
+        echo "  已存 $NEWEST0/videos/cam_rec.mkv（$(du -h "$NEWEST0/videos/cam_rec.mkv" | cut -f1)）" || \
+        echo "  没有 cam_rec.mkv（录制未开启或本轮太短）"
+fi
+
+echo
+echo "== 自动验收（grade_run.py）=="
+NEWEST=$(ls -dt data/fpga/loop_logs/run_* 2>/dev/null | head -1)
+if [ -n "$NEWEST" ]; then
+    "$PY" core/board/tools/grade_run.py "$NEWEST" || echo "（验收未通过，见上面 5 项）"
+fi
+

@@ -1,0 +1,17 @@
+hostfile_replace_entries: mkstemp: Permission denied
+update_known_hosts: hostfile_replace_entries failed for /home/zhang/.ssh/known_hosts: Permission denied
+Linux U.FMSH 5.4.52 #3 SMP Fri Mar 13 13:44:29 CST 2026 aarch64 aarch64 aarch64 GNU/Linux
+operating
+gain: 4
+sharpness: 2
+white_balance_temperature_auto: 1
+white_balance_temperature: 4000
+brightness: 70
+saturation: 16
+gamma: 120
+contrast: 32
+power_line_frequency: 1
+exposure_auto: 3
+exposure_absolute: 150
+0x0000000030100000
+3258d6f441cb7a031f0c3b0dc963c0ab  /lib/firmware/bd_vision.bin

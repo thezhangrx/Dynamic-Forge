@@ -1,0 +1,261 @@
+{
+  "tag": "p0i",
+  "scenario": "configs/20_walls_alt_24_dy140_gap8.json",
+  "scenario_name": "20_walls_alt_24",
+  "field_w": 640.0,
+  "field_h": 3420.0,
+  "dt": 0.008333333333333333,
+  "goal": [
+    320.0,
+    3360.0
+  ],
+  "goal_r": 24.0,
+  "spawn": [
+    320.0,
+    40.0
+  ],
+  "player_radius": 10.0,
+  "args": {
+    "scenario": "configs/20_walls_alt_24_dy140_gap8.json",
+    "port": 8498,
+    "tcp": 9006,
+    "speed": 0.5,
+    "max_seconds": 220.0,
+    "render_hz": 30.0,
+    "field_hz": 1.0,
+    "follow_scale": 1.0,
+    "out_dir": "/home/zhang/FPGA/data/fpga/loop_logs",
+    "tag": "p0i",
+    "viewer": true,
+    "viewer_fullscreen": true,
+    "viewer_pos": "320,60",
+    "viewer_size": "1440x1080",
+    "hold": 2.0,
+    "wall_rgb": "255,240,200",
+    "field_rgb": "12,14,20",
+    "bg_rgb": "0,0,0",
+    "viewer_margin": 0,
+    "fiducials": false,
+    "fiducial_side": 48.0,
+    "fiducial_anchor": "band",
+    "calib_markers": false,
+    "frame_px": 2,
+    "field_every": 5,
+    "profile": false,
+    "board_ssh": "root@192.168.137.242",
+    "ssh_key": "data/fpga/board_ssh/board_key",
+    "board_agent": "/root/tools/board_agent.py",
+    "board_python": "python3",
+    "vt_board_extra": "--x-shift-cols 37",
+    "board_extra": "--from-end --verbose --consensus-frames 8 --tol-vy 16 --settle 1.0 --pause-timeout 3.5",
+    "connect_timeout": 90.0,
+    "calib": "data/fpga/calib_y.json",
+    "calib_board": "/tmp/calib_y.json",
+    "quad_tol": 6.0,
+    "start_camera_pipe": true,
+    "cam_vt_bin": "/root/tools/pl_vision",
+    "cam_fps": 12.0,
+    "cam_w": 640,
+    "cam_h": 480
+  },
+  "videos": {
+    "follow": "/home/zhang/FPGA/data/fpga/loop_logs/platform_20261026_184929_p0i_follow.mp4",
+    "field": "/home/zhang/FPGA/data/fpga/loop_logs/platform_20261026_184929_p0i_field.mp4"
+  },
+  "summary_path": "/home/zhang/FPGA/data/fpga/loop_logs/platform_20261026_184929_p0i.json",
+  "virtual_truth": [
+    {
+      "y": 80.0,
+      "gap_center": 256.9,
+      "gap_width": 106.4,
+      "gap_side": "L",
+      "gap_gl": 203.7,
+      "gap_gr": 310.1
+    },
+    {
+      "y": 220.0,
+      "gap_center": 377.6,
+      "gap_width": 91.2,
+      "gap_side": "R",
+      "gap_gl": 332.0,
+      "gap_gr": 423.2
+    },
+    {
+      "y": 360.0,
+      "gap_center": 179.4,
+      "gap_width": 99.9,
+      "gap_side": "L",
+      "gap_gl": 129.45,
+      "gap_gr": 229.35
+    },
+    {
+      "y": 500.0,
+      "gap_center": 369.2,
+      "gap_width": 96.5,
+      "gap_side": "R",
+      "gap_gl": 320.95,
+      "gap_gr": 417.45
+    },
+    {
+      "y": 640.0,
+      "gap_center": 199.2,
+      "gap_width": 94.9,
+      "gap_side": "L",
+      "gap_gl": 151.75,
+      "gap_gr": 246.65
+    },
+    {
+      "y": 780.0,
+      "gap_center": 489.9,
+      "gap_width": 94.4,
+      "gap_side": "R",
+      "gap_gl": 442.7,
+      "gap_gr": 537.1
+    },
+    {
+      "y": 920.0,
+      "gap_center": 247.2,
+      "gap_width": 94.3,
+      "gap_side": "L",
+      "gap_gl": 200.05,
+      "gap_gr": 294.35
+    },
+    {
+      "y": 1060.0,
+      "gap_center": 356.6,
+      "gap_width": 93.2,
+      "gap_side": "R",
+      "gap_gl": 310.0,
+      "gap_gr": 403.2
+    },
+    {
+      "y": 1200.0,
+      "gap_center": 165.4,
+      "gap_width": 104.9,
+      "gap_side": "L",
+      "gap_gl": 112.95,
+      "gap_gr": 217.85
+    },
+    {
+      "y": 1340.0,
+      "gap_center": 385.0,
+      "gap_width": 98.1,
+      "gap_side": "R",
+      "gap_gl": 335.95,
+      "gap_gr": 434.05
+    },
+    {
+      "y": 1480.0,
+      "gap_center": 289.5,
+      "gap_width": 109.5,
+      "gap_side": "L",
+      "gap_gl": 234.75,
+      "gap_gr": 344.25
+    },
+    {
+      "y": 1620.0,
+      "gap_center": 451.0,
+      "gap_width": 103.7,
+      "gap_side": "R",
+      "gap_gl": 399.15,
+      "gap_gr": 502.85
+    },
+    {
+      "y": 1760.0,
+      "gap_center": 279.3,
+      "gap_width": 104.6,
+      "gap_side": "L",
+      "gap_gl": 227.0,
+      "gap_gr": 331.6
+    },
+    {
+      "y": 1900.0,
+      "gap_center": 449.3,
+      "gap_width": 106.0,
+      "gap_side": "R",
+      "gap_gl": 396.3,
+      "gap_gr": 502.3
+    },
+    {
+      "y": 2040.0,
+      "gap_center": 176.3,
+      "gap_width": 91.9,
+      "gap_side": "L",
+      "gap_gl": 130.35,
+      "gap_gr": 222.25
+    },
+    {
+      "y": 2180.0,
+      "gap_center": 425.5,
+      "gap_width": 91.0,
+      "gap_side": "R",
+      "gap_gl": 380.0,
+      "gap_gr": 471.0
+    },
+    {
+      "y": 2320.0,
+      "gap_center": 289.8,
+      "gap_width": 109.9,
+      "gap_side": "L",
+      "gap_gl": 234.85,
+      "gap_gr": 344.75
+    },
+    {
+      "y": 2460.0,
+      "gap_center": 492.2,
+      "gap_width": 109.1,
+      "gap_side": "R",
+      "gap_gl": 437.65,
+      "gap_gr": 546.75
+    },
+    {
+      "y": 2600.0,
+      "gap_center": 208.0,
+      "gap_width": 101.4,
+      "gap_side": "L",
+      "gap_gl": 157.3,
+      "gap_gr": 258.7
+    },
+    {
+      "y": 2740.0,
+      "gap_center": 378.0,
+      "gap_width": 91.9,
+      "gap_side": "R",
+      "gap_gl": 332.05,
+      "gap_gr": 423.95
+    },
+    {
+      "y": 2880.0,
+      "gap_center": 187.1,
+      "gap_width": 91.9,
+      "gap_side": "L",
+      "gap_gl": 141.15,
+      "gap_gr": 233.05
+    },
+    {
+      "y": 3020.0,
+      "gap_center": 374.9,
+      "gap_width": 91.8,
+      "gap_side": "R",
+      "gap_gl": 329.0,
+      "gap_gr": 420.8
+    },
+    {
+      "y": 3160.0,
+      "gap_center": 250.1,
+      "gap_width": 93.8,
+      "gap_side": "L",
+      "gap_gl": 203.2,
+      "gap_gr": 297.0
+    },
+    {
+      "y": 3300.0,
+      "gap_center": 480.7,
+      "gap_width": 98.0,
+      "gap_side": "R",
+      "gap_gl": 431.7,
+      "gap_gr": 529.7
+    }
+  ],
+  "started": "2026-10-26T18:49:29"
+}
