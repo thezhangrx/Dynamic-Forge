@@ -641,7 +641,16 @@ inline void camera_domain_adapt(uint8_t* img, int w, int h) {
 //: PL 输出 → 页面坐标（640×480，y↑）。**唯一的一处换算**，与上面的摆放严格互逆：
 //:   x_page = (x_pl - kOffX) / kFitScale
 //:   y_page = (kPlH - y_pl - kOffY) / kFitScale
+//: ⚠ **仅在硅上出现的固定列偏移补偿**（默认 0，不改基线行为）。
+//: 取证：同帧同 quad 同系数，Verilator 对齐、硅上整幅右移 +37 列（宽度不变、3 帧不累积）。
+//: 根因未定位（已排除 quad/正射/camadapt 帧首/DDR 延迟/out_sof 次数/位流过期），
+//: 这里只做**可关闭的**运行态补偿，供闭环验证用；默认 0 = 与原来完全一致。
+static double g_x_shift_cols = 0.0;      //: 硅上实测 +37
 inline double x_to_page_x(double x_pl) { return (x_pl - kOffX) / kFitScale; }
+//: vt.jsonl 里的 x 一律走这里（带上补偿）
+inline double x_to_page_corrected(double x_pl) {
+    return x_to_page_x(x_pl - g_x_shift_cols);
+}
 inline double row_to_page_y(double y_pl_row) { return (kPlH - y_pl_row - kOffY) / kFitScale; }
 
 //: 读 vision_top 的 row_count[row]（dbg sel=3）。这是 PL 眼里"这一行有多少墙像素"，
@@ -684,6 +693,7 @@ int main(int argc, char** argv) {
         else if (k == "--ortho-only") ortho_only = true;   //: 同上
         else if (k == "--dbg-frm") dbg_frm = next();       //: 只读探针落盘（jsonl）
         else if (k == "--dbg-n") dbg_n = std::atoi(next().c_str());
+        else if (k == "--x-shift-cols") g_x_shift_cols = std::atof(next().c_str());
         else if (k == "--no-camera-domain") g_cam_domain = false;
         else if (k == "--pl-param") {
             const std::string kv = next();
@@ -1000,10 +1010,10 @@ int main(int argc, char** argv) {
             //: 所以超出 [60, 140] 页面单位的一律丢掉（场景真值 91~110，留测量余量）：宁可这道墙"没有缺口"（agent 会
             //: 把它当实墙、绕开），也不能报一个不存在的开口。
             {
-                const double gwp = x_to_page_x(gr_img) - x_to_page_x(gl_img);
+                const double gwp = x_to_page_corrected(gr_img) - x_to_page_corrected(gl_img);
                 if (gwp < 60.0 || gwp > 140.0) continue;
             }
-            const double gl_p = x_to_page_x(gl_img), gr_p = x_to_page_x(gr_img);
+            const double gl_p = x_to_page_corrected(gl_img), gr_p = x_to_page_corrected(gr_img);
             bool merged = false;
             for (auto& kv : emitted_list) {
                 if (std::fabs(kv.first - y_page) > 2.0) continue;
@@ -1021,7 +1031,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(jf, "],\"player\":");
         if (gf.player.present) {
-            std::fprintf(jf, "[%.1f,%.1f]", x_to_page_x(gf.player.x), row_to_page_y(gf.player.y));
+            std::fprintf(jf, "[%.1f,%.1f]", x_to_page_corrected(gf.player.x), row_to_page_y(gf.player.y));
         } else {
             std::fprintf(jf, "null");
         }

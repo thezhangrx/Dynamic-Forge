@@ -1,0 +1,11 @@
+{
+  "scale": 0.95159,
+  "bias": 11.957,
+  "samples": 6919,
+  "rows_matched": 990,
+  "rmse": 7.89,
+  "max_abs": 29.94,
+  "quad": "51.6,27.7,599.1,7.9,631.0,422.6,58.6,457.9",
+  "run": "/home/zhang/FPGA/data/fpga/loop_logs/run_20261026_184929_p0i",
+  "scenario": "configs/20_walls_alt_24_dy140_gap8.json"
+}

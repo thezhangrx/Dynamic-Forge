@@ -139,7 +139,8 @@ echo "== 5. 开跑（标准参数）=="
     --calib "$CALIB_LOCAL" --calib-board /tmp/calib_y.json --quad-tol 6 \
     --viewer --viewer-fullscreen --viewer-pos 320,60 --viewer-size 1440x1080 \
     --viewer-margin 0 \
-    --cam-vt-bin "$CAM_VT_BIN" --cam-fps 12 --cam-w 640 --cam-h 480
+    --cam-vt-bin "$CAM_VT_BIN" --cam-fps 12 --cam-w 640 --cam-h 480 \
+    --vt-board-extra "${VT_EXTRA:-}"
 
 echo
 echo "== 取回相机录像（cam_rec.mkv）=="
