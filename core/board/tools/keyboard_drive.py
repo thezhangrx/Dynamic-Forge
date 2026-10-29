@@ -149,13 +149,14 @@ class TurnJob(threading.Thread):
     """一次转向：发弧线指令 → 盯编码器 θ → 到角度就停。后台跑，主线程继续读键盘。"""
 
     def __init__(self, car: Car, delta_deg: float, w_cmd: float, v_arc: float,
-                 timeout: float):
+                 timeout: float, odom_timeout: float = 1.0):
         super().__init__(daemon=True)
         self.car = car
         self.delta = delta_deg
         self.w_cmd = w_cmd
         self.v_arc = v_arc
         self.timeout = timeout
+        self.odom_timeout = odom_timeout
         self.cancel = False
         self.done = False
         self.reported = False
@@ -175,7 +176,7 @@ class TurnJob(threading.Thread):
         while time.time() - t0 < self.timeout:
             if self.cancel:
                 break
-            if time.time() - t0 > 0.8 and car.odom_count() == n0:
+            if time.time() - t0 > self.odom_timeout and car.odom_count() == n0:
                 lost = True         # @ODOM 没数据 → 闭环瞎了，立刻停，别让它一直拱
                 break
             if abs(car.angle_deg() - a0) >= abs(self.delta) - 2.0:
@@ -296,6 +297,8 @@ def main() -> int:
     ap.add_argument("--turn-sign", type=int, default=1, choices=(1, -1),
                     help="左右整体对调：+1（默认）/-1；运行中按 f 也能翻")
     ap.add_argument("--timeout", type=float, default=5.0, help="单次转向最长时间 s")
+    ap.add_argument("--odom-timeout", type=float, default=1.0,
+                    help="多久收不到 @ODOM 就中止转向（无线丢包多时调大）s")
     ap.add_argument("--no-mode", action="store_true", help="不切 @MODE 1（保持自平衡）")
     ap.add_argument("--log", default="", help="把每次转向的数字追加写进这个文件")
     a = ap.parse_args()
@@ -350,7 +353,7 @@ def main() -> int:
                 return                       # 同一次按住的自动重复
             d = 1.0 if seq == b"C" else -1.0
             delta, wcmd = turn_cmd(seq, deg, a.turn_scale, tsign, a.w)
-            job = TurnJob(car, delta, wcmd, a.arc_v, a.timeout)
+            job = TurnJob(car, delta, wcmd, a.arc_v, a.timeout, a.odom_timeout)
             job.start()
             print("  → 开始%s转 %.0f°：@VEL %d %d"
                   % ("右" if d > 0 else "左", abs(delta / a.turn_scale),
