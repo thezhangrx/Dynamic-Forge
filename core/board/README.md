@@ -197,6 +197,64 @@ bash core/board/tools/board_up.sh          # 等上线并报 PL state / 位流 m
 3. 再不行才用 JTAG 兜底：`xsdb.bat \wsl$\...\core\board\tools\jtag_boot.tcl`；
 4. **现场尽量别断电**：需要重启就在 ssh 里 `reboot`（热复位，稳）。
 
+#### 冷启动为什么会卡：把启动链拆开看（2026-10-29 从 `/boot 分区/uEnv.txt` 读出来的）
+
+启动分区 `mmcblk0p1`（FAT16）里的 `uEnv.txt` 就是 u-boot 的环境，关键三条：
+
+```sh
+bootcmd=run loadbit; run uenvcmd
+loadbit=mmc rescan && fatload mmc 0:2 0x10000000 download.bit && fpga loadb 0 0x10000000 $filesize
+uenvcmd=mmc rescan && fatload mmc 0:1 0x10080000 Image && fatload mmc 0:1 0x11000000 fmqlmp-verify.dtb && booti 0x10080000 - 0x11000000
+```
+
+也就是**冷上电要连续做三次 SD 访问**：ext4 分区（p2）读 6 MB 的 `download.bit` 烧 PL、
+FAT 分区（p1）读 13 MB 的 `Image`、再读 dtb。全程 `&&` 串联，**一次抖动就整条停住**
+（u-boot 不重试、也没有从别的设备再试的逻辑）。冷上电那一瞬间 SD 卡刚上电、电源还在爬，
+最容易抖；热复位时卡和电源都稳了，所以 `reboot` / JTAG `rst -system` 一按就过。
+
+> 我们的 P0 位流**不靠**这一步：`pl-autoload.service` 起来后会把 PL 覆盖成 P0
+> （§6.1.0），`loadbit` 只是让 PL 在 7 s 之前也有个设计。所以 `loadbit` 失败
+> 本身不致命，真正致命的是 `uenvcmd` 里读不到 `Image`。
+
+**先取证再改**（R7：不许盲修）。抓一次冷上电的串口日志（COM3，115200，
+**先开终端再上电**，UART 没有回放），看它停在哪：
+
+| 日志停在 | 说明 | 对应办法 |
+|---|---|---|
+| 完全没有输出 / 只有 `Xilinx First Stage Boot Loader` 就停 | FSBL 阶段，SD 初始化失败 | 换卡 / 查供电；改 uEnv.txt 没用 |
+| `U-Boot 20xx...` 之后停，或 `mmc_init: -95` / `fatload` 报错 | u-boot 阶段 SD/FAT 抖动 | 用下面的重试补丁 |
+| `Loading Image ...` 卡住 | 13 MB FAT 读抖动 | 同上 |
+
+**重试补丁（已备好，未应用）**：`core/board/tools/uEnv.txt.retry`
+只改 2 行（纯 `;` 串联，不写 u-boot 循环，语法风险最低）：
+
+```diff
+-bootcmd=run loadbit; run uenvcmd
++bootcmd=run try_boot; run try_boot; run try_boot
++try_boot=run loadbit; run uenvcmd
+```
+
+应用步骤（**先备份、写完回读校验、再用热复位验证**）：
+
+```bash
+# 板上，root
+mkdir -p /mnt/b1 && mount /dev/mmcblk0p1 /mnt/b1
+cp /mnt/b1/uEnv.txt /mnt/b1/uEnv.txt.bak.$(( $(date +%s) ))     # 备份
+cp /tmp/uEnv.txt.retry /mnt/b1/uEnv.txt                          # 先用 scp 传上来
+sync; md5sum /mnt/b1/uEnv.txt; umount /mnt/b1
+#   md5 要等于你本地那份；然后热复位验证（不是断电）：
+reboot   # 或 ssh 断了自己等；再 bash core/board/tools/board_up.sh
+```
+
+回滚：把 `uEnv.txt.bak.*` 拷回去再热复位。**不要在没抓过日志、没确认卡在
+u-boot 阶段之前就改**——改坏的代价是这件板子起不来，而 JTAG 只能复位/配 PL，
+改不了 SD 上的文件。
+
+**终极方案（建议赛后做）**：板子的 QSPI（`/dev/mtd0` bootloader 4 MB、`/dev/mtd1`
+kernel 16 MB）现在是**全 0xFF（空的）**，所以只有 SD 一条启动路径。把
+`BOOT.bin` 写进 QSPI 再把启动模式拨到 QSPI，就彻底不依赖 SD 卡；但要动拨码开关 +
+写 flash，写错就是砖，**赛前一晚不要做**。
+
 ### 6.1.1 看启动日志（板子卡住时唯一的手段）
 
 控制台是板载 **CP210x，插在 Windows 上（COM3）**。WSL 里要读它得先 `usbipd
