@@ -1,5 +1,11 @@
 # `core/board/` —— PS 侧（板上）代码
 
+> ⚠ **2026-10-25：本文“闭环 = `run_loop.sh` + 视觉 + `gap_avoid` + 键盘注入”已作废。**
+> 现行闭环 = `loop_standard.sh`（`platform_host.py` 渲染页面 → 相机 → `vt_sparse` 或 `pl_vision`
+> → `board_agent.py` → M1 `field_cli_board` → `@MOVE`），位姿由主机 `@POSE` 下发（`AGENTS.md` R2/R3 修订）。
+> 本文的 PS/PL 契约、几何帧、寄存器映射、板上编法仍然准。
+
+
 > 目标板：**复旦微悟净 PSOC Lite**，PS 是 4×Cortex-A7，跑 **Ubuntu 20.04 aarch64**。
 > 这一层解决"PS 怎么跟 PL 说话"：配置阈值 → 起一帧 → 读几何帧。
 
@@ -144,6 +150,28 @@ ssh root@192.168.137.242 'cd /root/board_src && cmake -S core/board -B build && 
 `vision_driver_devmem.cpp` + `vision_driver_factory.cpp` 就是这条后端；
 `main.cpp` 只调 `open_reg_io(url)`，不认识任何具体后端，默认 `devmem://0x43C00000`。
 （icraft 目标仍在，`-DVISION_BOARD_WITH_ICRAFT=ON` 才编。）
+
+### 6.1.0 PL 位流上电自启动（2026-10-29，现场必备）
+
+板子的 PL **不需要 JTAG**：`pl-autoload.service` 在上电 7.4 s 执行
+`echo bd_vision.bin > /sys/class/fpga_manager/fpga0/firmware`，所以
+**`/lib/firmware/bd_vision.bin` 是哪份，板子起来就是哪份**。
+
+- 修之前这个文件是 **R8 老位流**（md5 `3258d6f4…`）→ 每次上电 PL 里是 R8，
+  必须再 JTAG `fpga -f` 一次才是 P0；JTAG 链一旦不好（`NO_ZYNQ_ON_CHAIN`）
+  就会在"以为是 P0、其实跑 R8"的状态下跑闭环。
+- 现在放的是 P0 修复版（md5 `c6180da2…` ← `bd_vision_p0.bit` `d974d009…`），
+  断电重上电实测：`state=operating`，推 3 帧后 `FLEN=0x4C`、`FRMDIAG(0x958)=0x00041016`。
+
+换位流就一条命令（`.bit → .bin → 传 → 重启服务 → 推帧自检`）：
+
+```bash
+bash core/board/tools/deploy_pl_autoload.sh data/fpga/pl_bitstream/bd_vision_p0.bit
+```
+
+`.bit → .bin` 不用 Vivado/bootgen：`core/board/tools/bit2bin.py` 是纯 Python 等价实现
+（去 107 B 头 → 载荷按 4 字节内部换序 → 末尾补 5 个 `00 00 00 20`），
+用 r8 的 `.bit`/`.bin` 逐字节对拍验证过（`--selftest`）。
 
 ### 6.1.1 看启动日志（板子卡住时唯一的手段）
 
