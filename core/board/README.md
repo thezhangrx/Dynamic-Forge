@@ -282,6 +282,34 @@ kernel 16 MB）现在是**全 0xFF（空的）**，所以只有 SD 一条启动�
 `BOOT.bin` 写进 QSPI 再把启动模式拨到 QSPI，就彻底不依赖 SD 卡；但要动拨码开关 +
 写 flash，写错就是砖，**赛前一晚不要做**。
 
+#### PS_KEY 按键控制全流程（MIO47 → GPIO 473，2026-10-29）
+
+**按一下 PS_KEY → 全流程开跑；再按一下 → 干净收尾；跑着的时候板上指示灯亮。**
+
+```
+板上（开机自启，已装好）          PC 侧
+flow_keyd.service                 python3 core/board/tools/flow_key.py
+  PS_KEY(MIO47=gpio473)            每 0.5 s ssh 读 /run/flow/press
+  → /run/flow/press 计数            计数变了就翻转
+  /run/flow/run=1 → 灯亮            开跑：起 loop_standard.sh → 写 run=1（灯亮）
+                                   停止：SIGTERM 整个进程组 → T0c 收尾 → 写 run=0（灯灭）
+```
+
+细节：
+
+- **灯跟"run"文件绑，不跟"按过键"绑**：PC 只有真的拉起流程后才写 `run=1`，收尾完才写
+  `run=0` —— 所以灯亮 ⇔ 流程在跑；流程自己挂了，PC 那边也会写 0。
+- 停止走 **T0c**：板端 `ffmpeg/pl_vision/vt_sparse/mjpeg_server/board_agent/field_cli_board`
+  先 `-TERM` 再 `-INT`（**不 kill -9**），本机 `platform_host/page_view` 同样清，
+  最后报"板端进程数 / 本机平台进程数 / 8498-9006-8099 是否 LISTEN"。
+- GPIO 号换算（Zynq PS GPIO 四个 bank 是 DT 固定的）：
+  `MIO 0..31 → 480`、`MIO 32..53 → 458`、`EMIO 0..31 → 426`、`EMIO 32..63 → 394`，
+  所以 **MIO47 = 458 + 15 = 473**。
+- 灯还没定：`flow_keyd.service` 里 `--led-gpio -1`（不驱动灯），**原理图上 LD1/LD2
+  接哪个 MIO 告诉我就能开**；若灯在 PL 脚（PL_LED1/2）则要改位流，今晚不做。
+- 手动自测（不按键）：
+  `ssh … 'echo 1 > /run/flow/press'` → PC 侧应当"开始"；再 `echo 2 > …` → "停止"。
+
 ### 6.1.1 看启动日志（板子卡住时唯一的手段）
 
 控制台是板载 **CP210x，插在 Windows 上（COM3）**。WSL 里要读它得先 `usbipd

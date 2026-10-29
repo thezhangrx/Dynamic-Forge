@@ -1,0 +1,23 @@
+# 板端：PS_KEY(MIO47) 按键 → /run/flow/press 计数；/run/flow/run=1 → 点亮指示灯
+#
+# 安装（板上 root）：
+#   scp -i data/fpga/board_ssh/board_key core/board/tools/flow_keyd.py root@192.168.137.242:/root/tools/
+#   scp -i data/fpga/board_ssh/board_key core/board/tools/flow_keyd.service root@192.168.137.242:/etc/systemd/system/flow-keyd.service
+#   ssh root@192.168.137.242 'systemctl daemon-reload && systemctl enable --now flow-keyd'
+#   ssh root@192.168.137.242 'journalctl -u flow-keyd -n 20 --no-pager'
+# 卸载：systemctl disable --now flow-keyd && rm /etc/systemd/system/flow-keyd.service
+#
+# LED_GPIO 还不知道是几（原理图上看一下 LD1/LD2 接 MIO 几），先用 -1：灯不亮但按键照常。
+# 知道之后把 ExecStart 里的 -1 换成那个 GPIO 号，`systemctl daemon-reload && systemctl restart flow-keyd`。
+[Unit]
+Description=PS_KEY(MIO47) button -> /run/flow/press, /run/flow/run -> LED
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/tools/flow_keyd.py --key-gpio 473 --led-gpio -1 --led-active-low 1
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
