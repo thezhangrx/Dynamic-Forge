@@ -8,8 +8,9 @@
 #   ssh root@192.168.137.242 'journalctl -u flow-keyd -n 20 --no-pager'
 # 卸载：systemctl disable --now flow-keyd && rm /etc/systemd/system/flow-keyd.service
 #
-# 极性：D4 先按 active-low（常见接法：LED 阴极接 MIO，拉低才亮）。
-#   若实测是「跑起来时灯灭、不跑时灯亮」，把 --led-active-low 改成 0 再 restart。
+# 极性：2026-10-29 实测 D4 是 **active-high**（输出 1 才亮）——之前按 active-low 配，
+#   结果是"不跑的时候反而亮着"。所以这里是 --led-active-low 0。若哪天接法变了又反了，
+#   改回 1 再 restart 即可。
 # MIO → GPIO 号：MIO 0..31 → base 480，MIO 32..53 → base 458（MIO47 = 458+15 = 473）
 [Unit]
 Description=PS_KEY(MIO47) button -> /run/flow/press, /run/flow/run -> D4 LED(MIO7)
@@ -17,7 +18,7 @@ After=multi-user.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -u /root/tools/flow_keyd.py --key-gpio 473 --led-gpio 487 --led-active-low 1
+ExecStart=/usr/bin/python3 -u /root/tools/flow_keyd.py --key-gpio 473 --led-gpio 487 --led-active-low 0
 Restart=always
 RestartSec=2
 

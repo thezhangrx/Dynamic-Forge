@@ -68,12 +68,14 @@ def read(n: int) -> int:
         return -1
 
 
-def write(n: int, v: int) -> None:
+def write(n: int, v: int) -> bool:
     try:
         with open(p(n) + "/value", "w") as f:
             f.write("1" if v else "0")
-    except OSError:
-        pass
+        return True
+    except OSError as e:
+        print("写 gpio%d=%d 失败: %s" % (n, v, e), file=sys.stderr)
+        return False
 
 
 def write_atomic(path: str, text: str) -> None:
@@ -136,6 +138,7 @@ def main() -> int:
     led_state = None
     run_state = 0
     last_run_check = 0.0
+    last_led_write = 0.0
     # 去抖：同一电平连续 4 次采样（≈40 ms）才认；只在"稳定到按下电平"那一次计数
     last_stable = raw
     pending = raw
@@ -170,10 +173,15 @@ def main() -> int:
                 on = (0 if a.led_active_low else 1)
                 off = (1 if a.led_active_low else 0)
                 want = on if run_state else off
-                if want != led_state:
-                    write(a.led_gpio, want)
-                    led_state = want
-                    print("flow_keyd: run=%d -> 灯%s" % (run_state, "亮" if run_state else "灭"))
+                # 变化时写；另外每 1 s 无条件重写一次（自愈：引脚被别人 poke 过/写丢）
+                if want != led_state or now - last_led_write > 1.0:
+                    ok = write(a.led_gpio, want)
+                    last_led_write = now
+                    if want != led_state:
+                        led_state = want
+                        print("flow_keyd: run=%d -> 灯%s%s"
+                              % (run_state, "亮" if run_state else "灭",
+                                 "" if ok else "（写入失败！）"))
         time.sleep(a.poll)
 
 
