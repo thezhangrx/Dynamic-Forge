@@ -173,6 +173,30 @@ bash core/board/tools/deploy_pl_autoload.sh data/fpga/pl_bitstream/bd_vision_p0.
 （去 107 B 头 → 载荷按 4 字节内部换序 → 末尾补 5 个 `00 00 00 20`），
 用 r8 的 `.bit`/`.bin` 逐字节对拍验证过（`--selftest`）。
 
+#### 冷上电起不来（2026-10-29 现场前实测，与 PL 无关）
+
+**两种"自启动"要分开**：
+
+| | 是什么 | 现状 |
+|---|---|---|
+| PL 位流自启动 | 上电后 `pl-autoload.service` 把 `/lib/firmware/bd_vision.bin` 配进 PL | ✅ 已解决、已实测（见 §6.1.0） |
+| PS 冷启动 | 真·断电再上电，BootROM/FSBL 从 SD 起 Linux | ⚠ **不可靠**：`reboot`、JTAG `rst -system` 这类**热复位**一按就起来，冷上电常起不来 |
+
+症状：上电后 ssh/`ping 192.168.137.242` 一直不通（1~2 分钟），跑了
+`xsdb.bat ... jtag_boot.tcl`（内部 `rst -system`）就活了。典型原因是 SD 卡在冷上电
+那一下没初始化成功 —— 热复位时卡已经上电，所以能过。
+
+处置顺序（**先按复位键，不用 PC、不用 JTAG**）：
+
+```bash
+bash core/board/tools/board_up.sh          # 等上线并报 PL state / 位流 md5；起不来会打印下面这套动作
+```
+
+1. 按板子**复位键** → 再跑 `board_up.sh`（这一步等价于热复位，通常就好）；
+2. 不行就查供电（独立、电流够、别和 USB 共用），断电 5 s 再上电后重复 1；
+3. 再不行才用 JTAG 兜底：`xsdb.bat \wsl$\...\core\board\tools\jtag_boot.tcl`；
+4. **现场尽量别断电**：需要重启就在 ssh 里 `reboot`（热复位，稳）。
+
 ### 6.1.1 看启动日志（板子卡住时唯一的手段）
 
 控制台是板载 **CP210x，插在 Windows 上（COM3）**。WSL 里要读它得先 `usbipd
