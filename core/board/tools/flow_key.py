@@ -4,6 +4,10 @@
     python3 core/board/tools/flow_key.py
     python3 core/board/tools/flow_key.py --cmd "bash core/board/tools/loop_standard.sh --tag btn"
     python3 core/board/tools/flow_key.py --dry-run        # 只打印，不真跑
+    python3 core/board/tools/flow_key.py --no-hotkeys     # 不用 PC 键盘撒手锏
+
+除了板子上的 PS_KEY，**PC 键盘也能控**（终端里）：`s` 开始 / `x` 停止 / `q` 退出。
+板子按键还没查到引脚时，这就是保底手段。
 
 做三件事
   1. 每 0.5 s 通过 ssh 读板子 `/run/flow/press` 的计数，变了就翻转状态；
@@ -19,10 +23,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import select
 import signal
-import subprocess
 import sys
+import subprocess
+import termios
 import time
+import tty
 
 BOARD = "root@192.168.137.242"
 KEY = "data/fpga/board_ssh/board_key"
@@ -34,6 +41,41 @@ BOARD_PATTERNS = [
     "[s]tart_cam.sh",
 ]
 LOCAL_PATTERNS = ["[p]latform_host.py", "[p]age_view.py"]
+
+
+class Hotkeys:
+    """PC 终端单键：s=开始 x=停止 q=退出（raw 模式，不用回车）"""
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled and sys.stdin.isatty()
+        self.fd = sys.stdin.fileno() if self.enabled else -1
+        self.old = None
+
+    def __enter__(self):
+        if self.enabled:
+            try:
+                self.old = termios.tcgetattr(self.fd)
+                tty.setraw(self.fd)
+                os.set_blocking(self.fd, False)
+            except (termios.error, OSError):
+                self.enabled = False
+        return self
+
+    def __exit__(self, *exc):
+        if self.enabled and self.old is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+    def poll(self) -> str:
+        if not self.enabled:
+            return ""
+        r, _, _ = select.select([sys.stdin], [], [], 0)
+        if not r:
+            return ""
+        try:
+            ch = os.read(self.fd, 1).decode(errors="ignore")
+        except (OSError, BlockingIOError):
+            return ""
+        return ch
 
 
 def ssh(cmd: str, timeout: float = 8.0) -> str:
@@ -159,10 +201,12 @@ def main() -> int:
     ap.add_argument("--poll", type=float, default=0.5, help="轮询按键的周期 s")
     ap.add_argument("--grace", type=float, default=20.0, help="SIGTERM 后等多久再 SIGINT")
     ap.add_argument("--dry-run", action="store_true", help="只打印，不真起进程")
+    ap.add_argument("--no-hotkeys", action="store_true", help="不用 PC 键盘 s/x 控制")
     a = ap.parse_args()
 
     print("flow_key: 轮询 %s:/run/flow/press（每 %.1fs），命令 = %s" % (BOARD, a.poll, a.cmd))
-    print("          按板子上的 PS_KEY 开始 / 再按一次停止；Ctrl-C 退出并收尾")
+    print("          板子 PS_KEY：开始 / 再按一次停止")
+    print("          PC 键盘：s 开始 / x 停止 / q 退出（终端里直接按，不用回车）")
     run = Runner(a.cmd, a.dry_run, a.grace)
 
     last = read_press()
@@ -172,8 +216,20 @@ def main() -> int:
         last = 0
     set_run(False)
 
+    hk = Hotkeys(not a.no_hotkeys)
+    hk.__enter__()
     try:
         while True:
+            ch = hk.poll()
+            if ch:
+                if ch in ("s", "S"):
+                    print("[flow] PC 键 s → 开始")
+                    run.start()
+                elif ch in ("x", "X"):
+                    print("[flow] PC 键 x → 停止")
+                    run.stop("PC 键 x")
+                elif ch in ("q", "Q", "\x03"):
+                    raise KeyboardInterrupt
             time.sleep(a.poll)
             if run.self_exited:
                 run.stop("进程自己退出了（code=%s）" % run.proc.returncode)
@@ -187,8 +243,10 @@ def main() -> int:
             else:
                 run.start()
     except KeyboardInterrupt:
-        print("\n[flow] Ctrl-C → 收尾")
-        run.stop("Ctrl-C")
+        print("\n[flow] 退出 → 收尾")
+        run.stop("退出")
+    finally:
+        hk.__exit__()
     return 0
 
 
