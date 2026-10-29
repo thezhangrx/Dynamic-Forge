@@ -110,3 +110,15 @@ def test_turn_cmd_angle_scaling():
     """地面 90° + scale 0.75 ⇒ 只让编码器走 67.5°。"""
     delta, _ = kd.turn_cmd(b"C", 120.0, 0.75, +1, 600.0)
     assert abs(delta) == 90.0
+
+
+# ---------------- 4. 默认左右（2026-10-29 实测锁定） ----------------
+
+def test_default_sign_makes_right_key_turn_right():
+    """固件 moto1 物理上接的是右轮：w>0 = 车往右（顺时针）。
+    所以按 → 必须发 w>0。这条锁的是实车验证过的默认值，别再翻回去。"""
+    assert kd.TURN_SIGN_DEFAULT == -1
+    delta_r, w_r = kd.turn_cmd(b"C", 90.0, 0.75, kd.TURN_SIGN_DEFAULT, 600.0)   # →
+    delta_l, w_l = kd.turn_cmd(b"D", 90.0, 0.75, kd.TURN_SIGN_DEFAULT, 600.0)   # ←
+    assert w_r > 0 and w_l < 0
+    assert delta_r < 0 and delta_l > 0     # 编码器 θ：w>0 时 θ 减小（实测）

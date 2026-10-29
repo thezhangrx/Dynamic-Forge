@@ -2,8 +2,8 @@
 """keyboard_drive.py —— 用键盘方向键开小车（PC 侧，走 E30 无线链路）
 
 按键
-    ←  按一下 = 左转 90°（**两轮都正转**，左轮慢、右轮快 —— 靠差速转）
-    →  按一下 = 右转 90°（**两轮都正转**，左轮快、右轮慢）
+    ←  按一下 = 左转 90°（**两轮都正转**，外侧轮快 —— 靠差速转）
+    →  按一下 = 右转 90°（**两轮都正转**，外侧轮快）
     ↑  按住  = 往前走（松开 0.7 s 自动停）
     ↓  按住  = 往后走
     f        = 左右对调（打印新的 --turn-sign 值）
@@ -27,7 +27,7 @@
 
 用法
     python3 keyboard_drive.py
-    python3 keyboard_drive.py --turn-sign -1      # 左右对着反了时用它
+    python3 keyboard_drive.py --turn-sign 1       # 万一又反了（默认是 -1）
     python3 keyboard_drive.py --arc-v 0           # 纯原地转（两轮反向）——旧行为
     python3 keyboard_drive.py --deg 120 --turn-scale 0.75
 """
@@ -43,6 +43,11 @@ import time
 import tty
 
 TURN_LOCK_S = 0.80   # 同一次"按住"的续期窗口：必须 > 终端自动重复的首延迟(≈0.5 s)
+
+# 默认的左右符号。2026-10-29 实测：固件里叫"左"的 moto1（PWM A / PB1 / CCR4）
+# 实际接的是车的**右轮**，所以 w>0 时车是往右转（顺时针），和"w>0 左转"的
+# 教科书写法相反 —— 这里取 -1 把指令符号翻过来，让 ← 就是左、→ 就是右。
+TURN_SIGN_DEFAULT = -1
 HOLD_LOCK_S = 0.70   # ↑/↓ 松手判定窗口
 
 
@@ -294,8 +299,9 @@ def main() -> int:
     ap.add_argument("--deg", type=float, default=90.0, help="按一下转多少度")
     ap.add_argument("--turn-scale", type=float, default=0.75,
                     help="编码器角→地面角的换算（实测编码器 90°≈地面 120°，故 0.75）")
-    ap.add_argument("--turn-sign", type=int, default=1, choices=(1, -1),
-                    help="左右整体对调：+1（默认）/-1；运行中按 f 也能翻")
+    ap.add_argument("--turn-sign", type=int, default=TURN_SIGN_DEFAULT, choices=(1, -1),
+                    help="左右符号：默认 -1（实测固件 moto1 接的是右轮）；"
+                         "左右又反了就用 --turn-sign 1，运行中按 f 也能翻")
     ap.add_argument("--timeout", type=float, default=5.0, help="单次转向最长时间 s")
     ap.add_argument("--odom-timeout", type=float, default=1.0,
                     help="多久收不到 @ODOM 就中止转向（无线丢包多时调大）s")
