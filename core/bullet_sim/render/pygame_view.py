@@ -132,6 +132,8 @@ class PygameRenderer:
         #: 水平仍是全宽。墙/角色超出这一带的会被裁掉（真实相机只拍这一屏）。
         follow_player: bool = False,
         follow_h: float = 240.0,
+        #: 画不画角色（False = "无角色的平台"，只留场地/墙/缺口/四角标记）
+        show_player: bool = True,
         #: 跟随视口的额外缩放（1.0 = 场地全宽铺满窗口；<1 = 看得更远、墙小一点）。
         follow_scale: float = 1.0,
         fiducial_side: float = 28.0,   # 28 场地单位：够定边界，又不会挡住宅的墙/缺口
@@ -239,6 +241,7 @@ class PygameRenderer:
                 follow_h = 240.0
         self.follow_player = bool(follow_player)
         self.follow_h = float(follow_h)
+        self.show_player = bool(show_player)
         self.follow_scale = float(follow_scale) if follow_scale > 0 else 1.0
         self.fiducial_side = float(fiducial_side)
         #: 场地外框那 1 像素的线。相机拍屏幕时它是一条**横贯画面的长线**，会被
@@ -442,7 +445,20 @@ class PygameRenderer:
         )
         pygame.draw.rect(screen, self.field_bg, field_rect)
         if self.show_field_border:
-            pygame.draw.rect(screen, (60, 70, 95), field_rect, 1)
+            #: **上下两条横边不画**（用户口径，2026-10-23）：跟随视口里世界
+            #: y=0 / y=field_h 这两条边正好落在角色脚下/头上几十像素处，是一条
+            #: 横贯画面的细线；而板端 VT 找墙就是"找横向亮条"，于是**平台边界
+            #: 一直被当成一行墙**（开局角色在 y=40，场地底边就在它脚下 40 单位）。
+            #: 只留左右两条竖边（x=0 / x=field_w）：那条世界 x 的边界是缺口 x 的
+            #: 基准，不能去。白框（相机定四边形用）另有自己的开关，不受影响。
+            _c = (60, 70, 95)
+            _lx = int(round(min(x0, x1)))
+            _rx = int(round(max(x0, x1)))
+            _ty = int(round(min(y0, y1)))
+            _by = int(round(max(y0, y1)))
+            if abs(_by - _ty) > 2:
+                pygame.draw.line(screen, _c, (_lx, _ty), (_lx, _by), 1)
+                pygame.draw.line(screen, _c, (_rx, _ty), (_rx, _by), 1)
         if self.show_world_axes:
             self._draw_world_axes(screen, world, vp)
 
@@ -528,8 +544,8 @@ class PygameRenderer:
         self._draw_obstacles(screen, world, vp)
 
         # --- player: visible body + real hitbox -------------------------
-        self._draw_player(screen, world, vp)
-
+        if self.show_player:
+            self._draw_player(screen, world, vp)
         # --- 四角标定标记（ArUco）---------------------------------------
         # 画在目标之上：标记要**完整可见**才能被解码，被一条墙线切过就废了。
         import os as _os2
