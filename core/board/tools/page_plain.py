@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
 
@@ -85,6 +86,10 @@ def main(argv=None) -> int:
                           show_player=False,          # ← 无角色
                           window_size=(640, 480))
 
+    #: pygame/SDL 初始化时会接管 SIGTERM（只投递 SDL_QUIT，进程不退出，
+    #: 表现就是 kill -TERM 杀不掉、端口一直占着）。这里在渲染器建好之后
+    #: 重新装一次：收到 TERM 就按 Ctrl-C 处理，走 finally 收尾。
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
     frame = view.render(env.world)
     if frame is None:
         print("渲染失败")
