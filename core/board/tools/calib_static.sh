@@ -54,9 +54,11 @@ $SSH 'pkill -f "[m]jpeg_server.py"; pkill -x vt_sparse; pkill -x vt_board; pkill
 LEFT=$(ps -eo cmd | grep -c "[p]latform_host.*--board-ssh")
 echo "  正在跑的闭环数 = $LEFT（标定期间不能有闭环抢相机）"
 [ "$LEFT" -gt 0 ] && { echo "  ⚠ 先停掉闭环再标定" >&2; exit 3; }
-PAGE=$(ps -eo cmd | grep -c "[p]latform_host.*--scenario")
+#: 页面显示进程：以前只认 platform_host，现在也有独立的 page_display.py（只放页面、
+#: 不跑闭环），两种都算"屏幕上有画面"。
+PAGE=$(ps -eo cmd | grep -cE "[p]latform_host.*--scenario|[p]age_display\.py")
 echo "  静态页面显示进程 = $PAGE（标定必须有画面，0 = 相机拍不到东西）"
-[ "$PAGE" -eq 0 ] && { echo "  ⚠ 先起一个页面显示（--speed 0 --viewer --viewer-fullscreen）" >&2; exit 3; }
+[ "$PAGE" -eq 0 ] && { echo "  ⚠ 先起一个页面显示（python3 core/board/tools/page_display.py --y 40 或 platform_host --speed 0 --viewer）" >&2; exit 3; }
 
 echo "== 2. 检查 quad =="
 QB=$($SSH 'cat /tmp/quad.json 2>/dev/null' 2>/dev/null | tr -d '\r')
@@ -64,11 +66,17 @@ echo "  /tmp/quad.json = ${QB:-（空！）}"
 [ -z "$QB" ] && { echo "  ⚠ 没有 quad：先跑 push_quad.py（需要页面上有 ArUco）" >&2; exit 3; }
 
 echo "== 3. 锁曝光/白平衡后抓 $FRAMES 帧 640x480 =="
+#: **设备节点自动探测**：相机拔插后枚举号会变（/dev/video0 → /dev/video1）。
+#: 写死节点时这一步会静默抓 0 字节，然后"样本不足，跳过标定"——很难查。
+CAM_DEV=$($SSH "v4l2-ctl --list-devices 2>/dev/null | awk '/^[^ \t]/ { skip = (\$0 ~ /platform|mvx/); next } !skip && match(\$0, /\\/dev\\/video[0-9]+/) { print substr(\$0, RSTART, RLENGTH); exit }'" 2>/dev/null | tr -d '\r' | head -1)
+CAM_DEV="${CAM_DEV:-/dev/video0}"
+echo "  相机设备: $CAM_DEV"
 #: 与闭环管线用同一套相机参数，否则"标定时是自动曝光、跑的时候也是自动曝光"，
 #: 两边的亮度分布都对不上（实测没锁时 40 帧里只有 17 帧能测出墙）。
-#: 曝光保持自动（与闭环一致；固定曝光的坑见 platform_host.py 注释）; then         v4l2-ctl -d /dev/video0 --set-ctrl=exposure_auto=1                  --set-ctrl=exposure_absolute=200                  --set-ctrl=white_balance_temperature_auto=0                  --set-ctrl=white_balance_temperature=4000                  --set-ctrl=gain=4 2>/dev/null || true; fi' >/dev/null 2>&1
+#: 曝光保持自动（与闭环一致；固定曝光的坑见 platform_host.py 注释）。
+#: 需要锁就加 CAM_CTRL_LOCK=1（不锁时不动相机，避免把已经调好的画面弄坏）。
 $SSH "rm -f /tmp/calib.rgb; ffmpeg -hide_banner -loglevel error -f v4l2 \
-      -input_format mjpeg -video_size 640x480 -i /dev/video0 \
+      -input_format mjpeg -video_size 640x480 -i $CAM_DEV \
       -frames:v $FRAMES -f rawvideo -pix_fmt rgb24 -y /tmp/calib.rgb 2>/dev/null;
       echo bytes=\$(stat -c %s /tmp/calib.rgb)" 2>/dev/null | tail -1
 

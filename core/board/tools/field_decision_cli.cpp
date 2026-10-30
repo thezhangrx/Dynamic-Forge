@@ -49,6 +49,10 @@ int main(int argc, char** argv) {
   int hyst = 1;                      // 新方向连续几帧才换
   int reflex = 1;                    // 1 = 贴墙时改用"最安全方向"
   double inflate = 13.0;             // 规划膨胀半径（角色 10 + 余量）
+  //: 公式 5.5 的斥力项（默认 0 = 关，逐位等于旧行为）
+  double repel_range = 120.0;        // rr
+  double repel_gain = 1.0;           // η
+  double repel_weight = 0.0;         // w_rep：贴墙惩罚的"等效距离"上限
   const char* trace_path = nullptr;  // 逐帧决策轨迹（离线诊断用）
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
@@ -67,6 +71,9 @@ int main(int argc, char** argv) {
     else if (std::strcmp(a, "--reflex") == 0) reflex = static_cast<int>(next(reflex));
     else if (std::strcmp(a, "--trace") == 0 && i + 1 < argc) trace_path = argv[++i];
     else if (std::strcmp(a, "--inflate") == 0) inflate = next(inflate);
+    else if (std::strcmp(a, "--repel-range") == 0) repel_range = next(repel_range);
+    else if (std::strcmp(a, "--repel-gain") == 0) repel_gain = next(repel_gain);
+    else if (std::strcmp(a, "--repel-weight") == 0) repel_weight = next(repel_weight);
   }
   if (field_w <= 0 || field_h <= 0) {
     std::fprintf(stderr, "field 尺寸必须 > 0\n");
@@ -82,6 +89,9 @@ int main(int argc, char** argv) {
   cfg.ema = ema;
   cfg.inflate = inflate;
   cfg.hyst = hyst;
+  cfg.repel_range = repel_range;
+  cfg.repel_gain = repel_gain;
+  cfg.repel_weight = repel_weight;
   field_m1::Field field;
   field.configure(cfg);
 
@@ -120,9 +130,9 @@ int main(int argc, char** argv) {
     if (!printed_parse) {
       std::fprintf(stderr,
                    "[field] 解析到 %d 段墙（@STATE 里 n=%d），field %.0f×%.0f，"
-                   "goal (%.0f,%.0f)，view-h %.0f\n",
+                   "goal (%.0f,%.0f)，view-h %.0f，repel rr=%.0f η=%.2f w=%.1f\n",
                    static_cast<int>(walls.size()), n, field_w, field_h,
-                   goal_x, goal_y, view_h);
+                   goal_x, goal_y, view_h, repel_range, repel_gain, repel_weight);
       printed_parse = true;
       last_n = static_cast<int>(walls.size());
     }

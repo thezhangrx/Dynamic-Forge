@@ -24,9 +24,30 @@ struct Config {
   double field_w = 640.0, field_h = 480.0;
   double goal_x = 320.0, goal_y = 470.0;
   double cell = 10.0;        // 网格边长（场地单位）
-  double inflate = 13.0;     // 角色半径 10 + 安全余量 3
+  //: **硬阻挡带**（把墙周围一圈判成不可走）。用户 2026-10-23 口径：
+  //: **墙周围不要判成禁区** —— 靠斥力的 `1/d` 自己把车推开就行。
+  //: 所以本项在"带斥力"的配置里只留 ~1~2（只为把墙线本身那几格判成障碍，
+  //: 好让波前仍然绕缺口走），不再是 13。
+  double inflate = 13.0;
   double ema = 0.3;
   int hyst = 2;              // 新方向要连续 2 帧才换
+
+  //: **人工斥力（公式 5.5 的 U_rep，Khatib 排斥）** —— 只加在代价场上，
+  //: 不新增控制层。口径与 `core/cpu/potential_field.py` 同一套：
+  //:
+  //:     U_rep(p) = ½·η·(1/d − 1/rr)²      d < rr，否则 0
+  //:     F(p)     = travel_到目标(p) + w_rep · rr² · U_rep(p)
+  //:
+  //: `travel` 是波前测地距离（会绕缺口），`rr²·U_rep` 把 1/长度² 的量纲换回
+  //: "等效距离"，所以 `w_rep` 就是"贴墙惩罚最多值多少场地单位"。
+  //: `d` = 格中心到**未膨胀**墙矩形表面的距离（chamfer 用 inflate 后的网格算，
+  //: 这里用几何精算，避免让膨胀量顺带改变斥力形状）。
+  //:
+  //: **默认 w_rep = 0 → 逐位等于旧行为**（回归安全）。要"走中间"就把它打开，
+  //: 本机 bench 扫出来的稳健区间在 `docs/闭环标准配置.md` 里。
+  double repel_range = 120.0;   // rr：作用半径（场地单位），只在 d < rr 内生效
+  double repel_gain = 1.0;      // η
+  double repel_weight = 0.0;    // w_rep：打开就 > 0（建议从 20 起扫）
 };
 
 class Field {
@@ -149,6 +170,10 @@ class Field {
         }
       }
     }
+    //: 波前（`travel`）算完再叠斥力项 —— 二者的"零"不同：
+    //: travel 以目标为 0 反向传播，斥力只跟"离墙多远"有关，必须在 Dijkstra
+    //: **之后**加，否则斥力会被当成波前的种子传播、把测地距离算歪。
+    if (cfg_.repel_weight > 0.0 && cfg_.repel_range > 0.0) apply_repulsion(walls);
     built_ = true;
   }
 
@@ -201,6 +226,40 @@ class Field {
  private:
   float at(int ix, int iy) const {
     return cost_[static_cast<size_t>(iy) * nx_ + ix];
+  }
+
+  //: 点到轴对齐矩形的距离（矩形外 → 表面距离；矩形内 → 0）。
+  static double rect_dist(double x, double y, const Rect& r) {
+    const double dx = std::max(std::fabs(x - r.x) - r.hw, 0.0);
+    const double dy = std::max(std::fabs(y - r.y) - r.hh, 0.0);
+    return std::hypot(dx, dy);
+  }
+
+  //: F += w_rep·rr²·½η·(1/d − 1/rr)²（仅 d < rr；含墙/均无墙时不动）。
+  void apply_repulsion(const std::vector<Rect>& walls) {
+    const double rr = cfg_.repel_range;
+    const double k = cfg_.repel_weight * rr * rr * 0.5 * cfg_.repel_gain;
+    for (int iy = 0; iy < ny_; ++iy) {
+      const double y = view_y0_ + (iy + 0.5) * cfg_.cell;
+      for (int ix = 0; ix < nx_; ++ix) {
+        const size_t idx = static_cast<size_t>(iy) * nx_ + ix;
+        if (!std::isfinite(cost_[idx])) continue;      // 膨胀禁区恒为 inf
+        const double x = (ix + 0.5) * cfg_.cell;
+        double d = 1e18;
+        for (const Rect& r : walls) {
+          const double dd = rect_dist(x, y, r);
+          if (dd < d) d = dd;
+          if (d <= 0.0) break;
+        }
+        //: **`1/d` 做分母 ⇒ 越靠近墙势越大**，所以不需要"禁区"：
+        //: 真正贴到墙上的格代价是天文数字，下降自然不会去。这里只夹一个
+        //: 半个格的下限（`d>=cell/2`），纯粹为了让浮点数别溢出成 inf。
+        d = std::max(d, 0.5 * cfg_.cell);
+        if (d >= rr) continue;
+        const double u = 1.0 / d - 1.0 / rr;
+        cost_[idx] += static_cast<float>(k * u * u);
+      }
+    }
   }
 
   static int quantize(double vx, double vy) {

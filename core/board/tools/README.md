@@ -1,5 +1,11 @@
 # `core/board/tools/` —— 板上验证用的小工具
 
+> ⚠ **2026-10-25：工具索引只到 10-15，之后新增的一个都没写进来**
+> （`pl_vision.cpp`、`build_pl_vision.sh`、`board_world.py`、`grade_run.py`、`loop_watchdog.sh`、
+> `cam_lock.sh`、`auto_tune.py`、`make_task.py`、`smoke_agent.py`、`cam_settings_locked.sh` …）。
+> 现行用法：跑 → `loop_standard.sh`；判 → `check_run_logs.py` / `grade_run.py`。本文 §1–§2 的 AXI 警示仍有效。
+
+
 这些是**在板子上直接 gcc 编**的小程序（不是 `core/board/` 那套 C++17 交叉编译的
 驱动），用途是把 PL 侧的设计在真硅上验证掉。每个都是单文件、无依赖。
 

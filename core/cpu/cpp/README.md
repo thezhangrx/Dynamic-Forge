@@ -1,5 +1,9 @@
 # `gap_avoid.py` 的 C++ 移植（PS 侧跑的那一份）
 
+> ⚠ **2026-10-25：`gap_avoid` 的 C++ 移植不是现行决策**（现行 = `field_decision_cli` 的 M1），
+> 本文仅作旧路径/对照参考。
+
+
 `core/cpu/gap_avoid.py` 是**唯一的算法真值**（golden model）。本目录是它的
 C++17 移植，给板子的 PS（4×Cortex-A7 @1GHz，Ubuntu 20.04 aarch64）用。
 

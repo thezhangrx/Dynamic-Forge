@@ -1,5 +1,10 @@
 # `core/cpu/` —— CPU 决策层
 
+> ⚠ **2026-10-25：本文“`plan()` 是唯一需要移植的算法 / 板上 main.cpp 已接上它”已作废。**
+> 现行决策是板端 `core/board/tools/field_decision_cli.cpp`（M1 反向 Dijkstra 代价场 + `core/board/field_m1.hpp`）。
+> `plan()` / `gap_avoid` / 势场只作历史对照与 bench 基线。
+
+
 CPU 侧的两件事：**从"看见障碍"到"给出速度指令"的避障算法**，以及
 **CPU↔FPGA 帧回路**。平台侧（仿真器、渲染、数据集）在 `core/bullet_sim/`，
 图像处理在 `core/vision/`，本目录只依赖前者的类型定义，不依赖后者的任何实现。

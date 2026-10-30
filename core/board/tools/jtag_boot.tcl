@@ -23,8 +23,30 @@
 #     bash core/board/tools/loop_standard.sh --check
 # ===========================================================================
 
+#: ⚠ 默认位流路径原来是 `D:/FPGAWORKS/board_bits/BIT/.../ai7030_top_disable_icap.bit`，
+#:   这台机器上**没有那个文件** → 每次跑都 `PROGRAM_PL_FAIL: couldn't open ...`，
+#:   而失败被 catch 掉继续走（所以很容易误以为"位流烧了"）。改成仓库里真实存在的那份。
+#: 可覆盖：
+#:   xsdb.bat jtag_boot.tcl <bit 路径> <0|1 是否烧 PL>
+#:   xsdb.bat jtag_boot.tcl rollback        ← 用板上备用的老位流（等价于不烧 PL，靠 autoload）
 set DO_PL 1
-set BIT_FILE D:/FPGAWORKS/board_bits/BIT/30tai_lite_detpost/ai7030_top_disable_icap.bit
+set DO_RST 1
+set BIT_FILE {\\wsl$\Ubuntu\home\zhang\FPGA\data\fpga\pl_bitstream\bd_vision_p0.bit}
+if {[llength $argv] > 0} {
+    if {[lindex $argv 0] eq "default"} {
+        #: 用脚本内置的 UNC 路径（**推荐**：从 bash/cmd 传 UNC 路径要跨两层引号转义，
+        #:  实测评测时传进去变成了带花括号的字面量 `{...}` → couldn't open）
+        puts "MODE: default（用内置 BIT_FILE）"
+    } elseif {[lindex $argv 0] eq "rollback"} {
+        set DO_PL 0
+        puts "MODE: rollback（不烧 PL，只做系统复位）"
+    } else {
+        set BIT_FILE [lindex $argv 0]
+    }
+}
+if {[llength $argv] > 1} { set DO_PL [lindex $argv 1] }
+if {[llength $argv] > 2} { set DO_RST [lindex $argv 2] }
+puts "BIT_FILE=$BIT_FILE  DO_PL=$DO_PL  DO_RST=$DO_RST"
 
 proc banner {s} { puts "=== $s ===" }
 
@@ -74,6 +96,11 @@ if {[catch {set tl [targets]} e]} {
 set a9 ""
 foreach x $tl { if {[string match "*Cortex-A9*" $x]} { set a9 $x; break } }
 
+if {!$DO_RST} {
+    banner "SKIP RST（DO_RST=0：只重配 PL，不动 PS —— Linux 在跑时唯一安全的用法）"
+    puts "@@@END@@@"
+    exit 0
+}
 banner "RST -SYSTEM"
 if {$a9 ne ""} {
     puts "  选中 PS 目标：$a9"

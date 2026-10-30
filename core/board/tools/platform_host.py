@@ -307,6 +307,26 @@ def start_camera_pipe(target: str, key: str, extra: str = "",
     板端 agent 会校验这个标记，synthetic 输入会被直接拒绝。
     """
     import subprocess
+    #: **设备节点在板子上探测一次**（2026-10-24 保留的一处非 acc9 改动）：
+    #: 相机拔插后枚举号会变（实测 /dev/video0 → /dev/video1 → 现在又回到 video0），
+    #: 写死节点的后果是 ffmpeg `Cannot open video device`、整轮 0 帧、
+    #: 日志上却像"相机坏了"（base3 就是这么白跑一轮的）。
+    #: 探测失败就退回 /dev/video0 —— 行为与 acc9 完全一致。
+    dev = "/dev/video0"
+    try:
+        _d = subprocess.run(
+            ["ssh", "-i", key, "-o", "StrictHostKeyChecking=no",
+             "-o", "ConnectTimeout=8", target,
+             "v4l2-ctl --list-devices 2>/dev/null | awk '"
+             "/^[^ \\t]/ { skip = ($0 ~ /platform|mvx/); next } "
+             "!skip && match($0, /\\/dev\\/video[0-9]+/) "
+             "{ print substr($0, RSTART, RLENGTH); exit }'"],
+            capture_output=True, timeout=20)
+        _s = (_d.stdout or b"").decode("utf-8", "ignore").strip().splitlines()
+        if _s and _s[0].startswith("/dev/video"):
+            dev = _s[0].strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
     cmd = (
         #: 注意：这里必须用 `pkill -x`（按进程名精确匹配）而不是 `pkill -f`。
         #: 这条命令是**通过 ssh 传过去的一整行**，remote bash 自己的 cmdline 里就
@@ -319,7 +339,15 @@ def start_camera_pipe(target: str, key: str, extra: str = "",
         'rm -f /tmp/vt.jsonl /tmp/cam.jpg; '
         'nohup bash -c \'ffmpeg -hide_banner -loglevel error '
         '-fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 '
-        '-f v4l2 -input_format mjpeg -video_size 640x480 -i /dev/video0 '
+        #: 2026-10-24 实测：YUYV 清晰度 +49% 但 **USB 带宽撑不住**（640×480@30 =
+        #: 18.4 MB/s，dwc2 上跑一会儿就静默断流，抓帧全超时）→ 暂回 MJPG。
+        #: 原注释：只改采集格式，MJPG→YUYV（未压缩 4:2:2，
+        #: 去掉 JPEG 块效应）。实测清晰度 +49%、平坦区噪声 −28%，视角不变。
+        #: YUYV 必须显式 -framerate，否则协商失败。
+        #: YUYV 640×480 设备只支持 30 fps（`--list-formats-ext`），申请 12 会协商失败、
+        #: 出几十帧就停（实测 cam.jpg 停在 68 s 前、VT 随后 0 帧 → 闸门拒跑）。
+        #: 所以**设备按 30 要，滤镜里 fps=12 降帧**。
+        f'-f v4l2 -input_format mjpeg -video_size 640x480 -i {dev} '
         f'-filter_complex "fps={fps:g},scale={cam_w}:{cam_h},split=2[a][b]" '
         '-map "[a]" -f rawvideo -pix_fmt rgb24 - '
         '-map "[b]" -update 1 -q:v 5 -y /tmp/cam.jpg '
@@ -765,6 +793,16 @@ def main(argv: list[str] | None = None) -> int:
         detail = ""
         t_gate = time.monotonic()
         _last_pub = 0.0
+        #: ⚠ 2026-10-26 修（实测根因）：**静态墙是在 `env.step()` 的 spawn 阶段生成的**，
+        #: 而闸门跑在第一次 step 之前（主循环的 `env.step` 在 :867）——于是闸门期间
+        #: 发布的页面里**根本没有墙**，相机拍不到墙，闸门永远凑不到 5 帧，冷启动必挂。
+        #: 以前偶尔"能过"，是因为屏幕上还残留着上一轮带墙的页面（假象）。
+        #: 这里先走一步 act=0（"停"，不改变机器人位置），让 spawn 把本场景的静态墙
+        #: 生成出来，再发布页面。代价：仿真时间前进 1 个 dt（1/120 s），可忽略。
+        try:
+            env.step(0)
+        except Exception:  # noqa: BLE001
+            pass
         while time.monotonic() - t_gate < 25.0:
             _now = time.monotonic()
             if _now - _last_pub >= 0.05:

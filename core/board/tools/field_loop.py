@@ -97,6 +97,9 @@ def board_command(args, goal, field_w: float, field_h: float) -> list[str]:
                      ("--inflate", getattr(args, "board_inflate", None))):
         if val is not None:
             tail += [opt, f"{val:g}" if isinstance(val, float) else str(val)]
+    #: 通用追加参数（任意 A/B，例如 `--repel-weight 20`）：不再为每个旋钮
+    #: 都加一个 `--board-*`，否则这里的 A/B 表会越来越长。
+    tail += str(getattr(args, "board_extra", "") or "").split()
     if args.board == "local":
         return [args.local_bin, *tail]
     return [
@@ -143,6 +146,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stall-s", type=float, default=5.0,
                     help="多久收不到板子的 @ACK 就判失联（秒）")
     ap.add_argument("--no-stop-on-arrival", action="store_true")
+    ap.add_argument("--board-extra", default="",
+                    help="追加给板子/本地二进制的参数（空格分隔），例如 "
+                         "`--repel-weight 20`")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 

@@ -239,6 +239,12 @@ img{display:block;width:100vw;height:100vh;object-fit:contain}</style>
             return self._seq
 
     @property
+    def seq(self) -> int:
+        """最新已发布帧的序号（page_view 回传它，G1 据此倒查位姿）。"""
+        with self._cond:
+            return self._seq
+
+    @property
     def published(self) -> int:
         with self._cond:
             return self._published
@@ -268,7 +274,8 @@ class PagePublisher:
         self.server = server
         self.fps = max(1.0, float(fps))
         self._cond = threading.Condition()
-        self._frame: np.ndarray | None = None
+        self._frame = None             #: (rgb, pose_y) 最新一帧
+        self._seq_pose: dict[int, float] = {}   #: 序号 → 位姿 y
         self._stop = False
         self.published = 0
         self.dropped = 0
@@ -280,14 +287,22 @@ class PagePublisher:
         self._thread.start()
         return self
 
-    def submit(self, rgb) -> None:
+    def submit(self, rgb, pose_y=None) -> None:
+        """`pose_y`：这一帧描绘的仿真 y。**必须随帧一起走** —— G1 的正确性
+        依赖"序号 → 位姿"的精确对应，不能用"时刻回查"（MJPEG 有缓冲，
+        回查到的帧会比真正画在屏幕上的新，位姿偏 20~67 单位）。"""
         if rgb is None:
             return
         with self._cond:
             if self._frame is not None:
                 self.dropped += 1          # 编码跟不上产帧：只保留最新一帧
-            self._frame = rgb
+            self._frame = (rgb, pose_y)
             self._cond.notify()
+
+    def pose_of(self, seq: int):
+        """序号 → 该帧描绘的位姿 y（没有记录时 None）。"""
+        with self._cond:
+            return self._seq_pose.get(int(seq))
 
     def stop(self) -> None:
         with self._cond:
@@ -310,8 +325,15 @@ class PagePublisher:
                 if self._stop:
                     return
                 frame, self._frame = self._frame, None
-            if self.server.publish(frame):
+            rgb, pose_y = frame if isinstance(frame, tuple) else (frame, None)
+            if self.server.publish(rgb):
                 self.published += 1
+                if pose_y is not None:
+                    with self._cond:
+                        self._seq_pose[int(self.server.seq)] = float(pose_y)
+                        if len(self._seq_pose) > 600:
+                            for _k in sorted(self._seq_pose)[:-600]:
+                                del self._seq_pose[_k]
 
 
 # ======================================================================
