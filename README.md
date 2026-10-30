@@ -1,5 +1,12 @@
 # bullet_sim — 二维动态障碍环境模拟器 · 组员开发手册
 
+> ⚠ **2026-10-25 口径更正（本文是引擎手册，状态表已过期）**
+> 本文 §19 状态表与 §20.4 闭环描述（“开发板通信未接入 / FPGA RTL 未开始 / 闭环 = 移动墙 + `core/cpu`”）
+> **全部作废**。现行以 `AGENTS.md`（硬规则，见 R2/R3 修订：位姿走 `@POSE`）、`core/using/LOCKED.md`
+> （锁定轮 `acc9r16`）、`core/fpga/docs/PL_HANDOFF.md`（PL 感知线）为准。
+> 引擎本身（§1–§18：数据结构/障碍/难度/安全校验/可视化/数据集）仍然有效。
+
+
 > 目标链路：**虚拟环境训练 → CPU / FPGA 异构部署 → 现实二维小车验证**。
 > 优先级：**正确性 > 可复现性 > 模块化 > 数据接口 > 性能 > UI 美观**。
 >
@@ -964,8 +971,8 @@ BULLET_SIM_NO_PYTEST=1 python -m bullet_sim.tests.run_tests
 | State 帧协议 v3（兼容读 v1/v2） | ✅ 已完成 | CRC32 + 固定 stride |
 | Prediction 帧协议 + FPGA Python 参考块 | ✅ 已完成（参考模型） | `[SOFTWARE_REFERENCE_ONLY]`，**非 HDL** |
 | CPU 决策层（只吃字节帧） | ✅ 已完成 | 精度低于直接读实体的基线，属已量化偏差 |
-| **开发板真实通信** | ⏳ **尚未接入** | `[HARDWARE_INPUT_INTERFACE_TBD]`（输入适配器）/ `[HARDWARE_INTERFACE_TBD]`（FPGA） |
-| **FPGA RTL 实现** | ⏳ **尚未开始** | 只有 Python golden model 与帧格式 |
+| **开发板真实通信** | ✅ **已接入**（2026-10-24） | `platform_host.py` ↔ 板端 `board_agent.py`：`@POSE` 下发位姿 / `@MOVE` 收动作（见 `AGENTS.md` R2/R3 修订） |
+| **FPGA RTL 实现** | ✅ **已在板上运行**（2026-10-25） | `core/fpga/rtl` 10 个 .v + `bd_vision_r8` 位流；相机域 300/300 帧与 C 参考（`ref/vision_ref.c`）逐字节一致 |
 | **训练好的 AI 模型** | ⏳ **`[MODEL_NOT_AVAILABLE_YET]`** | 接口已就绪，模型需自行训练 |
 | **30TAI / Icraft 量化与上板** | ⏳ **`[MODEL_DEPLOYMENT_TBD]`** | 工具链未确定，不猜测 |
 | CPU / FPGA 带宽与延迟实测 | ⏳ **`[TBD]`** | 依赖上一条 |
@@ -1121,6 +1128,8 @@ python vision_track.py --capture 40 --calibration data/vision/calibration.json -
 典型的"跑得通但全错"。真机实测 **40/40 帧被 `cpu.plan()` 接受**。
 
 ### 20.4 闭环：视觉决策**直接控制角色**
+
+> ⚠ **2026-10-25：本节的“移动墙 + `core/cpu` 决策 + 原地等墙过”已作废**——现行是 24 墙静态墙 + 板端 M1 代价场，角色必须穿过缺口。见 `AGENTS.md` 与 `core/fpga/docs/PL_HANDOFF.md`。
 
 ```bash
 python cpu_vision_loop.py --synthetic --episodes 3 --seconds 14   # 可复现

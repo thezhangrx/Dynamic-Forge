@@ -189,6 +189,12 @@ int main(void)
                     motor_stop();
                     car_ctrl_reset(&g_ctrl);
                     break;
+                case CAR_CMD_MODE:
+                    g_cfg.diff_mode = cmd.mode;
+                    g_mode_act = 0;
+                    /* 切差速时立刻清空直立环状态，避免残留力矩把车推走 */
+                    car_ctrl_reset(&g_ctrl);
+                    break;
                 case CAR_CMD_CAL:
                     if (mpu_ok) mpu6050_calib_gyro(g_gyro_bias, 200);
                     break;

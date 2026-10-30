@@ -78,3 +78,6 @@ htmlcov/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Verilator 协同仿真的构建产物（每个模型一个 --Mdir）
+core/fpga/cosim/obj_*/

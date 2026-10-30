@@ -12,6 +12,7 @@
  *   @VEL <v_mm_s> <w_mrad_s> 直接给差速指令：线速度 mm/s、角速度 mrad/s
  *   @STOP                    立即停（保持停车状态直到下一条 MOVE/VEL）
  *   @CAL                     重新标定陀螺零偏（车必须静止）
+ *   @MODE <0|1>             0=自平衡（默认，行为不变） 1=纯差速（直立环不参与）
  *
  * 上行（STM32 -> 上位机）
  *   @ODOM <x_mm> <y_mm> <theta_mrad>              里程计位姿（页面坐标）
@@ -28,6 +29,7 @@ typedef enum {
     CAR_CMD_VEL,
     CAR_CMD_STOP,
     CAR_CMD_CAL,
+    CAR_CMD_MODE,     /* @MODE <0|1>：0=自平衡(默认) 1=纯差速 */
 } car_cmd_kind_t;
 
 typedef struct {
@@ -35,6 +37,7 @@ typedef struct {
     uint8_t act;        /* CMD_MOVE 时有效 */
     float   v;          /* CMD_VEL：mm/s */
     float   w;          /* CMD_VEL：mrad/s */
+    int     mode;       /* CMD_MODE：0/1 */
 } car_cmd_t;
 
 /* 无线链路（E30-433T20D 透明传输）用：行尾可带 "#<seq>"，回 "@ACK <seq>"。

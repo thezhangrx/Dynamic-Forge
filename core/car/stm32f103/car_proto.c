@@ -125,6 +125,14 @@ static int parse_line(const char *line, car_cmd_t *out)
         out->kind = CAR_CMD_STOP;
         return 1;
     }
+    if (strncmp(line, "@MODE", 5) == 0) {
+        const char *p = line + 5;
+        float m;
+        if (!parse_float(&p, &m)) return 0;
+        out->kind = CAR_CMD_MODE;
+        out->mode = (m >= 0.5f) ? 1 : 0;
+        return 1;
+    }
     if (strncmp(line, "@CAL", 4) == 0) {
         out->kind = CAR_CMD_CAL;
         return 1;
