@@ -117,7 +117,15 @@ def test_rtl_lint_clean():
         [v, "--lint-only", "-Wall", "-Wno-DECLFILENAME", "--top-module", "vision_axi",
          f"-I{RTL}", str(RTL / "vision_selftest.v"), str(RTL / "vision_tpg.v"),
          str(RTL / "vision_axi.v"), str(RTL / "vision_top.v"),
-         str(RTL / "vision_ccl.v"), str(RTL / "vision_div.v")],
+         str(RTL / "vision_ccl.v"), str(RTL / "vision_div.v"),
+         # P0 正射主体（2026-10-25 起纳入 lint 门禁）。
+         # 注：早先还写过一个独立的 vision_ortho_coef.v，后来发现它与 vision_ortho 内部
+         # 那段系数运算是**同一份逻辑的两份源码** —— 按 R7「单一事实源」删掉那份拷贝。
+         str(RTL / "vision_ortho.v"),
+         # P0 数据通路（2026-10-25 起纳入 lint 门禁）：行缓存 + 填充控制 + AXI 读主口 + 系统层
+         str(RTL / "vision_linecache.v"), str(RTL / "vision_linefill.v"),
+         str(RTL / "vision_axi_master.v"), str(RTL / "vision_ortho_sys.v"),
+         str(RTL / "vision_div_pipe.v")],
         capture_output=True, text=True, env=_env(), cwd=str(COSIM),
     )
     assert r.returncode == 0, r.stdout + r.stderr
@@ -139,9 +147,20 @@ def exe() -> pathlib.Path:
 
 @pytest.fixture(scope="module")
 def stim(tmp_path_factory: pytest.TempPathFactory) -> tuple[pathlib.Path, int]:
-    """导一批彩色 PPM 真实帧。灰度会让 R-B 判据恒为 0，墙根本测不出来。"""
+    """导一批彩色 PPM 真实帧。灰度会让 R-B 判据恒为 0，墙根本测不出来。
+
+    优先用 `data/fpga/stim_color`（320 帧真实相机/录屏语料，已入库在 data 里）；
+    没有录像 `data/vision/run4/screen.mp4` 时才有必要现场导帧 —— 这条 fallback
+    是 2026-10-25 加的：原来没有那段 mp4 就整组"逐位一致"用例全 skip，
+    P1a 的 luma 模式等于没有回归保护。
+    """
+    pre = ROOT / "data" / "fpga" / "stim_color"
+    if pre.is_dir() and any(pre.glob("*.ppm")):
+        files = sorted(pre.glob("*.ppm"))
+        want = int(os.environ.get("FPGA_COSIM_FRAMES", DEFAULT_FRAMES))
+        return pre, min(want, len(files))
     if not VIDEO.exists():
-        pytest.skip("没有真实录像 data/vision/run4/screen.mp4")
+        pytest.skip("没有真实录像 data/vision/run4/screen.mp4，也没有 data/fpga/stim_color")
     want = int(os.environ.get("FPGA_COSIM_FRAMES", DEFAULT_FRAMES))
     out = tmp_path_factory.mktemp("stim")
     r = subprocess.run(
@@ -180,6 +199,22 @@ def test_cosim_bit_exact_on_real_frames(exe, stim):
     assert "有差异的帧 0" in r.stdout, r.stdout
     # 每一帧至少要比 3*w*h + h 项（三张掩膜 + 行直方图），防止
     # "一帧都没真比" 也报 0 不符。
+    n_checks = int(r.stdout.split("比对项 ")[1].split("，")[0])
+    assert n_checks > 600_000 * frames, r.stdout
+
+
+# ---------------------------------------------------------------------------
+# 2b) P1a：自适应亮度判据（luma_mode=1）也必须逐位一致
+#
+# 这条模式不是"换个阈值"：它多三遍（清直方图 / 求分位 / 重分类 + 形状门），
+# 每条路径都改过一版，所以单独钉一条用例；参数走真实 AXI-Lite 写路径。
+# ---------------------------------------------------------------------------
+def test_cosim_luma_mode_bit_exact(exe, stim):
+    stim_dir, frames = stim
+    r = _run(exe, stim_dir, frames, "--luma")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "不符 0" in r.stdout, r.stdout
+    assert "有差异的帧 0" in r.stdout, r.stdout
     n_checks = int(r.stdout.split("比对项 ")[1].split("，")[0])
     assert n_checks > 600_000 * frames, r.stdout
 

@@ -164,6 +164,22 @@ module vision_top #(
                      CFG_P_MAX_AREA  = 6'd18,
                      CFG_P_FILL      = 6'd19,
                      CFG_P_ASPECT    = 6'd20,
+                     /* P1a（2026-10-25）：自适应亮度判据。
+                      * luma_mode=0 → 旧 RGB 判据，行为逐位不变（默认）；
+                      * luma_mode=1 → thr = 亮度直方图 luma_pct 分位 - luma_bias，
+                      *   夹在 [luma_min, luma_max]；wall = gray>=thr 且行内亮游程
+                      *   >= luma_run_min；bright = gray >= max(thr, luma_player_min)；
+                      *   上下各排除 luma_edge_rows 行（页面白框不算墙）。 */
+                     CFG_LUMA_MODE   = 6'd21,
+                     CFG_LUMA_PCT    = 6'd22,
+                     CFG_LUMA_BIAS   = 6'd23,
+                     CFG_LUMA_MIN    = 6'd24,
+                     CFG_LUMA_MAX    = 6'd25,
+                     CFG_LUMA_PMIN   = 6'd26,
+                     CFG_LUMA_EDGE   = 6'd27,
+                     CFG_LUMA_RUNMIN = 6'd28,
+                     /* 状态（只读）。**必须是这张表的最后一项**：
+                      * core/fpga/tests/test_rtl_contract.py 用正则扫到它为止。 */
                      CFG_STATUS      = 6'd31;
 
     reg [7:0]  r_wall_rb, r_wall_min_r, r_wall_min_g;
@@ -172,6 +188,33 @@ module vision_top #(
     reg [15:0] r_wall_col_pct, r_wall_col_min, r_edge_min, r_edge_min_cols;
     reg [15:0] r_min_seg_px, r_min_gap_px;
     reg [31:0] r_player_min_area, r_player_max_area, r_player_min_fill_pct, r_player_max_aspect_pct;
+
+    // ---- P1a：自适应亮度判据 ----------------------------------------------
+    reg [7:0]  r_luma_mode, r_luma_pct, r_luma_bias, r_luma_min, r_luma_max;
+    reg [7:0]  r_luma_pmin, r_luma_run_min;
+    reg [15:0] r_luma_edge;
+    //: 直方图走**分布式 RAM**：更新要"读-改-写"同一拍、求分位要 256 拍异步扫，
+    //: 256×16 = 4 Kb ≈ 500 个 LUT（器件有 26600，够）。
+    (* ram_style = "distributed" *) reg [15:0] hist_mem [0:255];
+    reg [7:0]  r_luma_thr;          // 本帧阈值（S_HTHR 算出）
+    reg [7:0]  r_luma_pthr;         // 角色阈值 = max(thr, luma_pmin)
+    reg [17:0] luma_a;              // LRC 扫描的预读地址
+    reg [17:0] luma_hi;             // 求分位时的桶号
+    reg [17:0] luma_acc;            // 分位累计
+    reg [17:0] luma_need;           // 需要的样本数 = samples*pct/100
+    reg [15:0] lrc_run;             // LRC1 的行内墙计数 / LRC2 的当前亮游程长度
+    reg [AW-1:0] lrc_run_start;     // LRC2 当前亮游程的起始地址
+    reg [H_BITS-1:0] lrc_row;       // 当前行
+    reg [AW-1:0] lrc_row_end;       // 本行最后一个地址
+    reg [15:0] lrc_rc;              // 行内墙像素计数
+    reg        lrc_edge;            // 当前行是否属于上下排除带
+    //: LRC2 的清短游程：**单条 pending**，后台写 0，扫描不停。
+    //: 两个都试过并放弃的方案：① 停顿+就地清（rd_addr 会跟预读地址漂一格，漏像素）；
+    //: ② 4 深环形队列（push/pop 同拍时计数被后写覆盖，队列错位）。
+    reg        pc_valid;
+    reg [AW-1:0] pc_a, pc_e;
+    reg lrc_vld;                    // LRC1/LRC2 的"第一拍只发预读"
+    reg [AW-1:0] lrc_last;          // WIDTH*HEIGHT-1
 
     localparam [7:0] WIDTH_LO  = WIDTH[7:0];
     localparam [7:0] WIDTH_HI  = WIDTH[15:8];
@@ -229,6 +272,35 @@ module vision_top #(
     // **单写口**记录存储。写进程见 §5.4（一个数组只有一个 `mem[a] <= d`）。
     (* ram_style = "distributed" *) reg [31:0] obs_words [0:511];
     (* ram_style = "distributed" *) reg [31:0] gap_words [0:511];
+
+    // =====================================================================
+    // wall_mem / bright_mem 的**单一写口**（2026-10-25，为布局而做）
+    //
+    // 为什么要这么写：这两个数组是 1 位宽、256 K 深，它们有三个写来源
+    // （S_RECV 收帧、S_LRC1 重分类、S_LRC2 形状门清 0），原先是三段独立的
+    // 非阻塞赋值。综合看成**多写口** → BRAM 只有 1 个写口 → 只能退化成分布式 RAM
+    // （实测：wall_mem 7200 个 RAM128X1D、bright_mem 5400 个），把 7030 的
+    // 26,600 个 SLICEM 站点撑爆（布局报 Place 30-640 requires 63,318）。
+    //
+    // 三条来源本来就是**同一个状态机的互斥分支**，所以合成一个写口是**语义等价**的：
+    //   写使能 / 地址 / 数据 各按 state 选，别的什么都不改。
+    // 门禁：`pytest test_cosim` 里那 22 条逐位对账（含 luma 模式的 8 帧）会盯着。
+    // =====================================================================
+    wire wr_recv = (state == S_RECV) && din_vld;
+    wire wr_lrc1 = (state == S_LRC1) && lrc_vld;
+    wire wr_clr  = (state == S_LRC2) && pc_valid;
+
+    wire           wm_we = wr_recv | wr_lrc1 | wr_clr;
+    wire [AW-1:0]  wm_wa = wr_recv ? wr_addr : (wr_lrc1 ? rd_addr : pc_a);
+    wire           wm_wd = wr_recv ? is_wall : (wr_lrc1 ? lrc_pw : 1'b0);
+    wire           bm_we = wr_recv | wr_lrc1;
+    wire [AW-1:0]  bm_wa = wr_recv ? wr_addr : rd_addr;
+    wire           bm_wd = wr_recv ? cls_w[1] : (gray_rd >= r_luma_pthr);
+
+    always @(posedge pix_clk) begin
+        if (wm_we) wall_mem[wm_wa] <= wm_wd;
+        if (bm_we) bright_mem[bm_wa] <= bm_wd;
+    end
 
     reg [AW-1:0] rd_addr;
 
@@ -355,9 +427,45 @@ module vision_top #(
                        S_CCL        = 5'd14,
                        S_PACK_INIT  = 5'd15,
                        S_PACK       = 5'd16,
-                     S_DONE       = 5'd17;
+                     S_DONE       = 5'd17,
+                     // P1a 的四个附加态（只在 luma_mode=1 时走到；26..31 是空闲编号）
+                     S_HCLR       = 5'd26,   // 清直方图（256 拍）
+                     S_HTHR       = 5'd27,   // 求分位 → thr（256 拍）
+                     S_LRC1       = 5'd28,   // 重分类：gray → wall/bright/row_count
+                     S_LRC2       = 5'd29;   // 形状门：清掉行内过短的亮游程
 
     reg [4:0] state;
+
+    // ---- P1a 的组合辅助 ---------------------------------------------------
+    //: 阈值夹取：clamp(v - bias, min, max)，与 C 的流水线同序（先减后夹）。
+    function [7:0] luma_clamp(input [7:0] v, input [7:0] bias,
+                              input [7:0] lo, input [7:0] hi);
+        reg signed [9:0] t;
+        begin
+            t = $signed({2'b0, v}) - $signed({2'b0, bias});
+            if (t < $signed({2'b0, lo}))      luma_clamp = lo;
+            else if (t > $signed({2'b0, hi})) luma_clamp = hi;
+            else                              luma_clamp = t[7:0];
+        end
+    endfunction
+    wire lrc_pw       = (!lrc_edge) && (gray_rd >= r_luma_thr);  // 本像素算不算墙（未过形状门）
+    wire lrc_end_now  = (rd_addr == lrc_row_end);                 // 行末
+    wire [15:0] lrc_len_after = lrc_run + {15'b0, wall_rd};       // 计入本像素后的游程长度
+    //: 行末收尾时的"有效游程起点/终点"。
+    //: 踩过：行末那一个像素若是**新游程的第 1 个**（lrc_run 还是 0），lrc_run_start
+    //: 是上一段游程的残留地址，按它去清会清错地方 —— 表现是"这一像素该清没清、
+    //: 行里另一个像素被误清"（cosim 里就是 wall 差 1 个像素）。
+    wire [AW-1:0] lrc_start_eff = (wall_rd && (lrc_run == 16'd0)) ? rd_addr : lrc_run_start;
+    wire [AW-1:0] lrc_last_eff  = wall_rd ? rd_addr : (rd_addr - 1'b1);
+    //: 本拍是否"收尾了一段短游程"，以及要清哪一段。
+    wire lrc_close   = lrc_end_now ? (lrc_len_after != 16'd0)
+                                   : ((wall_rd == 1'b0) && (lrc_run != 16'd0));
+    wire [15:0] lrc_close_n = lrc_end_now ? lrc_len_after : lrc_run;
+    wire lrc_short   = (state == S_LRC2) && lrc_vld && lrc_close &&
+                       (lrc_close_n < {8'b0, r_luma_run_min});
+    wire [AW-1:0] lrc_push_a = lrc_end_now ? lrc_start_eff : lrc_run_start;
+    wire [AW-1:0] lrc_push_e = lrc_end_now ? lrc_last_eff
+                                            : ((rd_addr == 0) ? rd_addr : (rd_addr - 1'b1));
     // 调试钩子：`+dumpseg` 打开后每个墙段落一行中间量（与 C 侧
     // `VR_DEBUG_SEG=1` 的格式刻意做成一样，diff 就能定位分叉点）。
     reg       dbg_dump_seg = 1'b0;
@@ -553,6 +661,9 @@ module vision_top #(
             r_min_seg_px    <= 16'd8;   r_min_gap_px    <= 16'd8;
             r_player_min_area <= 32'd60;  r_player_max_area <= 32'd1500;
             r_player_min_fill_pct     <= 32'd45;  r_player_max_aspect_pct   <= 32'd160;
+            r_luma_mode <= 8'd0;  r_luma_pct  <= 8'd88;  r_luma_bias    <= 8'd20;
+            r_luma_min  <= 8'd90; r_luma_max  <= 8'd200; r_luma_pmin    <= 8'd165;
+            r_luma_edge <= 16'd8; r_luma_run_min <= 8'd40;
         end else if (cfg_we) begin
             case (cfg_addr)
                 CFG_WALL_RB:     r_wall_rb       <= cfg_wdata[7:0];
@@ -576,6 +687,14 @@ module vision_top #(
                 CFG_P_MAX_AREA:  r_player_max_area  <= cfg_wdata;
                 CFG_P_FILL:      r_player_min_fill_pct      <= cfg_wdata;
                 CFG_P_ASPECT:    r_player_max_aspect_pct    <= cfg_wdata;
+                CFG_LUMA_MODE:   r_luma_mode    <= cfg_wdata[7:0];
+                CFG_LUMA_PCT:    r_luma_pct     <= cfg_wdata[7:0];
+                CFG_LUMA_BIAS:   r_luma_bias    <= cfg_wdata[7:0];
+                CFG_LUMA_MIN:    r_luma_min     <= cfg_wdata[7:0];
+                CFG_LUMA_MAX:    r_luma_max     <= cfg_wdata[7:0];
+                CFG_LUMA_PMIN:   r_luma_pmin    <= cfg_wdata[7:0];
+                CFG_LUMA_EDGE:   r_luma_edge    <= cfg_wdata[15:0];
+                CFG_LUMA_RUNMIN: r_luma_run_min <= cfg_wdata[7:0];
                 default: ;                       /* 未映射地址写进来当没看见 */
             endcase
         end
@@ -604,6 +723,14 @@ module vision_top #(
             CFG_P_MAX_AREA:  cfg_rdata = r_player_max_area;
             CFG_P_FILL:      cfg_rdata = r_player_min_fill_pct;
             CFG_P_ASPECT:    cfg_rdata = r_player_max_aspect_pct;
+            CFG_LUMA_MODE:   cfg_rdata = {24'b0, r_luma_mode};
+            CFG_LUMA_PCT:    cfg_rdata = {24'b0, r_luma_pct};
+            CFG_LUMA_BIAS:   cfg_rdata = {24'b0, r_luma_bias};
+            CFG_LUMA_MIN:    cfg_rdata = {24'b0, r_luma_min};
+            CFG_LUMA_MAX:    cfg_rdata = {24'b0, r_luma_max};
+            CFG_LUMA_PMIN:   cfg_rdata = {24'b0, r_luma_pmin};
+            CFG_LUMA_EDGE:   cfg_rdata = {16'b0, r_luma_edge};
+            CFG_LUMA_RUNMIN: cfg_rdata = {24'b0, r_luma_run_min};
             // 状态（只读）：bit0 busy，bit1 最近一帧已完成，[23:8] 完成帧计数
             CFG_STATUS:      cfg_rdata = {8'b0, frame_count, 6'b0, frame_done_lat, busy};
             default:         cfg_rdata = 32'd0;
@@ -735,7 +862,10 @@ module vision_top #(
     // 用 dout_last 定帧长（AXI 包装层就是这么做的），帧长会变成 4 ——
     // 这个 bug 是被 AXI 路径的协同仿真抓到的，tb_vision 一路没发现。
     assign dout_last = dout_vld && (pk_phase == 2'd1) && (pk_tx == 2'd3);
-    assign busy      = (state != S_IDLE);
+    /// busy = "流水线在帧里"，但 **不包含** 两个不取像素的准备态（S_HCLR/S_HTHR）：
+    /// 像素源（PS 的 pixfeed / 协同仿真台）就是靠 busy 的上升沿决定什么时候开始推，
+    /// 若准备态也拉高 busy，头 257 个像素会被丢掉，整帧平移。
+    assign busy      = (state != S_IDLE) && (state != S_HCLR) && (state != S_HTHR);
 
     // =====================================================================
     // 5. 主时序
@@ -926,6 +1056,14 @@ module vision_top #(
                     end
                 end
             end
+            // (6b) P1a 的两遍重分类：顺序预读
+            S_LRC1, S_LRC2: begin
+                //: 进入这两态的第一拍必须先读地址 0（lrc_vld=0 时 luma_a 还是上一次的残留）
+                //: 进入时先读地址 0；S_LRC2 在"要清但还没清完"时保持当前地址
+                rd_nxt = (!lrc_vld) ? {AW{1'b0}}
+                       : ((state == S_LRC2 && lrc_short && pc_valid) ? rd_addr
+                                                                    : luma_a[AW-1:0]);
+            end
             // (4) 列扫描：进入时定位到首列的带底
             S_COL_CLEAR: begin
                 if (!(band_i >= n_bands) && !(ctr < WIDTH))
@@ -975,15 +1113,39 @@ module vision_top #(
                     player_valid <= 1'b0; ccl_started <= 1'b0;
                     bi <= 0; band_phase <= 0; band_in_run <= 0; m_vld <= 0;
                     wf <= 4'd0; gw_f <= 4'd0; gw_busy <= 1'b0;
-                    state <= S_RECV;
+                    lrc_vld <= 1'b0;
+                    lrc_last <= WIDTH * HEIGHT - 1;
+                    if (r_luma_mode != 8'd0) begin
+                        // P1a：先清直方图（256 拍），再收帧
+                        luma_hi <= 18'd0;
+                        state   <= S_HCLR;
+                    end else begin
+                        state   <= S_RECV;
+                    end
+                end
+            end
+            // =============================================================
+            // P1a ①：清直方图 + 算"需要多少样本"
+            S_HCLR: begin
+                hist_mem[luma_hi[7:0]] <= 16'd0;
+                if (luma_hi == 18'd255) begin
+                    luma_hi   <= 18'd0;
+                    luma_acc  <= 18'd0;
+                    // 采样密度 1/16（x[1:0]==0 && y[1:0]==0），与 C 参考同一口径
+                    luma_need <= ((WIDTH / 4) * (HEIGHT / 4) * r_luma_pct) / 100;
+                    state     <= S_RECV;
+                end else begin
+                    luma_hi <= luma_hi + 1'b1;
                 end
             end
             // =============================================================
             S_RECV: begin
                 if (din_vld) begin
                     gray_mem[wr_addr]   <= gray_w;
-                    wall_mem[wr_addr]   <= is_wall;
-                    bright_mem[wr_addr] <= cls_w[1];
+                    //: wall_mem/bright_mem 的写**不在这里** —— 见下面的"单一写口"块。
+                    //: P1a：每 4 个像素采 1 个进直方图（与 C 参考 vr_luma_threshold 同口径）
+                    if (r_luma_mode != 8'd0 && wr_col[1:0] == 2'd0 && wr_row[1:0] == 2'd0)
+                        hist_mem[gray_w] <= hist_mem[gray_w] + 16'd1;
                     if (din_sof) begin
                         // 帧首像素：行/列必须**在这里**归零。上一帧结束把 wr_row
                         // 加到了 HEIGHT，不归零的话第二帧的地址会整体偏一帧。
@@ -994,10 +1156,115 @@ module vision_top #(
                         row_count[wr_row] <= rc_run + (is_wall ? 16'd1 : 16'd0);
                         rc_run <= 0; wr_col <= 0;
                         wr_row <= wr_row + 1'b1;
-                        if (wr_row == HEIGHT[H_BITS-1:0] - 1'b1) state <= S_BAND;
+                        if (wr_row == HEIGHT[H_BITS-1:0] - 1'b1)
+                            state <= (r_luma_mode != 8'd0) ? S_HTHR : S_BAND;
                     end else begin
                         rc_run <= rc_run + (is_wall ? 16'd1 : 16'd0);
                         wr_col <= wr_col + 1'b1;
+                    end
+                end
+            end
+            // =============================================================
+            // P1a ②：求分位阈值。luma_acc 逐桶累加，到 luma_need 就取该桶。
+            //   阈值 = clamp(桶号 - bias, min, max)；角色阈值 = max(thr, pmin)。
+            S_HTHR: begin
+                if (luma_acc + {2'b0, hist_mem[luma_hi[7:0]]} >= luma_need) begin
+                    r_luma_thr  <= luma_clamp(luma_hi[7:0], r_luma_bias, r_luma_min, r_luma_max);
+                    r_luma_pthr <= (luma_clamp(luma_hi[7:0], r_luma_bias, r_luma_min, r_luma_max)
+                                    > r_luma_pmin)
+                                   ? luma_clamp(luma_hi[7:0], r_luma_bias, r_luma_min, r_luma_max)
+                                   : r_luma_pmin;
+                    luma_hi  <= 18'd0;
+                    lrc_vld  <= 1'b0;
+                    state    <= S_LRC1;
+                end else if (luma_hi == 18'd255) begin
+                    // 兜底：样本没累到（理论上不会）→ 用上限
+                    r_luma_thr  <= r_luma_max;
+                    r_luma_pthr <= (r_luma_max > r_luma_pmin) ? r_luma_max : r_luma_pmin;
+                    luma_hi  <= 18'd0;
+                    lrc_vld  <= 1'b0;
+                    state    <= S_LRC1;
+                end else begin
+                    luma_acc <= luma_acc + {2'b0, hist_mem[luma_hi[7:0]]};
+                    luma_hi  <= luma_hi + 1'b1;
+                end
+            end
+            // =============================================================
+            // P1a ③：重分类一遍（gray → wall/bright/row_count）。
+            //   与 C 参考 vr_reclassify_luma 的"阈值部分"逐条对应；形状门在 LRC2。
+            S_LRC1: begin
+                if (!lrc_vld) begin
+                    lrc_vld     <= 1'b1;
+                    luma_a      <= 18'd1;              // 已发地址 0 的预读
+                    lrc_row     <= {H_BITS{1'b0}};
+                    lrc_row_end <= WIDTH[AW-1:0] - 1'b1;
+                    lrc_rc      <= 16'd0;
+                    lrc_edge    <= (r_luma_edge != 16'd0);
+                end else begin
+                    lrc_rc  <= lrc_rc + {15'b0, lrc_pw};
+                    luma_a  <= luma_a + 1'b1;
+                    if (rd_addr == lrc_row_end) begin
+                        row_count[lrc_row] <= lrc_rc + {15'b0, lrc_pw};
+                        lrc_rc      <= 16'd0;
+                        lrc_row     <= lrc_row + 1'b1;
+                        lrc_row_end <= lrc_row_end + WIDTH[AW-1:0];
+                        lrc_edge    <= ((lrc_row + 1'b1) < r_luma_edge) ||
+                                       ((lrc_row + 1'b1) >= (HEIGHT[H_BITS-1:0] - r_luma_edge[H_BITS-1:0]));
+                        if (rd_addr == lrc_last) begin
+                            lrc_vld <= 1'b0;
+                            luma_a  <= 18'd0;
+                            state   <= S_LRC2;
+                        end
+                    end
+                end
+            end
+            // =============================================================
+            // P1a ④：形状门。行内亮游程 < luma_run_min 的，把那段清 0。
+            //   扫描不停：清 0 用 pc_* 在身后并行写；只有"上一条还没清完、又来一段"
+            //   时才停一拍（实测几千帧里几乎不出现）。
+            S_LRC2: begin
+                if (!lrc_vld) begin
+                    lrc_vld     <= 1'b1;
+                    luma_a      <= 18'd1;
+                    lrc_row     <= {H_BITS{1'b0}};
+                    lrc_row_end <= WIDTH[AW-1:0] - 1'b1;
+                    lrc_run     <= 16'd0;
+                    pc_valid    <= 1'b0;
+                end else begin
+                    if (lrc_short && !pc_valid) begin
+                        pc_a     <= lrc_push_a;
+                        pc_e     <= lrc_push_e;
+                        pc_valid <= 1'b1;
+                        row_count[lrc_row] <= row_count[lrc_row] - lrc_close_n;
+                    end
+                    if (pc_valid) begin
+                        //: 清 0 也走那个单一写口（见下面的"单一写口"块）
+                        if (pc_a == pc_e) pc_valid <= 1'b0;
+                        else              pc_a     <= pc_a + 1'b1;
+                    end
+
+                    if (lrc_short && pc_valid) begin
+                        // 停一拍：地址保持、不处理像素（rd_nxt 那边看同一个条件）
+                    end else if (lrc_end_now) begin
+                        lrc_run     <= 16'd0;
+                        lrc_row     <= lrc_row + 1'b1;
+                        lrc_row_end <= lrc_row_end + WIDTH[AW-1:0];
+                        if (rd_addr == lrc_last && !pc_valid && !lrc_short) begin
+                            lrc_vld <= 1'b0;
+                            luma_a  <= 18'd0;
+                            state   <= S_BAND;
+                        end else if (rd_addr != lrc_last) begin
+                            luma_a <= luma_a + 1'b1;
+                        end
+                    end else if (wall_rd) begin
+                        if (lrc_run == 16'd0) lrc_run_start <= rd_addr;
+                        lrc_run <= lrc_run + 1'b1;
+                        luma_a  <= luma_a + 1'b1;
+                    end else if (lrc_run != 16'd0) begin
+                        lrc_run <= 16'd0;
+                        luma_a  <= luma_a + 1'b1;
+                    end else begin
+                        luma_a <= luma_a + 1'b1;
                     end
                 end
             end
@@ -1562,7 +1829,18 @@ module vision_top #(
             4'd12: dbg_data = {16'b0, col_cnt[dbg_idx[W_BITS-1:0]]};
             4'd13: dbg_data = col_sumy[dbg_idx[W_BITS-1:0]];
             4'd14: dbg_data = {24'b0, col_step[dbg_idx[W_BITS-1:0]]};
-            4'd15: dbg_data = {31'b0, dout_vld};
+            //: sel=15 原来是 dout_vld（单值）。改成 sub 选择，**sub=0 保持原行为**
+            //: （老用例/文档不受影响），新增 3 个"进度"读数 —— 排查"收不满/卡在哪一态"用：
+            //:   sub=1 state（0=IDLE 1=RECV 2=BAND 10/11/12=SEG 13=GAP 14=CCL 15/16=PACK 17=DONE）
+            //:   sub=2 {wr_row, wr_col}（收到第几行第几列）
+            //:   sub=3 frame_count
+            4'd15: case (dbg_sub)
+                       4'd0: dbg_data = {31'b0, dout_vld};
+                       4'd1: dbg_data = {27'b0, state};
+                       4'd2: dbg_data = {13'b0, wr_row, wr_col};
+                       4'd3: dbg_data = {16'b0, frame_count};
+                       default: dbg_data = 32'd0;
+                   endcase
             default: dbg_data = 32'd0;
         endcase
     end

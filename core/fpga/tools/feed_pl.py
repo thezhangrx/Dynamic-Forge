@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import ctypes
 import mmap
 import os
 import struct
@@ -54,16 +55,41 @@ MAGIC = 0x31564842
 
 def open_regs():
     fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
-    return mmap.mmap(fd, 4096, mmap.MAP_SHARED,
-                     mmap.PROT_READ | mmap.PROT_WRITE, offset=BASE), fd
+    m = mmap.mmap(fd, 4096, mmap.MAP_SHARED,
+                  mmap.PROT_READ | mmap.PROT_WRITE, offset=BASE)
+    return m, fd
+
+
+#: **必须用 ctypes 写单个 32 位字，不能用 `struct.pack_into`**（2026-10-24 实测）。
+#:
+#: 板上用 `0x0F8`（PIXPUSH 的提交计数）对照过四种写法：
+#:     struct.pack_into("<I", m, off, v)   → **3 次 AXI 提交**（FIFO 进 3 份）
+#:     m[off:off+4] = b"..."               → 2 次
+#:     ctypes.c_uint32(...).value = v      → **1 次**（正确）
+#:     C 的 `*(volatile uint32_t*)p = v`   → 1 次
+#: 一次 store 变成 3 笔写，FIFO 里就多了 2 份同样的字 → 像素流错位（每 4 个像素
+#: 里 2 个是 0），几何帧长度/CRC 却仍然自洽 ⇒ 表现为"喂了一整帧但 n_obs=0"。
+#: 这个坑只在真硅上出现：cosim 的 TB 自己拼 AXI 事务，天然一笔一个。
+_rd32 = None
+_wr32 = None
+
+
+def _views(m):
+    global _rd32, _wr32
+    if _wr32 is None:
+        buf = (ctypes.c_char * 4096).from_buffer(m)
+        _rd32 = lambda off: ctypes.c_uint32.from_buffer(buf, off).value
+        _wr32 = lambda off, val: setattr(
+            ctypes.c_uint32.from_buffer(buf, off), "value", val & 0xFFFFFFFF)
+    return _rd32, _wr32
 
 
 def rd(m, off: int) -> int:
-    return struct.unpack_from("<I", m, off)[0]
+    return _views(m)[0](off)
 
 
 def wr(m, off: int, val: int) -> None:
-    struct.pack_into("<I", m, off, val & 0xFFFFFFFF)
+    _views(m)[1](off, val)
 
 
 def load_rgb(path: str, w: int, h: int) -> bytes:
@@ -85,13 +111,16 @@ def push_frame(m, rgb: bytes, seq: int, stamp_ns: int, pad: int = 0) -> float:
     #: 顺序**必须是"先 start 再推像素"**：vision_top 只在收到 frame_start 的
     #: 那一帧里吃像素，IDLE 时推进去的会被丢掉，随后 start 又等不到像素 → 死等。
     #: （RTL 头注释："PS 的顺序是 写 start → 轮询 busy 落 → 读 frame_len → 读窗口"）
-    wr(m, kOffPixCtl, 0b11)          # 源=FIFO + flush（清掉上一帧残留）
-    wr(m, kOffPixCtl, 0b01)          # 源=FIFO，取消 flush
     wr(m, kOffSeq, seq)
     wr(m, kOffStamp0, stamp_ns & 0xFFFFFFFF)
     wr(m, kOffStamp1, (stamp_ns >> 32) & 0xFFFFFFFF)
     t0 = time.perf_counter()
-    wr(m, kOffCtrl, 1)               # 先启动这一帧
+    wr(m, kOffCtrl, 1)               # ① 先启动这一帧
+    #: ② 之后**再**选 FIFO 源 + flush（顺序照抄 cosim tb_axi.cpp 的 FIFO 分支：
+    #:    CTRL=1 → 空转几拍 → PIXCTL=0x3 → 推像素）。先设 PIXCTL 再启动会让
+    #:    状态机在 IDLE 阶段吃掉/错位开头若干字节，帧长与 CRC 仍自洽但整幅图错位。
+    time.sleep(0.0002)               # 200 µs ≫ 4 拍（50 MHz 下 4 拍=80 ns）
+    wr(m, kOffPixCtl, 0b11)          # 源=FIFO + flush
     #: **必须等 busy 拉高再推像素**：vision_top 在收到 din_sof 之前忽略所有像素，
     #: 而 pixfeed 的放行条件就是"流水线已经开始收"（busy 高）。不等的话开头几十个
     #: 像素被吞 → 整帧错位，但帧长/CRC 仍然自洽（这个坑很隐蔽，实测 n_obs=0）。
@@ -110,8 +139,11 @@ def push_frame(m, rgb: bytes, seq: int, stamp_ns: int, pad: int = 0) -> float:
     while rd(m, kOffCtrl) & 0x1:      # busy
         if time.perf_counter() > deadline:
             raise RuntimeError("PL 5 s 内没处理完这一帧（busy 一直高）")
+    #: 溢出**不算失败**：PS 推得比流水线吃得快时，帧取满 WIDTH*HEIGHT 像素之后
+    #: 剩下的字会灌满 8 KB 的像素 FIFO 并置粘滞 ovf —— 那时帧已经完整了。
+    #: 判"帧对不对"只认 magic/长度/CRC。C 喂数器（feeding 更快）常走到这一步。
     if rd(m, kOffCtrl) & 0x10000:
-        raise RuntimeError("PL 报 overflow")
+        print("（提示）PL 尾部溢出：帧已取满，剩余字丢弃，不影响帧内容")
     return time.perf_counter() - t0
 
 
@@ -149,6 +181,8 @@ def main(argv=None) -> int:
     ap.add_argument("--pad", type=int, default=0,
                     help="帧前多推 N 个字节（定位 FIFO/流水线吃掉的起始字节数）")
     ap.add_argument("--jsonl", default="")
+    ap.add_argument("--dump", default="",
+                    help="把读回的几何帧原始字节写到这个文件（用于与 C 参考逐位 cmp）")
     a = ap.parse_args(argv)
 
     m, fd = open_regs()
@@ -168,6 +202,9 @@ def main(argv=None) -> int:
                    r["w"], r["h"], r["n_obs"], r["n_gaps"], r["need"], r["flen"],
                    "OK" if r["ok_crc"] else "MISMATCH(0x%08x vs 0x%08x)" %
                    (r["crc_frame"], r["crc_calc"])))
+            if a.dump:
+                with open(a.dump, "wb") as df:
+                    df.write(r["raw"])
             if f:
                 f.write(json.dumps({k: r[k] for k in ("magic", "ver", "seq", "w", "h",
                                                       "n_obs", "n_gaps", "need", "flen",
@@ -176,7 +213,10 @@ def main(argv=None) -> int:
     finally:
         if f:
             f.close()
-        m.close()
+        #: 不能 `m.close()`：ctypes 的 `from_buffer` 视图还导出了这块 mmap 的指针，
+        #: CPython 会抛 `BufferError: cannot close exported pointers exist`
+        #: （踩过一次：帧其实已经跑对了，却因为这句崩在收尾，连 dump 都没写出来）。
+        #: 进程马上退出，交给内核回收即可。
         os.close(fd)
     print("结论：", "全部通过" if ok_all else "有失败项（见上）")
     return 0 if ok_all else 1

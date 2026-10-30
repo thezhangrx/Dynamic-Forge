@@ -87,6 +87,18 @@ typedef struct {
     int wall_col_pct, wall_col_min, edge_min, edge_min_cols;
     int min_seg_px, min_gap_px;
     int player_min_area, player_max_area, player_min_fill_pct, player_max_aspect_pct;
+    /* ③ 判据模式（P1a，2026-10-25）：0 = 现有 RGB 判据（默认，行为不变）；
+     *    1 = 自适应亮度判据（对齐 core/board/tools/vt_sparse.cpp 的口径）。
+     *    luma_force_thr > 0 时跳过自适应，直接用该阈值。 */
+    int luma_mode;          /* 0/1 */
+    int luma_pct;           /* 分位，默认 88 */
+    int luma_bias;          /* 阈值 = 分位点 - bias，默认 20 */
+    int luma_min;           /* 阈值下限，默认 90 */
+    int luma_max;           /* 阈值上限，默认 200 */
+    int luma_player_min;    /* 角色亮度下限（取 max(thr, 这个)），默认 165 */
+    int luma_edge_rows;     /* 上下各排除多少行（页面白框不是墙），默认 8 */
+    int luma_run_min;       /* 一行里连续亮像素 ≥ 这个长度才算墙（形状门），默认 40 */
+    int luma_force_thr;     /* >0：强制阈值（调试用） */
 } VrRefParams;
 
 void vr_ref_default_params(VrRefParams *p);

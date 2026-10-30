@@ -74,7 +74,14 @@ module vision_pixfeed #(
     //: 主机端对同一份字节算同样的量，一致 ⇒ 传输没问题，问题在判据侧。
     output reg  [31:0] dbg_bytes,
     output reg  [31:0] dbg_xor,
-    output reg  [31:0] dbg_sum
+    output reg  [31:0] dbg_sum,
+    // ---- 诊断（2026-10-24 第二批）：把 FIFO 内部状态做成可读的 -------------
+    //: 为什么要这个：板上"推了一整帧、帧自洽但判不出墙"，而灰度图取证只能看到
+    //: 最终结果。要分清"写没写进去 / 读指针跑到哪 / 蓄水池里剩几个字节"，
+    //: 必须把内部量读出来，否则只能猜。
+    input  wire [AW-1:0] dbg_mem_addr,   // 要回读的 FIFO 字地址
+    output wire [31:0]   dbg_mem_data,   // 该地址的字（与 FIFO 自己的读口同源）
+    output reg  [31:0]   dbg_ptr         // {16'b0, level[11:0], nb[3:0]}
 );
 
     // -----------------------------------------------------------------------
@@ -108,6 +115,15 @@ module vision_pixfeed #(
     //    level ≤ 2048（AW=11）→ 12 位够；×4 ≤ 8192 → 14 位
     wire [13:0] lvl4 = {level, 2'b00};                       // 12 + 2 = 14
     assign buffered  = {2'b0, lvl4} + {12'b0, nb};            // 16 + 16 → 16
+
+    //: 诊断口：与 FIFO 自己的读口**同一条路径**（异步读 mem），这样读到的就是
+    //: 消费者真正会看到的那个字 —— 不是另开一条"看起来对"的旁路。
+    assign dbg_mem_data = mem[dbg_mem_addr];
+
+    always @(posedge clk) begin
+        if (!rst_n) dbg_ptr <= 32'd0;
+        else dbg_ptr <= {16'd0, level, nb};
+    end
 
 
     // -----------------------------------------------------------------------

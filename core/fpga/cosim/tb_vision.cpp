@@ -68,6 +68,15 @@ enum {
     CFG_P_MAX_AREA   = 18,
     CFG_P_FILL       = 19,
     CFG_P_ASPECT     = 20,
+    // P1a：自适应亮度判据（vision_top.v 的 CFG_LUMA_*）
+    CFG_LUMA_MODE    = 21,
+    CFG_LUMA_PCT     = 22,
+    CFG_LUMA_BIAS    = 23,
+    CFG_LUMA_MIN     = 24,
+    CFG_LUMA_MAX     = 25,
+    CFG_LUMA_PMIN    = 26,
+    CFG_LUMA_EDGE    = 27,
+    CFG_LUMA_RUNMIN  = 28,
     CFG_STATUS       = 31
 };
 
@@ -110,6 +119,14 @@ static void cfg_apply(const VrRefParams &p)
     cfg_write(CFG_P_MAX_AREA, (uint32_t)p.player_max_area);
     cfg_write(CFG_P_FILL,     (uint32_t)p.player_min_fill_pct);
     cfg_write(CFG_P_ASPECT,   (uint32_t)p.player_max_aspect_pct);
+    cfg_write(CFG_LUMA_MODE,   (uint32_t)p.luma_mode);
+    cfg_write(CFG_LUMA_PCT,    (uint32_t)p.luma_pct);
+    cfg_write(CFG_LUMA_BIAS,   (uint32_t)p.luma_bias);
+    cfg_write(CFG_LUMA_MIN,    (uint32_t)p.luma_min);
+    cfg_write(CFG_LUMA_MAX,    (uint32_t)p.luma_max);
+    cfg_write(CFG_LUMA_PMIN,   (uint32_t)p.luma_player_min);
+    cfg_write(CFG_LUMA_EDGE,   (uint32_t)p.luma_edge_rows);
+    cfg_write(CFG_LUMA_RUNMIN, (uint32_t)p.luma_run_min);
 }
 
 // ---- 时钟 ----------------------------------------------------------------
@@ -250,6 +267,7 @@ static int  g_stim_err    = 0;   // 激励读不出来 / 超限的次数
 static int  g_timeouts    = 0;   // RTL 没在 guard 内出帧的次数
 static bool g_verbose = false;
 static bool g_dump_cc = false;   // --dump-cc：每帧把 RTL 的连通域全表打出来
+static const char *g_dump_mask = nullptr;  // --dump-mask PREFIX：把 RTL/C 的 gray+wall 落 PGM
 // 整轮几何帧字节的 FNV-1a 折叠：给"这组参数到底有没有改变输出"一个廉价判据。
 // 只比"两边一致"是不够的 —— 两边都没变也是"一致"，那样配置寄存器接错也发现不了。
 static uint64_t g_hash = 1469598103934665603ull;
@@ -303,6 +321,7 @@ int main(int argc, char **argv)
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--verbose")) g_verbose = true;
         else if (!strcmp(argv[i], "--dump-cc")) g_dump_cc = true;
+        else if (!strcmp(argv[i], "--dump-mask") && i + 1 < argc) g_dump_mask = argv[++i];
         // 改一个参数（两边一起改）：用来验证"配置寄存器真的接到了那个判据上"。
         // 只改 RTL 不改 C，或者改了却接错寄存器，这一条立刻挂。
         else if (!strcmp(argv[i], "--bright") && i + 1 < argc) params.bright_min = atoi(argv[++i]);
@@ -318,6 +337,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--p-fill") && i + 1 < argc) params.player_min_fill_pct = atoi(argv[++i]);
         // **反面控制**：只改 RTL 的寄存器、不改 C 的参数。这样两边必须**不一致** ——
         // 用它来证明"配置寄存器真的参与了判据"，而不是碰巧两边都没变。
+        // P1a：走自适应亮度判据（两边同一组参数，仍然要求逐位一致）
+        else if (!strcmp(argv[i], "--luma")) params.luma_mode = 1;
+        else if (!strcmp(argv[i], "--luma-pct")    && i + 1 < argc) params.luma_pct = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--luma-bias")   && i + 1 < argc) params.luma_bias = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--luma-runmin") && i + 1 < argc) params.luma_run_min = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--luma-edge")   && i + 1 < argc) params.luma_edge_rows = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--rtl-only") && i + 2 < argc) {
             rtl_only_addr = atoi(argv[++i]);
             rtl_only_val  = (uint32_t)atoi(argv[++i]);
@@ -388,6 +413,13 @@ int main(int argc, char **argv)
         top->frame_start = 1;
         step();
         top->frame_start = 0;
+        // 等流水线真的进到"能收像素"的状态再推 —— 与 pixfeed 里等 sink_ready 同一条
+        // 约束。P1a 的 luma 模式在收帧前要先清直方图（257 拍），不等就会丢头 257 像素。
+        {
+            long wguard = 100000;
+            while (!top->busy && wguard-- > 0) step();
+            if (wguard <= 0) { printf("帧 %d: 等 busy 超时\n", f); g_timeouts++; break; }
+        }
 
         size_t npix = (size_t)w * h;
         for (size_t i = 0; i < npix; i++) {
@@ -431,6 +463,26 @@ int main(int argc, char **argv)
         }
 
         if (g_dump_cc) dump_rtl_cc();
+
+        // ---- 落盘两张掩膜（--dump-mask）：逐像素定位分叉用 ----
+        if (g_dump_mask) {
+            char pn[512];
+            for (int k = 0; k < 4; ++k) {
+                const char *tag = k == 0 ? "rtl" : k == 1 ? "c" : k == 2 ? "rtlgray" : "cgray";
+                snprintf(pn, sizeof pn, "%s_f%d_%s.pgm", g_dump_mask, f, tag);
+                if (FILE *pf = fopen(pn, "wb")) {
+                    fprintf(pf, "P5\n%d %d\n255\n", w, h);
+                    for (size_t i = 0; i < npix; ++i) {
+                        uint8_t v = k == 1 ? wall_g[i]
+                                  : k == 3 ? gray_g[i]
+                                  : k == 2 ? (uint8_t)top->rootp->vision_top__DOT__gray_mem[i]
+                                  : (uint8_t)top->rootp->vision_top__DOT__wall_mem[i];
+                        fputc(v, pf);
+                    }
+                    fclose(pf);
+                }
+            }
+        }
 
         // ---- 比对 ----
         long fail_before = g_fail;

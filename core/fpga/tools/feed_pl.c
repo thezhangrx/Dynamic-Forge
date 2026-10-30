@@ -42,7 +42,17 @@
 #define OFF_PIXCTL  0x0DC
 #define OFF_FRAME   0x100
 #define FRAME_WINDOW 2048
-#define MAGIC_LE    0x32485642UL   /* 'B''H''V''1' 小端 */
+
+/* 把帧窗口从设备映射**逐字节**拷到普通内存。
+ *
+ * 为什么不能直接 `memcpy`/`fwrite` 读映射区：这块内存是 Device 属性，
+ * ARM 上**非对齐访问会触发总线错误**（SIGBUS），而 glibc 的 memcpy/fwrite
+ * 会按 8/16 字节宽、且可能非对齐地读 —— 实测 `fwrite(raw + 0x100, ...)`
+ * 直接 SIGBUS（rc=135），而逐字节读完全正常。 */
+static void copy_frame_window(volatile uint8_t *src, uint8_t *dst, size_t n) {
+    for (size_t i = 0; i < n; ++i) dst[i] = src[i];
+}
+#define MAGIC_LE    0x31564842UL   /* 'B''H''V''1' 小端（0x31='1'；曾错写成 0x32 导致永远报 MISMATCH） */
 
 static volatile uint32_t *regs;
 
@@ -141,37 +151,45 @@ int main(int argc, char **argv) {
 
         /* 等 busy 落 */
         while (rd(OFF_CTRL) & 0x1) {}
-        if (rd(OFF_CTRL) & 0x10000) { fprintf(stderr, "PL overflow\n"); bad++; }
+        /* 溢出**不算失败**：PS 推得比流水线吃得快时，帧取满 230400 像素之后
+         * 剩下的字会灌满 8 KB FIFO 并置粘滞 ovf —— 那时帧已经完整了。
+         * 判"帧对不对"只认 magic/长度/CRC（下面那三道），溢出不参与。
+         * （踩过：把 ovf 当错误，320 帧里 91 帧被误判成失败，而它们逐字节一致。） */
+        int ovf = (rd(OFF_CTRL) & 0x10000) ? 1 : 0;
         double t1 = now_ms();
 
         uint32_t magic = rd(OFF_FRAME + 0);
         uint32_t ver   = rd(OFF_FRAME + 4) & 0xFFFF;
         uint32_t seq   = rd(OFF_FRAME + 8);
-        uint8_t *raw   = (uint8_t *)map;     /* 直接用映射内存读窗口 */
-        uint32_t n_obs = raw[OFF_FRAME + 12];
-        uint32_t n_gaps = raw[OFF_FRAME + 16];
+        uint8_t win[FRAME_WINDOW];           /* 帧窗口的普通内存副本（见 copy_frame_window） */
+        copy_frame_window((volatile uint8_t *)map + OFF_FRAME, win, FRAME_WINDOW);
+        const uint8_t *raw = win;            /* 之后一律只碰这份副本 */
+        uint32_t n_obs = raw[12];
+        uint32_t n_gaps = raw[16];
         uint32_t need  = 76 + 36 * (n_obs + n_gaps);
         uint32_t flen  = rd(OFF_FLEN);
         /* CRC32(zlib) 覆盖前面 need-4 字节 */
         uint32_t crc = 0xFFFFFFFFu;
         for (uint32_t i = 0; i < need - 4; ++i) {
-            crc ^= raw[OFF_FRAME + i];
+            crc ^= raw[i];
             for (int b = 0; b < 8; ++b) crc = (crc >> 1) ^ (0xEDB88320u & (~(crc & 1) + 1));
         }
         crc ^= 0xFFFFFFFFu;
         uint32_t crc_frame;
-        memcpy(&crc_frame, raw + OFF_FRAME + need - 4, 4);
+        crc_frame = (uint32_t)raw[need - 4] | ((uint32_t)raw[need - 3] << 8)
+                  | ((uint32_t)raw[need - 2] << 16) | ((uint32_t)raw[need - 1] << 24);
         int ok = (magic == MAGIC_LE) && (need == flen) && (crc == crc_frame);
         if (!ok) bad++;
         if (!quiet) {
             printf("帧 %d: 推字 %.2f ms，整帧 %.2f ms | magic=0x%08x ver=%u seq=%u "
-                   "n_obs=%u n_gaps=%u need=%u flen=%u crc %s\n",
+                   "n_obs=%u n_gaps=%u need=%u flen=%u crc %s%s\n",
                    k + 1, t_push - t0, t1 - t0, magic, ver, seq, n_obs, n_gaps,
-                   need, flen, ok ? "OK" : "MISMATCH");
+                   need, flen, ok ? "OK" : "MISMATCH",
+                   ovf ? "（尾部溢出，帧已完整）" : "");
         }
         if (dump) {
             FILE *o = fopen(dump, k ? "ab" : "wb");
-            if (o) { fwrite(raw + OFF_FRAME, 1, need, o); fclose(o); }
+            if (o) { fwrite(raw, 1, need, o); fclose(o); }
         }
     }
     if (!quiet) printf("总耗时 %.2f ms（%d 帧）\n", now_ms() - t_all0, frames);

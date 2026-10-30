@@ -35,9 +35,15 @@
 catch {encoding system utf-8}
 catch {fconfigure stdout -encoding utf-8}
 
-set rtl_dir [lindex $argv 0]
-set bd_dir  [lindex $argv 1]
-set out_dir [lindex $argv 2]
+#: 路径：命令行 `-tclargs` 给了就用，没给就用下面的默认值
+#: （**GUI 的 `Tools → Run Tcl Script…` 没有 argv，也能直接跑**）
+#: ⚠ 同 bd_pack.tcl：`expr {cond} ? "C:/..." : ...` 会把路径当裸词，报 invalid bareword。
+set rtl_dir "C:/pl_build/rtl"
+set bd_dir  "C:/pl_build/bd"
+set out_dir "C:/pl_build/out"
+if {[info exists argv] && [llength $argv] > 0} { set rtl_dir [lindex $argv 0] }
+if {[info exists argv] && [llength $argv] > 1} { set bd_dir  [lindex $argv 1] }
+if {[info exists argv] && [llength $argv] > 2} { set out_dir [lindex $argv 2] }
 set tag     [lindex $argv 3]
 
 set ip_dir  $out_dir/ip_vision
@@ -70,8 +76,8 @@ puts "@@@ 已加入 IP 仓库 $out_dir @@"
 #:     ERROR: [#UNDEF] Error in evaluating command source init.tcl
 #:     invalid command name "::xgui::utils::init_utils"
 #: 修法：**先切到它自己的目录把它 source 一遍**（init 是幂等的），再建块设计。
-set _xgd [expr {[info exists ::env(VIVADO_XGUI_DIR)] ? $::env(VIVADO_XGUI_DIR)
-                : "D:/Vivado/Vivado/2018.3/scripts/xguifrmwork"}]
+set _xgd "D:/Vivado/Vivado/2018.3/scripts/xguifrmwork"
+if {[info exists ::env(VIVADO_XGUI_DIR)]} { set _xgd $::env(VIVADO_XGUI_DIR) }
 if {[file exists [file join $_xgd init.tcl]]} {
     set _cwd [pwd]
     cd $_xgd
@@ -102,6 +108,16 @@ puts "@@@ vision_axi_ip 已实例化 @@"
 create_bd_cell -type module -reference tpg_source tpg_0
 puts "@@@ tpg_source 已实例化 @@"
 
+# ---- P0：正射主口的协议转换器（**必须建在时钟/复位之前**）-------------------
+#: ⚠ 踩过：创建语句写在了下面的 AXI 连接段，而时钟/复位那段在它之前就
+#: `get_bd_pins pc_hp0/aclk` —— 拿到空列表，`connect_bd_net` 直接报
+#: `BD 41-701 connect_bd_net requires at least two pins/ports`。
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_protocol_converter:2.1 pc_hp0
+set_property -dict [list \
+    CONFIG.SI_PROTOCOL {AXI4} CONFIG.MI_PROTOCOL {AXI3} \
+    CONFIG.ADDR_WIDTH {32} CONFIG.DATA_WIDTH {64}] [get_bd_cells pc_hp0]
+puts "@@@ [get_bd_cells pc_hp0]: 协议转换器已建（AXI4 → AXI3）@@"
+
 # ---- 时钟 / 复位 -----------------------------------------------------------
 set CLK     [get_bd_pins ps7_0/FCLK_CLK0]
 set RST_RAW [get_bd_pins ps7_0/FCLK_RESET0_N]
@@ -128,11 +144,12 @@ connect_bd_net $CLK     [get_bd_pins rst_0/slowest_sync_clk]
 connect_bd_net $RST_RAW [get_bd_pins rst_0/ext_reset_in]
 
 set RST [get_bd_pins rst_0/peripheral_aresetn]
-foreach p {axi_ic/ACLK axi_ic/S00_ACLK axi_ic/M00_ACLK vision_0/s_axi_aclk tpg_0/clk} {
+foreach p {axi_ic/ACLK axi_ic/S00_ACLK axi_ic/M00_ACLK vision_0/s_axi_aclk tpg_0/clk \
+           pc_hp0/aclk} {
     connect_bd_net $CLK [get_bd_pins $p]
 }
 foreach p {axi_ic/ARESETN axi_ic/S00_ARESETN axi_ic/M00_ARESETN \
-           vision_0/s_axi_aresetn tpg_0/rst_n} {
+           vision_0/s_axi_aresetn tpg_0/rst_n pc_hp0/aresetn} {
     connect_bd_net $RST [get_bd_pins $p]
 }
 puts "@@@ 时钟/复位已连（含 PS7 侧 AXI 端口时钟 + proc_sys_reset 同步复位）@@@"
@@ -148,7 +165,30 @@ connect_bd_intf_net [get_bd_intf_pins axi_ic/M00_AXI]  [get_bd_intf_pins vision_
 #   所以在 BD 侧把该 IP 实例的接口与时钟频率改成 50 MHz。
 set_property CONFIG.FREQ_HZ {50000000} [get_bd_intf_pins vision_0/s]
 catch {set_property CONFIG.FREQ_HZ {50000000} [get_bd_pins vision_0/s_axi_aclk]}
+#: ⚠ 主口也要钉到 50 MHz。打包出来的 IP 默认把 aximm 接口写成 100 MHz，
+#: 而 `pc_hp0/S_AXI` 跟着 FCLK_CLK0 = 50 MHz —— 不钉就报
+#:   `BD 41-237 Bus Interface property FREQ_HZ does not match between
+#:    /pc_hp0/S_AXI(50000000) and /vision_0/m_axi(100000000)`
+#: （2026-10-25 实测，validate_bd_design 直接失败）。
+set_property CONFIG.FREQ_HZ {50000000} [get_bd_intf_pins vision_0/m_axi]
 puts "@@@ AXI 已连（接口频率对齐到 50 MHz）@@"
+
+# ---- P0：正射的 AXI 读主口 → PS 的 S_AXI_HP0 -------------------------------
+#
+# 为什么需要这个协议转换器（2026-10-25）：
+#   Zynq-7000 的 `S_AXI_HP0` 是 **AXI3**（6 位 ID、awlock[1:0]），而打包出来的
+#   `vision_axi_ip/m_axi` 是标准 **AXI4**（awlock 1 位、有 qos）。两端直连会在
+#   `validate_bd_design` 报协议不匹配。`axi_protocol_converter` 就是干这个的：
+#   SI=AXI4、MI=AXI3，数据位宽 64 两边一致。
+#
+# 为什么走 HP0 而不是继续用 GP0 + PIXPUSH（数在 PL_P0_P1_MIGRATION.md R62/R63）：
+#   PS 逐字推一整帧 640×480×3 = 76,800 个字，实测 17.3 ms；
+#   64 位 HP 口峰值 400 MB/s，同样一帧只要 2.3 ms。正射搬进 PL 之后，
+#   这 17.3 ms 是唯一还留在链路上的大开销。
+
+connect_bd_intf_net [get_bd_intf_pins vision_0/m_axi] [get_bd_intf_pins pc_hp0/S_AXI]
+connect_bd_intf_net [get_bd_intf_pins pc_hp0/M_AXI]    [get_bd_intf_pins ps7_0/S_AXI_HP0]
+puts "@@@ M_AXI → pc_hp0 → S_AXI_HP0 已连 @@"
 
 # ---- 像素流 ----------------------------------------------------------------
 foreach s {din_vld din_sof din_eol din_r din_g din_b} {
@@ -235,6 +275,15 @@ puts "@@@ wrapper: $wr @@"
 launch_runs synth_1 -jobs 4
 wait_on_run synth_1
 if {[get_property PROGRESS [get_runs synth_1]] ne "100%"} { puts "@@@ SYNTH_FAIL @@"; exit 1 }
+# ---- 存储映射取证（R7）：布局报 "分布式 RAM 超量" 时，必须能在**块设计这一层**点名 ---
+#: 打包 IP 的单模块综合/OOC 综合都是干净的（pmem→RAMB36E1:24、gray_mem→RAMB36E1:64、
+#: 分布式 RAM 16136 个站点），但块设计整体布局却说需要 63318 个 —— 差出来的 4.7 万
+#: 必须在**这一层**看清楚是谁。两个报告都写，命名带 tag。
+open_run synth_1 -name synth_1
+report_ram_utilization -file $out_dir/${tag}_ram_synth.rpt
+report_utilization -hierarchical -file $out_dir/${tag}_util_synth.rpt
+puts "@@@ 存储映射报告（块设计层）已写 ${tag}_ram_synth.rpt / ${tag}_util_synth.rpt @@"
+close_design
 launch_runs impl_1 -to_step write_bitstream -jobs 4
 wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] ne "100%"} { puts "@@@ IMPL_FAIL @@"; exit 1 }

@@ -127,6 +127,11 @@ static const VrRefParams VR_DEFAULT_REF_PARAMS = {
     .min_seg_px = 8, .min_gap_px = 8,
     .player_min_area = 60, .player_max_area = 1500,
     .player_min_fill_pct = 45, .player_max_aspect_pct = 160,
+    /* P1a（2026-10-25）：默认仍是 RGB 判据（与旧版逐位一致） */
+    .luma_mode = 0, .luma_pct = 88, .luma_bias = 20, .luma_min = 90,
+    .luma_max = 200, .luma_player_min = 165, .luma_edge_rows = 8,
+    .luma_run_min = 40,
+    .luma_force_thr = 0,
 };
 
 void vr_ref_default_params(VrRefParams *p)
@@ -331,6 +336,81 @@ static void vr_feed_pixel(VrFrame *f, int x, int y, uint8_t r, uint8_t g, uint8_
     f->wall[i]   = (uint8_t)((cls & (1u << 0)) ? 1 : 0);
     f->bright[i] = (uint8_t)((cls & (1u << 1)) ? 1 : 0);
     if (f->wall[i]) f->row_count[y]++;
+}
+
+/* ---- P1a：自适应亮度判据 -------------------------------------------------
+ *
+ * 语义对照 core/board/tools/vt_sparse.cpp:217-239：
+ *   thr      = 帧内亮度直方图的「luma_pct 分位点」- luma_bias，夹在 [luma_min, luma_max]；
+ *   wall     = gray >= thr（上下各排除 luma_edge_rows 行：页面白框不算墙）；
+ *   bright   = gray >= max(thr, luma_player_min)。
+ * 与 vt_sparse 的两处差异都是**为了确定性/可移植**，不是口径变化：
+ *   · 它在 24 列稀疏点上统计分位，这里用整帧直方图（RTL 只需 256 桶计数器）；
+ *   · 白框改由"排除边行"处理（vt_sparse 用 rc<10/RC>FH-11，pl_vision 用 6 px）。
+ * 只改"哪些像素算墙/亮"，下游（行带/列投影/缺口/CCL）一个字不动。
+ * ------------------------------------------------------------------------ */
+static int vr_luma_threshold(const VrFrame *f, const VrRefParams *p)
+{
+    uint32_t hist[256];
+    size_t need, acc = 0, total = 0;
+    int v, thr = 140;
+    memset(hist, 0, sizeof hist);
+    /*: 采样密度 1/16（x%4==0 && y%4==0）——**必须与 RTL 的 S_RECV 一致**，
+     *  否则两边算出的分位点会差一个灰阶，逐位对拍立刻红。 */
+    for (int y = 0; y < f->height; y += 4)
+        for (int x = 0; x < f->width; x += 4) {
+            hist[f->gray[(size_t)y * f->width + x]]++;
+            total++;
+        }
+    if (p->luma_force_thr > 0) return p->luma_force_thr;
+    need = total * (size_t)p->luma_pct / 100u;
+    for (v = 0; v < 256; v++) {
+        acc += hist[v];
+        if (acc >= need) { thr = v; break; }
+    }
+    thr -= p->luma_bias;
+    if (thr < p->luma_min) thr = p->luma_min;
+    if (thr > p->luma_max) thr = p->luma_max;
+    return thr;
+}
+
+/* 形状门：一行里**连续**亮像素 ≥ run_min 才算墙。
+ *
+ * 为什么必须有（2026-10-25 实测，raw 相机页 + 纯阈值）：
+ *   角色（≈34 px 宽）与反光斑也会越过阈值，被当成"墙" → 多出 2 个障碍，
+ *   其中一个是角色本身（x=335 y=187，hw=34 hh=20），还把 y≈348 那道墙的
+ *   缺口从 76 撑到 181。加上长度门后与"PS 侧形状染色 + RGB 判据"的结果一致。
+ *   —— 这正是 pl_vision 里 kAdaptRunMin=40 那条经验，搬进判据本身。 */
+static void vr_reclassify_luma(VrFrame *f, const VrRefParams *p, int thr, int player_thr)
+{
+    const int edge_rows = p->luma_edge_rows;
+    const int run_min   = p->luma_run_min;
+    memset(f->row_count, 0, (size_t)f->height * sizeof(uint16_t));
+    for (int y = 0; y < f->height; y++) {
+        const int edge = (y < edge_rows) || (y >= f->height - edge_rows);
+        int x = 0;
+        while (x < f->width) {
+            if (f->gray[(size_t)y * f->width + x] < thr) {
+                //: 阈值以下的像素必须**显式清零** —— 第一遍（RGB 判据）可能已把它
+                //: 标成墙，不清就会残留下来（cosim 里表现为"RTL=0 C=1"）。
+                f->wall[(size_t)y * f->width + x] = 0;
+                x++;
+                continue;
+            }
+            int s = x;
+            while (x < f->width && f->gray[(size_t)y * f->width + x] >= thr) x++;
+            const int len = x - s;
+            const int is_wall = (!edge) && (len >= run_min);
+            for (int k = s; k < x; k++) {
+                if (is_wall) { f->wall[(size_t)y * f->width + k] = 1; f->row_count[y]++; }
+                else          f->wall[(size_t)y * f->width + k] = 0;
+            }
+        }
+        for (; x < f->width; x++) f->wall[(size_t)y * f->width + x] = 0;
+        for (x = 0; x < f->width; x++)
+            f->bright[(size_t)y * f->width + x] =
+                (uint8_t)(f->gray[(size_t)y * f->width + x] >= player_thr);
+    }
 }
 
 /* ---- ② 行带 ------------------------------------------------------------ */
@@ -866,6 +946,15 @@ static const VrParamSlot VR_PARAM_SLOTS[] = {
     { "player_max_area",           offsetof(VrRefParams, player_max_area) },
     { "player_min_fill_pct",       offsetof(VrRefParams, player_min_fill_pct) },
     { "player_max_aspect_pct",     offsetof(VrRefParams, player_max_aspect_pct) },
+    { "luma_mode",        offsetof(VrRefParams, luma_mode) },
+    { "luma_pct",         offsetof(VrRefParams, luma_pct) },
+    { "luma_bias",        offsetof(VrRefParams, luma_bias) },
+    { "luma_min",         offsetof(VrRefParams, luma_min) },
+    { "luma_max",         offsetof(VrRefParams, luma_max) },
+    { "luma_player_min",  offsetof(VrRefParams, luma_player_min) },
+    { "luma_edge_rows",   offsetof(VrRefParams, luma_edge_rows) },
+    { "luma_run_min",     offsetof(VrRefParams, luma_run_min) },
+    { "luma_force_thr",   offsetof(VrRefParams, luma_force_thr) },
     { NULL, 0 }
 };
 
@@ -1022,6 +1111,13 @@ int vr_ref_process_ex(const uint8_t *rgb, int w, int h, int color,
             else       { r = g = b = rgb[i]; }
             vr_feed_pixel(&f, x, y, r, g, b, &th);
         }
+    }
+    if (params && params->luma_mode) {
+        const int thr  = vr_luma_threshold(&f, params);
+        const int pthr = (params->luma_player_min > thr) ? params->luma_player_min : thr;
+        vr_reclassify_luma(&f, params, thr, pthr);
+        if (getenv("VR_DUMP_THR"))
+            fprintf(stderr, "[luma] thr=%d player_thr=%d\n", thr, pthr);
     }
     vr_process(&f, &wp);
 
