@@ -50,6 +50,17 @@ DIRS = {0: (0, 0), 1: (-1, 0), 2: (1, 0), 3: (0, 1), 4: (0, -1),
         5: (-1, 1), 6: (1, 1), 7: (-1, -1), 8: (1, -1)}
 
 
+def parse_odom(line: str):
+    """'@ODOM x y th' → (x_mm, y_mm, th_mrad)；不是 @ODOM 或解析失败 → None"""
+    f = line.split()
+    if len(f) < 4 or f[0] != "@ODOM":
+        return None
+    try:
+        return int(float(f[1])), int(float(f[2])), int(float(f[3]))
+    except ValueError:
+        return None
+
+
 def split_act(act: int, car_sign: int, v: float):
     """板子 act → (喂给平台的 world_act, 喂给小车的线速度 mm/s)。
 
@@ -80,6 +91,8 @@ class Car:
         self.v, self.w = 0.0, 0.0
         self.s = None
         self._stop = False
+        self.odo = None          # 最近一次 @ODOM → (x_mm, y_mm, th_mrad)
+        self.odo_n = 0
         if dry:
             print("[car] dry-run：只打印，不开串口")
         else:
@@ -89,6 +102,7 @@ class Car:
             time.sleep(0.05)
             self.cmd("@MODE 1")
         threading.Thread(target=self._hb, daemon=True).start()
+        threading.Thread(target=self._rx, daemon=True).start()
 
     def cmd(self, line: str) -> None:
         if self.s is None:
@@ -97,6 +111,28 @@ class Car:
             self.s.write((line + "\n").encode())
         except Exception:
             pass
+
+    def _rx(self) -> None:
+        """只读 @ODOM：小车自己的里程计（x_mm 就是"往前走了多少"）"""
+        buf = b""
+        while not self._stop:
+            if self.s is None:
+                time.sleep(0.2)
+                continue
+            try:
+                chunk = self.s.read(512) or b""
+            except Exception:
+                time.sleep(0.1)
+                continue
+            if not chunk:
+                continue
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                od = parse_odom(line.decode(errors="ignore"))
+                if od is not None:
+                    self.odo = od
+                    self.odo_n += 1
 
     def _hb(self) -> None:
         last = None
@@ -191,6 +227,13 @@ def main(argv=None) -> int:
     ap.add_argument("--car-x-sign", type=int, default=1, choices=(1, -1),
                     help="平台 +x 是 1（小车前进）还是 -1（小车后退）")
     ap.add_argument("--no-car", action="store_true", help="不接小车（只打印）")
+    # ---- C 方案：用小车编码器里程计（@ODOM）当"角色位姿" ----
+    ap.add_argument("--odo", action="store_true",
+                    help="用车端 @ODOM 的 x（往前走了多少 mm）驱动平台角色的 x")
+    ap.add_argument("--mm-per-unit", type=float, default=2.883,
+                    help="物理毫米/场地单位（你们量的：640 单位≈184.5 cm ⇒ 2.883）")
+    ap.add_argument("--odo-sign", type=int, default=1, choices=(1, -1),
+                    help="小车前进 → 角色 x 增大(1) 还是减小(-1)")
     ap.add_argument("--max-seconds", type=float, default=0.0, help="跑多久后自己停（0=不限）")
     a = ap.parse_args(argv)
 
@@ -235,7 +278,7 @@ def main(argv=None) -> int:
     else:
         print("[board] 不接板子：用键盘 1/2/3/4/0 当指令")
 
-    car = Car(a.car_port, a.car_baud, a.car_v, dry=(a.no_car or a.no_board))
+    car = Car(a.car_port, a.car_baud, a.car_v, dry=a.no_car)
 
     server = FrameServer(int(a.port))
     pub = PagePublisher(server, fps=max(10.0, a.fps)).start()
@@ -261,14 +304,18 @@ def main(argv=None) -> int:
     print("  对角 5..8 拆成两半：y 给平台、x 给小车")
     print("  平台：%.0f 单位宽，scale=%.3f px/单位，视口中心 y=%.0f"
           % (field_w, scale, y0))
+    print("  C 方案里程计：%s（%.3f mm/单位，符号 %+d）"
+          % ("开" if a.odo else "关", a.mm_per_unit, a.odo_sign))
     print("  页面 %s  小车 %s" % (f"http://127.0.0.1:{a.port}/",
-                                 "dry-run" if (a.no_car or a.no_board) else a.car_port),
+                                 "dry-run" if a.no_car else a.car_port),
           flush=True)
 
     hk = Hotkeys(not a.no_board)
     hk.__enter__()
     act = 0
     hk_act = None
+    x0 = float(env.world.player[0])
+    r_player = float(env.world.player[4]) if False else 10.0
     t_sim = 0.0
     dt = 1.0 / max(1.0, a.fps)
     last_pose = 0.0
@@ -288,6 +335,10 @@ def main(argv=None) -> int:
             if hk_act is not None:
                 act = hk_act
 
+            # C：角色 x 跟着小车真实里程走（打滑也照实反映）
+            if a.odo and car.odo is not None and a.mm_per_unit > 0:
+                dist_u = float(car.odo[0]) / a.mm_per_unit * a.odo_sign
+                env.world.player[0] = min(field_w - 10.0, max(10.0, x0 + dist_u))
             world_act, car_v = split_act(act, a.car_x_sign, a.car_v)
             if world_act:
                 env.step(world_act)          # 平台视角前后移
@@ -321,6 +372,15 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
+        od = parse_odom("@ODOM 1234 -12 350")
+        print("parse_odom:", od)
+        ok = od == (1234, -12, 350) and parse_odom("@STATE 0 0 0 0") is None
+        # 640 单位 ≈ 184.5 cm ⇒ 2.883 mm/单位；走 1 m 应等于 347 单位
+        u = 1000.0 / 2.883
+        print("走 1000 mm → %.0f 场地单位（应为 ~347）" % u)
+        ok = ok and 340 < u < 355
+        print("PASS" if ok else "FAIL")
+        raise SystemExit(0 if ok else 1)
         print("act  world_act  car_v(sign=+1)  car_v(sign=-1)   含义")
         ok = True
         for act in range(9):
