@@ -1,0 +1,6 @@
+// 把完整位流包成 fpga_manager 能吃的 .bin
+// 用法： bootgen -image bit2bin.bif -arch zynq -process_bitstream bin -o out.bin -w on
+all:
+{
+    bd_vision.bit
+}

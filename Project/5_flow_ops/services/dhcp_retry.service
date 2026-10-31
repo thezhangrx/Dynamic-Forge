@@ -1,0 +1,22 @@
+# 板端：eth0 没 IP 时每 5 s 再要一次地址（DHCP 只在上电时跑一次，网线晚插就永远没 IP）
+#
+# 为什么需要（2026-10-29）：冷上电时 JTAG(SMT2)/PS 串口/网线接在 PC 上会把板子的
+# 上电时序拖歪、起不来；现场的做法是"上电只接电源，起来后再插网线"。但板子的
+# IPv4 是 `/etc/network/interfaces.d/eth0` 里的 `iface eth0 inet dhcp`，
+# ifupdown 只在启动时跑一次 dhclient —— 网线晚插就拿不到 IP，ssh 进不来。
+# 这个 unit 补的就是这一步：只要 eth0 没有 IPv4，就重试 dhclient -1。
+#
+# 幂等/安全：有 IP 时什么都不做；不碰 iptables、不改任何地址配置。
+# 卸载：systemctl disable --now dhcp-retry && rm /etc/systemd/system/dhcp-retry.service
+[Unit]
+Description=Retry DHCP on eth0 while it has no IPv4 (board boots before LAN is plugged)
+After=networking.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+ExecStart=/bin/sh -c 'while :; do if ! ip -4 addr show eth0 2>/dev/null | grep -q "inet "; then dhclient -1 eth0 2>/dev/null; fi; sleep 5; done'
+
+[Install]
+WantedBy=multi-user.target

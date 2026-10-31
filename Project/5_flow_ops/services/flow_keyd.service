@@ -1,0 +1,26 @@
+# 板端：PS_KEY(PS_MIO47 → gpio473) 按下 → /run/flow/press 计数；
+#       /run/flow/run=1 → 点亮 D4（PS_MIO7 → gpio487）
+#
+# 安装（板上 root）：
+#   scp -i data/fpga/board_ssh/board_key core/board/tools/flow_keyd.py root@192.168.137.242:/root/tools/
+#   scp -i data/fpga/board_ssh/board_key core/board/tools/flow_keyd.service root@192.168.137.242:/etc/systemd/system/flow-keyd.service
+#   ssh root@192.168.137.242 'systemctl daemon-reload && systemctl enable --now flow-keyd'
+#   ssh root@192.168.137.242 'journalctl -u flow-keyd -n 20 --no-pager'
+# 卸载：systemctl disable --now flow-keyd && rm /etc/systemd/system/flow-keyd.service
+#
+# 极性：2026-10-29 实测 D4 是 **active-high**（输出 1 才亮）——之前按 active-low 配，
+#   结果是"不跑的时候反而亮着"。所以这里是 --led-active-low 0。若哪天接法变了又反了，
+#   改回 1 再 restart 即可。
+# MIO → GPIO 号：MIO 0..31 → base 480，MIO 32..53 → base 458（MIO47 = 458+15 = 473）
+[Unit]
+Description=PS_KEY(MIO47) button -> /run/flow/press, /run/flow/run -> D4 LED(MIO7)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /root/tools/flow_keyd.py --key-gpio 473 --led-gpio 487 --led-active-low 0
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
