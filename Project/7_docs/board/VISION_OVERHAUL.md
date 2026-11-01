@@ -112,7 +112,7 @@
    定义的场地坐标 y **朝下**（TL 是 `(32,32)`）。换算时要做 `y -> field_h - y`。
    不翻的话"期望像素"会跑到画面另一头（实测偏 173 px），看起来像检测偏了，其实是量尺错了。
 7. **构建纪律**：改了任何 header 都必须**整目录同步再重建**（`core/board/tools/sync_board.sh`）。
-   实测踩过：只传了 `main.cpp` + 两个新 header，漏传 `geometry.hpp`，板子编译照样通过，
+   实测曾遇到：只传了 `main.cpp` + 两个新 header，漏传 `geometry.hpp`，板子编译照样通过，
    运行时却每帧判 `marker_far_from_corner`（旧的角点顺序），看起来像算法坏了。
 
 ## 6. 改动日志
@@ -586,7 +586,7 @@ bash core/board/tools/build_offline_corpus.sh 20        # 一次 ~40 s
 | 平台自身延迟 | **0.127 s**（真值侧，板秒 0.138） | 真值 `applied` 第一次变成该方向 |
 | 契约对照 | 200 单位/**仿真秒** × rtf 0.75 = **150 真实单位/秒** | 与视觉的 143.7 差 4%，两条独立路径互相印证 |
 
-**口径**（写死在 `calib.json` 里，别再混）：
+**口径**（写死在 `calib.json` 里，不再混）：
 `speed_units_per_board_s` 给**板子上积分**用；`speed_units_real_s` 只用来和真值对照；
 `cmd_delay_board_s` 是"平台多快开始动"；`vision_latency_board_s` 是"你看到的画面
 落后多少"—— 决策/预测要用后者，两者差 4 倍，混用就会预测过头。

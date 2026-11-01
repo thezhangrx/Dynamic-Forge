@@ -12,11 +12,11 @@
 |---|---|---|
 | 1 | `AGENTS.md` | **硬规则**。T0（动手前先复述理解）、R0（提问时不动手）、R1/R1b/R2/R3/R4/R5/R6/R7。R1b 锁定的基线是 `acc9r16`；R7 是"不盲修"的四条铁律 |
 | 2 | `core/fpga/docs/PL_HANDOFF.md` | 上一段 A/B 会话的总交接（相机域链路、相机参数、板子地址、运维纪律） |
-| 3 | `core/fpga/docs/PL_P0_P1_MIGRATION.md` 的 **R52–R88** | P0（正射搬进 PL）的完整证据链，**每一步都有数字和踩坑**。R77=整体复盘，R88=待办清单 |
+| 3 | `core/fpga/docs/PL_P0_P1_MIGRATION.md` 的 **R52–R88** | P0（正射搬进 PL）的完整证据链，**每一步都有数字和遇到问题**。R77=整体复盘，R88=待办清单 |
 | 4 | 本文 | 口径汇总 + 不要重复做的事 |
 | 5 | 代码（按需） | 见 §6 文件地图 |
 
-**项目结构现状（别再造轮子）**：PL 侧 RTL 在 `core/fpga/rtl/`（`vision_axi` 是顶层包装：配置寄存器 + 像素源三选一 + 正射子系统 + `vision_top` 判据），
+**项目结构现状（不再造轮子）**：PL 侧 RTL 在 `core/fpga/rtl/`（`vision_axi` 是顶层包装：配置寄存器 + 像素源三选一 + 正射子系统 + `vision_top` 判据），
 协同仿真在 `core/fpga/cosim/`（每个模块一个 `--Mdir`，`Makefile` 里有 `run-ortho/run-sys/run-lc/run-axim/run-divp`），
 测试在 `core/fpga/tests/`（pytest），构建在 `core/fpga/synth/`（Vivado batch tcl），板端工具在 `core/board/tools/` 与 `core/fpga/tools/`。
 
@@ -33,7 +33,7 @@
 3. **系数由 PS 从 `quad.json` 现算**（`field_frame::homography → rectify::invert → q16/q24`），
    **不许手抄常数**。探针的 `--quad` 已自证：算出来与 `VR_DBG_HQ` **0 项差异**、`c0..c1=80..560`。
 4. **`vision_top` 的 `din_sof` 是"整帧第一像素"**，行靠 `din_eol` 推进。
-   正射/适配器都必须按这个口径出 `sof`（**这是 R82 抓到的真 bug，别再改回"每行行首"**）。
+   正射/适配器都必须按这个口径出 `sof`（**这是 R82 抓到的真 bug，不再修改回"每行行首"**）。
 5. **AXI 读地址 = FRMBASE + line*1920**。`vision_ortho_sys` 的 `frm_base` 输入就是干这个的（R84 的 bug：漏加）。
 6. **填充完成只认行缓存的 `fill_done`**（不是主口的 `m_done`）；行缓存的读/写都是**像素**（24 位），不按字节。
 7. **位流只重建"本地已修好的真 bug"**，不为调试重建；**不 hot-swap 位流**，一律 JTAG 只配 PL（R73）。
@@ -95,17 +95,17 @@ CAM_VT_BIN=/root/tools/pl_vision core/board/tools/loop_standard.sh --tag plp0N
 
 ---
 
-## 4. **不要重复做的事**（本会话踩过/验证过，重做纯浪费）
+## 4. **不要重复做的事**（本会话曾遇到/验证过，重做纯浪费）
 
 1. **别重建位流做调试**；WNS 富余这版就是唯一基础。要改 RTL 就本地先用 `tb_p0` 验，再一次重建。
-2. **别再用 `echo ... > /sys/class/fpga_manager/fpga0/firmware` 热换位流**（曾在 PL 有未完成 AXI 事务时把 PS 弄挂）；
+2. **不再用 `echo ... > /sys/class/fpga_manager/fpga0/firmware` 热换位流**（曾在 PL 有未完成 AXI 事务时把 PS 弄挂）；
    一律 `xsdb.bat jtag_boot.tcl default 1 0`。
-3. **别再怀疑 `hold`**：`-GHOLD_BYPASS=1` 实测与正常完全一致（R80）。
-4. **别再给 `out_sof` 改成每行**（R82 的真 bug）。
-5. **别再漏 `frm_base`**（R84 的真 bug；本地 tb 已用非零 FRMBASE 覆盖）。
-6. **别再手抄正射系数**（用 `--quad` 现算，已自证 0 差异）。
+3. **不再怀疑 `hold`**：`-GHOLD_BYPASS=1` 实测与正常完全一致（R80）。
+4. **不再给 `out_sof` 改成每行**（R82 的真 bug）。
+5. **不再漏 `frm_base`**（R84 的真 bug；本地 tb 已用非零 FRMBASE 覆盖）。
+6. **不再手抄正射系数**（用 `--quad` 现算，已自证 0 差异）。
 7. **别在 tb 里让 AXI 从机"同拍结算两次"**（R82 的假死锁元凶）；`tb_p0` 已拆成 `slave_comb()` + `tick()` 内结算。
-8. **别再用"等 2000 万次 MMIO"当超时**（会量出 5622/6809 ms 假数）；按**时间**设上限（探针已改）。
+8. **不再用"等 2000 万次 MMIO"当超时**（会量出 5622/6809 ms 假数）；按**时间**设上限（探针已改）。
 9. **别重复搭 cosim**：`tb_ortho`（直供）、`tb_ortho_sys`（全链路）、`tb_p0`（集成 + vision_top）、
    `tb_linecache`、`tb_axim`、`tb_divpipe`、`tb_camadapt` 都已存在，`Makefile` 有对应 target。
 10. **别改基线逻辑**：`board_agent.py` / `field_m1.hpp` / `@POSE` 链 / `calib_y.json` 一行不动（R1/R2/R3）。

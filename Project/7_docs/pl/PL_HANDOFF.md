@@ -46,7 +46,7 @@ PL（复旦微 JFMQL30TAI676H 的 FPGA 侧）已经能替代板端视觉前端�
 - PL 输入固定 **640×360**（`vision_top` 的 WIDTH/HEIGHT）。`pl_vision` 把页面按 **0.75 等比放进
   640×360**（左右各 80 px 黑边带），与 `stim_color` 语料同一摆法；反算页面坐标：
   `x_page=(x_pl-80)/0.75`、`y_page=(360-y_pl)/0.75`。
-- ⚠ `field_frame::homography()` 的方向是**相机→页面**，要取 `rectify::invert()` 才是页面→相机（踩过）。
+- ⚠ `field_frame::homography()` 的方向是**相机→页面**，要取 `rectify::invert()` 才是页面→相机（曾遇到）。
 
 ## 3. 硬件 / 位流 / 命令
 
@@ -62,7 +62,7 @@ PL（复旦微 JFMQL30TAI676H 的 FPGA 侧）已经能替代板端视觉前端�
   cmd.exe /c "D:\Vivado\Vivado\2018.3\bin\vivado.bat -mode batch -source C:/pl_build/bd_vision.tcl -tclargs C:/pl_build/rtl C:/pl_build/bd C:/pl_build/out"
   bootgen -image bit2bin.bif -arch zynq -process_bitstream bin -w on -o C:\pl_build\out
   ```
-  坑：`bd_pack.tcl` 里 `expr {[info exists argv] && …}` 会被当表达式解析（已修）；`$tag` 无默认值会把
+  问题：`bd_pack.tcl` 里 `expr {[info exists argv] && …}` 会被当表达式解析（已修）；`$tag` 无默认值会把
   位流写成隐藏文件 `out/.bit`（已修）；D: 盘偶尔读失败，**重试即可**。
 - PL 寄存器（`0x43C00000`）：`0x000+4i` 21 个阈值；`0x080/0x084` 调试口；
   `0x0C0` CTRL(start/busy/done/ovf)；`0x0D4` PIXPUSH；`0x0D8` PIXSTAT；`0x0DC` PIXCTL；
@@ -144,7 +144,7 @@ PL（复旦微 JFMQL30TAI676H 的 FPGA 侧）已经能替代板端视觉前端�
 3. PS 侧 `pl_vision.cpp` 改成"把 640×480 帧 memcpy 进 udmabuf → 写 FRMBASE → start →
    读几何帧"（去掉 PC 正射与 PIXPUSH 17.3 ms）。
 
-## 8. 运维纪律（今天踩过的坑，务必遵守）
+## 8. 运维纪律（今天曾遇到的问题，务必遵守）
 
 1. **跑闭环前**：`cp core/using/calib/calib_y.json data/fpga/calib_y.json` —— 闭环结束会自动**改写**它。
 2. **跑闭环后**：清相机管线，否则它会一直占着像素 FIFO，让后续离线测量两个进程抢同一个 FIFO

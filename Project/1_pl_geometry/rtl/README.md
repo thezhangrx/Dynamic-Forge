@@ -109,7 +109,7 @@ FPGA_COSIM_FRAMES=320 python -m pytest core/fpga/tests/test_cosim.py -q
 * **并查集顺序查找**：链长最坏到标签表深度，组合展开就是 256 级级联比较器；
   顺序走只多花几拍。
 
-## 两个真踩过的坑（写在这里省得再踩）
+## 两个真曾遇到的问题（写在这里省得再踩）
 
 1. **Verilator：把函数调用直接写进"数组元素"的非阻塞赋值 RHS，可能算错。**
    实测 `obs_words[n*9+8] <= vo_atan2_q6(a, b);`（同一函数在 `$display` 里也调了
