@@ -23,8 +23,8 @@
 
 ```bash
 # 标准闭环（含板端）
-bash core/board/tools/loop_standard.sh --tag demo
+bash 5_flow_ops/scripts/loop_standard.sh --tag demo
 
 # 仅页面（无角色，用于投影测量）
-Env/bin/python core/board/tools/page_plain.py
+python3 4_virtual_platform/host/page_plain.py
 ```

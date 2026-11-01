@@ -2,12 +2,10 @@
 
 ## 1. 概述
 
-本目录将虚拟平台闭环全流程的源代码按功能划分为 8 个模块，共 406 个文件、约 6.1 MB。
-所有文件取自仓库工作树（`core/` 等目录），逻辑与对应源文件一致，未作功能修改；
-文档（`*.md`）的措辞按技术报告口径作了统一整理。
+本工程为虚拟平台闭环全流程的实现代码，按数据流划分为 8 个功能模块，共 406 个源文件、
+约 6.1 MB。各模块的职责、目录结构与接口见该模块目录下的 README。
 
-运行产物（PL 位流、采集日志、板端二进制、相机录像等）按仓库 `.gitignore` 的约定不纳入
-版本管理，因此不在本目录内；相关产物存放于仓库 `data/` 目录。
+PL 位流、采集日志、板端二进制与相机录像等体积较大的运行产物不纳入版本管理。
 
 ## 2. 系统链路
 
@@ -48,26 +46,23 @@ PL 数据通路：PS memcpy → /dev/udmabuf0（物理地址 0x30100000）→ FR
 
 ## 4. 运行方式
 
-以下命令在仓库根目录执行。本目录为代码整理副本，脚本内的相对路径指向仓库工作树
-（`core/board/tools/...`），直接在本目录内执行脚本将无法定位依赖文件。
+以下命令在工程根目录执行。
 
 ```bash
-cd /home/zhang/FPGA
-
 # 4.1 环境体检（不启动相机与闭环）
-bash core/board/tools/loop_standard.sh --check
+bash 5_flow_ops/scripts/loop_standard.sh --check
 
 # 4.2 标准闭环运行一轮（相机 + 板端 + 虚拟平台）
-bash core/board/tools/loop_standard.sh --tag demo
+bash 5_flow_ops/scripts/loop_standard.sh --tag demo
 
 # 4.3 仅显示无角色平台页面（用于投影尺寸测量与相机对位）
-Env/bin/python core/board/tools/page_plain.py
+python3 4_virtual_platform/host/page_plain.py
 
 # 4.4 板端指令分方向转发（纵向指令驱动平台视角，横向指令驱动小车）
-Env/bin/python core/board/tools/plain_car_host.py --board-ssh root@192.168.137.242 --no-car
+python3 4_virtual_platform/host/plain_car_host.py --board-ssh root@192.168.137.242 --no-car
 
 # 4.5 PL 位流部署（转换为板端可加载格式并写入上电自启动路径）
-bash core/board/tools/deploy_pl_autoload.sh data/fpga/pl_bitstream/bd_vision_p0.bit
+bash 5_flow_ops/scripts/deploy_pl_autoload.sh <bit 路径>
 ```
 
 ## 5. 接口与端口约定
@@ -83,4 +78,4 @@ bash core/board/tools/deploy_pl_autoload.sh data/fpga/pl_bitstream/bd_vision_p0.
 
 ## 6. 文件清单
 
-`00_文件清单.txt` 列出本目录全部文件的相对路径，按模块分组排序。
+`00_文件清单.txt` 列出全部源文件的相对路径，按模块分组排序。

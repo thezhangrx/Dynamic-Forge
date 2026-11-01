@@ -23,7 +23,7 @@
 ## 运行
 
 ```bash
-bash core/board/tools/loop_standard.sh --check      # 体检
-bash core/board/tools/loop_standard.sh --tag demo   # 跑一轮
-bash core/board/tools/board_up.sh --check           # 板端状态
+bash 5_flow_ops/scripts/loop_standard.sh --check      # 体检
+bash 5_flow_ops/scripts/loop_standard.sh --tag demo   # 跑一轮
+bash 5_flow_ops/scripts/board_up.sh --check           # 板端状态
 ```

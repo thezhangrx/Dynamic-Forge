@@ -17,11 +17,11 @@
 
 ```bash
 # 板端 / CPU
-/tmp/vpy/bin/python -m pytest core/board/tests -q
-/tmp/vpy/bin/python -m pytest core/cpu/tests -q
+/tmp/vpy/bin/python -m pytest 6_tests/board -q
+/tmp/vpy/bin/python -m pytest 6_tests/cpu -q
 
 # 小车固件（主机编译运行）
-cd core/car/stm32f103/tests
-gcc -std=c11 -Wall -Wextra -I.. -o /tmp/test_car test_car.c \
-    ../car_kin.c ../car_control.c ../car_proto.c -lm && /tmp/test_car
+cd 8_car_firmware/tests
+gcc -std=c11 -Wall -Wextra -I../src -o /tmp/test_car test_car.c \
+    ../src/car_kin.c ../src/car_control.c ../src/car_proto.c -lm && /tmp/test_car
 ```

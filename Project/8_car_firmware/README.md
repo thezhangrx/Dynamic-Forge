@@ -24,7 +24,7 @@ STM32F103 底盘控制器固件：陀螺仪姿态解算、串级 PID（直立/�
 ## 构建与烧写
 
 ```bash
-cd core/car/stm32f103
+cd 8_car_firmware/src
 make                      # 产出 build/car.elf、build/car.bin
 st-flash write build/car.bin 0x8000000 && st-flash reset
 ```

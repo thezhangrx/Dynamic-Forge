@@ -27,4 +27,4 @@
 
 1. 协同仿真：`cd cosim && make`（需 Verilator 5.x），产物为各 `tb_*` 可执行文件；
 2. 语法与位宽检查：`make -C cosim lint`；
-3. 位流：`synth/bd_pack.tcl` → `synth/bd_vision.tcl` → `bootgen`（或用仓库 `core/board/tools/bit2bin.py` 完成 `.bit → .bin` 转换）。
+3. 位流：`synth/bd_pack.tcl` → `synth/bd_vision.tcl` → `bootgen`（或使用 `5_flow_ops/scripts/bit2bin.py` 完成 `.bit → .bin` 转换）。
