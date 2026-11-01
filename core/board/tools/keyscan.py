@@ -13,10 +13,12 @@
     * 结束后把**我们改过方向的脚还原**、export 过的 unexport。
 
 用法（板上 root）：
-    python3 keyscan.py 0               # 0 = 一直扫（推荐：按键随时按都记得到）
-    python3 keyscan.py 1200            # 或只扫 1200 s
+    python3 keyscan.py --duration 0        # 0 = 一直扫（默认）
+    python3 keyscan.py --duration 1200     # 或只扫 1200 s
+    python3 keyscan.py 1200                # 位置参数等价写法（兼容旧用法）
     cat /tmp/keyscan.log               # 看哪个脚动过（MIO16/22 是外设噪声，已标注）
 """
+import argparse
 import os
 import sys
 import time
@@ -65,7 +67,12 @@ def wr(n, name, val):
 
 
 def main():
-    dur = float(sys.argv[1]) if len(sys.argv) > 1 else 0.0
+    ap = argparse.ArgumentParser(description="扫描 MIO 输入脚，定位按键所在的 GPIO")
+    ap.add_argument("seconds", nargs="?", type=float, default=None,
+                    help="扫描时长（秒），0 或省略表示一直扫")
+    ap.add_argument("--duration", type=float, default=None, help="同 seconds")
+    args = ap.parse_args()
+    dur = args.duration if args.duration is not None else (args.seconds or 0.0)
     forever = (dur <= 0)
     dur = 1e9 if forever else dur
     changed = {}        # 我们自己 export 的脚 -> 原方向（用于还原）

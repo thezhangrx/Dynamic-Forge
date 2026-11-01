@@ -34,8 +34,18 @@ ESC / q 退出，空格暂停。
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
+
+# --- 工程内路径引导（保证从工程任意位置启动都能定位依赖）---
+_PRJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+for _p in (os.path.join(_PRJ_ROOT, "lib"),
+           os.path.join(_PRJ_ROOT, "4_virtual_platform", "sim"),
+           os.path.dirname(os.path.abspath(__file__))):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 import time
 
 import pygame

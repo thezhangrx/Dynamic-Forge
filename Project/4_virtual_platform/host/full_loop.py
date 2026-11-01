@@ -78,6 +78,15 @@ for _p in (str(_ROOT), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+# --- 工程内路径引导（保证从工程任意位置启动都能定位依赖）---
+_PRJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+for _p in (os.path.join(_PRJ_ROOT, "lib"),
+           os.path.join(_PRJ_ROOT, "4_virtual_platform", "sim"),
+           os.path.dirname(os.path.abspath(__file__))):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+
 from field_loop import board_command, dist_rect, pct, walls_of   # noqa: E402
 from bullet_sim.scenarios.spec import ScenarioSpec                # noqa: E402
 from bullet_sim.simulator.env import BulletHellEnv                # noqa: E402

@@ -44,6 +44,15 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, os.path.join(ROOT, "core"))
 sys.path.insert(0, HERE)
 
+# --- 工程内路径引导（保证从工程任意位置启动都能定位依赖）---
+_PRJ_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+for _p in (os.path.join(_PRJ_ROOT, "lib"),
+           os.path.join(_PRJ_ROOT, "4_virtual_platform", "sim"),
+           os.path.dirname(os.path.abspath(__file__))):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+
 #: act -> (x 分量, y 分量)，与 car_kin.c 的 k_dirs 一致（页面坐标，y 向下）
 #: 1=-x 2=+x 3=+y 4=-y 5=(-1,+1) 6=(+1,+1) 7=(-1,-1) 8=(+1,-1)
 DIRS = {0: (0, 0), 1: (-1, 0), 2: (1, 0), 3: (0, 1), 4: (0, -1),
